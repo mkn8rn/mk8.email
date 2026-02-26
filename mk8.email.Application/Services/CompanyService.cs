@@ -1,0 +1,227 @@
+using Microsoft.EntityFrameworkCore;
+using mk8.email.Application.Interfaces;
+using mk8.email.Contracts.DTOs;
+using mk8.email.Contracts.Enums;
+using mk8.email.Infrastructure.Data;
+using mk8.email.Infrastructure.Models;
+
+namespace mk8.email.Application.Services;
+
+public class CompanyService(EmailDbContext db) : ICompanyService
+{
+    public async Task<CompanyDTO?> CreateCompanyAsync(Guid userId, CreateCompanyRequestDTO request)
+    {
+        if (!await IsSuperAdminAsync(userId))
+            return null;
+
+        if (await db.Companies.AnyAsync(c => c.Name == request.Name))
+            return null;
+
+        var company = new CompanyDB
+        {
+            Id = Guid.CreateVersion7(),
+            Name = request.Name,
+        };
+
+        db.Companies.Add(company);
+        await db.SaveChangesAsync();
+
+        return ToDTO(company);
+    }
+
+    public async Task<IReadOnlyList<CompanyDTO>> GetAllCompaniesAsync()
+    {
+        return await db.Companies.AsNoTracking()
+            .Select(c => new CompanyDTO(c.Id, c.Name, c.IsActive, c.CreatedAt))
+            .ToListAsync();
+    }
+
+    public async Task<CompanyDTO?> GetCompanyAsync(Guid companyId)
+    {
+        var company = await db.Companies.AsNoTracking().FirstOrDefaultAsync(c => c.Id == companyId);
+        return company is null ? null : ToDTO(company);
+    }
+
+    public async Task<GlobalConfigDTO> GetGlobalConfigAsync()
+    {
+        var c = await db.GlobalConfig.FirstAsync();
+        return ToConfigDTO(c);
+    }
+
+    public async Task<GlobalConfigDTO?> UpdateGlobalConfigAsync(Guid userId, GlobalConfigDTO config)
+    {
+        if (!await IsSuperAdminAsync(userId))
+            return null;
+
+        var e = await db.GlobalConfig.FirstAsync();
+
+        e.AllowRegistration = config.AllowRegistration;
+
+        e.SmtpHostname = config.SmtpHostname;
+        e.SmtpPort = config.SmtpPort;
+        e.SmtpSubmissionPort = config.SmtpSubmissionPort;
+        e.SmtpImplicitTlsPort = config.SmtpImplicitTlsPort;
+
+        e.EnableSmtp = config.EnableSmtp;
+        e.EnableSubmission = config.EnableSubmission;
+        e.EnableImplicitTls = config.EnableImplicitTls;
+
+        e.EnableStartTls = config.EnableStartTls;
+        e.RequireTls = config.RequireTls;
+        e.TlsCertificatePath = config.TlsCertificatePath;
+        e.TlsCertificateKeyPath = config.TlsCertificateKeyPath;
+
+        e.PasswordHashScheme = config.PasswordHashScheme;
+        e.RequireAuth = config.RequireAuth;
+
+        e.MaxMessageSizeBytes = config.MaxMessageSizeBytes;
+        e.MaxRecipientsPerMessage = config.MaxRecipientsPerMessage;
+        e.ConnectionTimeoutSeconds = config.ConnectionTimeoutSeconds;
+        e.MaxConnectionsPerIp = config.MaxConnectionsPerIp;
+
+        e.AllowRelay = config.AllowRelay;
+
+        e.EnableImap = config.EnableImap;
+        e.ImapPort = config.ImapPort;
+        e.EnableImapImplicitTls = config.EnableImapImplicitTls;
+        e.ImapImplicitTlsPort = config.ImapImplicitTlsPort;
+
+        e.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+
+        return ToConfigDTO(e);
+    }
+
+    public async Task<GlobalLimitsDTO> GetGlobalLimitsAsync()
+    {
+        var l = await db.GlobalLimits.FirstAsync();
+        return new GlobalLimitsDTO(l.Id, l.DefaultMaxDomainsPerCompany, l.DefaultMaxInboxesPerCompany, l.DefaultMaxInboxesPerDomain);
+    }
+
+    public async Task<GlobalLimitsDTO?> UpdateGlobalLimitsAsync(Guid userId, GlobalLimitsDTO limits)
+    {
+        if (!await IsSuperAdminAsync(userId))
+            return null;
+
+        var entity = await db.GlobalLimits.FirstAsync();
+        entity.DefaultMaxDomainsPerCompany = limits.DefaultMaxDomainsPerCompany;
+        entity.DefaultMaxInboxesPerCompany = limits.DefaultMaxInboxesPerCompany;
+        entity.DefaultMaxInboxesPerDomain = limits.DefaultMaxInboxesPerDomain;
+        entity.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+
+        return new GlobalLimitsDTO(entity.Id, entity.DefaultMaxDomainsPerCompany, entity.DefaultMaxInboxesPerCompany, entity.DefaultMaxInboxesPerDomain);
+    }
+
+    public async Task<CompanyConfigDTO?> GetCompanyConfigAsync(Guid userId, Guid companyId)
+    {
+        if (!await HasCompanyAccessAsync(userId, companyId))
+            return null;
+
+        var config = await db.CompanyConfigs.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.CompanyId == companyId);
+
+        return config is null ? null : new CompanyConfigDTO(config.Id, config.CompanyId, config.AllowUserRegistration);
+    }
+
+    public async Task<CompanyConfigDTO?> UpdateCompanyConfigAsync(Guid userId, Guid companyId, bool allowUserRegistration)
+    {
+        if (!await HasCompanyAccessAsync(userId, companyId))
+            return null;
+
+        var config = await db.CompanyConfigs.FirstOrDefaultAsync(c => c.CompanyId == companyId);
+
+        if (config is null)
+        {
+            config = new CompanyConfigDB
+            {
+                Id = Guid.CreateVersion7(),
+                CompanyId = companyId,
+                AllowUserRegistration = allowUserRegistration,
+            };
+            db.CompanyConfigs.Add(config);
+        }
+        else
+        {
+            config.AllowUserRegistration = allowUserRegistration;
+            config.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await db.SaveChangesAsync();
+        return new CompanyConfigDTO(config.Id, config.CompanyId, config.AllowUserRegistration);
+    }
+
+    public async Task<CompanyLimitsDTO?> GetCompanyLimitsAsync(Guid userId, Guid companyId)
+    {
+        if (!await HasCompanyAccessAsync(userId, companyId))
+            return null;
+
+        var limits = await db.CompanyLimits.AsNoTracking()
+            .FirstOrDefaultAsync(l => l.CompanyId == companyId);
+
+        return limits is null ? null : new CompanyLimitsDTO(limits.Id, limits.CompanyId, limits.MaxDomains, limits.MaxInboxes, limits.MaxInboxesPerDomain);
+    }
+
+    public async Task<CompanyLimitsDTO?> UpdateCompanyLimitsAsync(Guid userId, Guid companyId, int? maxDomains, int? maxInboxes, int? maxInboxesPerDomain)
+    {
+        if (!await IsSuperAdminAsync(userId))
+            return null;
+
+        var limits = await db.CompanyLimits.FirstOrDefaultAsync(l => l.CompanyId == companyId);
+
+        if (limits is null)
+        {
+            limits = new CompanyLimitsDB
+            {
+                Id = Guid.CreateVersion7(),
+                CompanyId = companyId,
+                MaxDomains = maxDomains,
+                MaxInboxes = maxInboxes,
+                MaxInboxesPerDomain = maxInboxesPerDomain,
+            };
+            db.CompanyLimits.Add(limits);
+        }
+        else
+        {
+            limits.MaxDomains = maxDomains;
+            limits.MaxInboxes = maxInboxes;
+            limits.MaxInboxesPerDomain = maxInboxesPerDomain;
+            limits.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await db.SaveChangesAsync();
+        return new CompanyLimitsDTO(limits.Id, limits.CompanyId, limits.MaxDomains, limits.MaxInboxes, limits.MaxInboxesPerDomain);
+    }
+
+    private async Task<bool> IsSuperAdminAsync(Guid userId)
+    {
+        return await db.Users.AnyAsync(u => u.Id == userId && u.Role == nameof(UserRole.SuperAdmin));
+    }
+
+    private async Task<bool> HasCompanyAccessAsync(Guid userId, Guid companyId)
+    {
+        var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId);
+        if (user is null)
+            return false;
+
+        var role = Enum.Parse<UserRole>(user.Role);
+        return role switch
+        {
+            UserRole.SuperAdmin => true,
+            UserRole.CompanyAdmin => user.CompanyId == companyId,
+            _ => false,
+        };
+    }
+
+    private static CompanyDTO ToDTO(CompanyDB c) => new(c.Id, c.Name, c.IsActive, c.CreatedAt);
+
+    private static GlobalConfigDTO ToConfigDTO(GlobalConfigDB c) => new(
+        c.Id, c.AllowRegistration,
+        c.SmtpHostname, c.SmtpPort, c.SmtpSubmissionPort, c.SmtpImplicitTlsPort,
+        c.EnableSmtp, c.EnableSubmission, c.EnableImplicitTls,
+        c.EnableStartTls, c.RequireTls, c.TlsCertificatePath, c.TlsCertificateKeyPath,
+        c.PasswordHashScheme, c.RequireAuth,
+        c.MaxMessageSizeBytes, c.MaxRecipientsPerMessage, c.ConnectionTimeoutSeconds, c.MaxConnectionsPerIp,
+        c.AllowRelay,
+        c.EnableImap, c.ImapPort, c.EnableImapImplicitTls, c.ImapImplicitTlsPort);
+}
