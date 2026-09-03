@@ -1,0 +1,5 @@
+$ORIGIN mkn8rn.com.
+$TTL 300
+
+matrix                          IN A 176.61.153.171 ; cf_tags=cf-proxied:false
+turn                            IN A 176.61.153.171 ; cf_tags=cf-proxied:false

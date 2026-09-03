@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the mk8 service backup each day
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 Europe/Zagreb
+RandomizedDelaySec=15m
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

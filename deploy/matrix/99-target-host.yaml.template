@@ -1,0 +1,39 @@
+public_baseurl: "https://matrix.mkn8rn.com/"
+serve_server_wellknown: true
+report_stats: false
+enable_registration: false
+enable_registration_without_verification: false
+url_preview_enabled: false
+max_upload_size: 100M
+
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    password: "REPLACE_WITH_SYNAPSE_DATABASE_PASSWORD"
+    database: synapse
+    host: 127.0.0.1
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    bind_addresses:
+      - 127.0.0.1
+      - ::1
+    resources:
+      - names:
+          - client
+          - federation
+        compress: false
+
+turn_uris:
+  - "turn:turn.mkn8rn.com:3478?transport=udp"
+  - "turn:turn.mkn8rn.com:3478?transport=tcp"
+turn_shared_secret: "REPLACE_WITH_TURN_SHARED_SECRET"
+turn_user_lifetime: 1h
+turn_allow_guests: false

@@ -1,0 +1,33 @@
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid drop
+        ct state established,related accept
+        iifname "lo" accept
+
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+
+        udp sport 67 udp dport 68 accept
+        udp sport 547 udp dport 546 accept
+
+        ip saddr 192.168.89.0/24 tcp dport 22 ct state new accept
+        meta nfproto ipv4 tcp dport { 25, 80, 443, 465, 587, 993, 3478 } ct state new accept
+        meta nfproto ipv4 udp dport { 3478, 49160-49200 } ct state new accept
+
+        limit rate 3/minute burst 5 packets log prefix "nft-input-drop: " level warn
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}

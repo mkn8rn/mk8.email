@@ -1,0 +1,7 @@
+-w /etc/mk8email/ -p wa -k mk8email_config
+-w /etc/matrix-synapse/ -p wa -k matrix_config
+-w /etc/nginx/ -p wa -k nginx_config
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+-w /etc/sudoers -p wa -k privilege_config
+-w /etc/sudoers.d/ -p wa -k privilege_config

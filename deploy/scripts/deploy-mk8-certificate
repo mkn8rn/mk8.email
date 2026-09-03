@@ -1,0 +1,88 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: deploy-mk8-certificate mail|matrix" >&2
+    exit 2
+fi
+
+case "$1" in
+    mail)
+        lineage=${RENEWED_LINEAGE:-/etc/letsencrypt/live/mk8-mail}
+        destination=/etc/mk8email/tls
+        owner=root
+        group=mk8email
+        directory_mode=0750
+        mode=0440
+        ;;
+    matrix)
+        lineage=${RENEWED_LINEAGE:-/etc/letsencrypt/live/mk8-matrix}
+        destination=/etc/matrix-synapse/tls
+        owner=root
+        group=root
+        directory_mode=0700
+        mode=0400
+        ;;
+    *)
+        printf '%s\n' "The certificate target is not valid." >&2
+        exit 2
+        ;;
+esac
+
+if [ ! -f "$lineage/fullchain.pem" ] || [ ! -f "$lineage/privkey.pem" ]; then
+    printf '%s\n' "The certificate lineage is incomplete." >&2
+    exit 1
+fi
+
+work=$(mktemp -d /run/mk8-certificate.XXXXXX)
+cleanup() {
+    case "$work" in
+        /run/mk8-certificate.*)
+            rm -rf -- "$work"
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 604800
+openssl pkey -in "$lineage/privkey.pem" -noout -check
+openssl x509 -in "$lineage/fullchain.pem" -pubkey -noout \
+    | openssl pkey -pubin -outform DER > "$work/certificate-public-key.der"
+openssl pkey -in "$lineage/privkey.pem" -pubout -outform DER > "$work/private-public-key.der"
+if ! cmp --silent "$work/certificate-public-key.der" "$work/private-public-key.der"; then
+    printf '%s\n' "The certificate and private key do not match." >&2
+    exit 1
+fi
+
+install -d -o "$owner" -g "$group" -m "$directory_mode" "$destination"
+if [ -f "$destination/fullchain.pem" ]; then
+    cp -p "$destination/fullchain.pem" "$work/fullchain.old"
+fi
+if [ -f "$destination/privkey.pem" ]; then
+    cp -p "$destination/privkey.pem" "$work/privkey.old"
+fi
+
+install -o "$owner" -g "$group" -m "$mode" "$lineage/fullchain.pem" "$destination/fullchain.pem.new"
+install -o "$owner" -g "$group" -m "$mode" "$lineage/privkey.pem" "$destination/privkey.pem.new"
+mv "$destination/fullchain.pem.new" "$destination/fullchain.pem"
+mv "$destination/privkey.pem.new" "$destination/privkey.pem"
+
+if ! nginx -t; then
+    if [ -f "$work/fullchain.old" ]; then
+        cp -p "$work/fullchain.old" "$destination/fullchain.pem"
+    else
+        rm -f -- "$destination/fullchain.pem"
+    fi
+    if [ -f "$work/privkey.old" ]; then
+        cp -p "$work/privkey.old" "$destination/privkey.pem"
+    else
+        rm -f -- "$destination/privkey.pem"
+    fi
+    printf '%s\n' "The nginx validation failed. The prior certificate was restored." >&2
+    exit 1
+fi
+
+systemctl reload nginx.service
+if [ "$1" = mail ] && systemctl is-active --quiet mk8email.service; then
+    systemctl restart mk8email.service
+fi

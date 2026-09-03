@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: install-host-hardening ASSET_ROOT" >&2
+    exit 2
+fi
+
+asset_root=$1
+if [ ! -d "$asset_root/deploy" ]; then
+    printf '%s\n' "The deployment asset root is not valid." >&2
+    exit 1
+fi
+
+install -m 0644 "$asset_root/deploy/apt/20auto-upgrades" /etc/apt/apt.conf.d/20auto-upgrades
+install -m 0644 "$asset_root/deploy/apt/52mk8-unattended-upgrades" /etc/apt/apt.conf.d/52mk8-unattended-upgrades
+install -m 0640 "$asset_root/deploy/audit/50-mk8-server.rules" /etc/audit/rules.d/50-mk8-server.rules
+install -m 0644 "$asset_root/deploy/default/debsums" /etc/default/debsums
+install -m 0644 "$asset_root/deploy/default/sysstat" /etc/default/sysstat
+install -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
+install -m 0644 "$asset_root/deploy/journald/90-mk8-server.conf" /etc/systemd/journald.conf.d/90-mk8-server.conf
+install -m 0644 "$asset_root/deploy/logind/90-mk8-server.conf" /etc/systemd/logind.conf.d/90-mk8-server.conf
+install -m 0644 "$asset_root/deploy/modprobe/90-mk8-server.conf" /etc/modprobe.d/90-mk8-server.conf
+install -m 0644 "$asset_root/deploy/pam/90-mk8-server.conf" /etc/security/pwquality.conf.d/90-mk8-server.conf
+install -m 0644 "$asset_root/deploy/profile/90-mk8-umask.sh" /etc/profile.d/90-mk8-umask.sh
+install -d -o postgres -g postgres -m 0750 /etc/postgresql/17/main/conf.d
+install -o postgres -g postgres -m 0640 "$asset_root/deploy/postgresql/90-mk8-production.conf" /etc/postgresql/17/main/conf.d/90-mk8-production.conf
+install -o postgres -g postgres -m 0640 "$asset_root/deploy/postgresql/pg_hba.conf" /etc/postgresql/17/main/pg_hba.conf
+install -m 0600 "$asset_root/deploy/ssh/90-mk8-hardening.conf" /etc/ssh/sshd_config.d/90-mk8-hardening.conf
+install -m 0644 "$asset_root/deploy/sysctl/90-mk8-server.conf" /etc/sysctl.d/90-mk8-server.conf
+install -m 0644 "$asset_root/deploy/tmpfiles/mk8-postgresql.conf" /etc/tmpfiles.d/mk8-postgresql.conf
+install -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
+
+if grep -Eq '^[[:space:]]*UMASK[[:space:]]+' /etc/login.defs; then
+    sed -i -E 's/^[[:space:]]*UMASK[[:space:]]+.*/UMASK 027/' /etc/login.defs
+else
+    printf '%s\n' 'UMASK 027' >> /etc/login.defs
+fi
+
+sshd -t
+nft -c -f /etc/nftables.conf
+nft -f /etc/nftables.conf
+sysctl --system >/dev/null
+systemd-tmpfiles --create /etc/tmpfiles.d/mk8-postgresql.conf
+pg_ctlcluster 17 main reload
+augenrules --load
+systemctl daemon-reload
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+systemctl enable --now nftables.service auditd.service fail2ban.service acct.service sysstat.service
+systemctl enable --now dailyaidecheck.timer sysstat-collect.timer sysstat-summary.timer
+systemctl reload ssh.service
+systemctl restart fail2ban.service
+
+printf '%s\n' "Host hardening assets installed. Reboot the host to apply all controls."

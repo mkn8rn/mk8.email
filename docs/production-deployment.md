@@ -1,99 +1,160 @@
-# Production deployment foundation
+# Production deployment
 
-## Current boundary
+## Deployment boundary
 
-Do not route `mk8n.com` mail to this service yet. Database migrations and standards-compliant inbound mail authentication remain required.
+Do not change the `mk8n.com` MX record yet. Several conditions still block live mail delivery.
 
-This foundation provides strict configuration, secret files, non-root execution, isolated PostgreSQL networking, TLS ports, and a container health check.
+The Internet path from the target blocks outbound TCP port 25. The public address has no usable PTR result. The application database has no schema.
 
-## Host requirements
+The repository has no Entity Framework migration. Project rules require an explicit user instruction before migration generation.
 
-Use a Linux host with a static public IPv4 address. Confirm that the provider permits inbound and outbound TCP port 25.
+Inbound SPF, DKIM, and DMARC evaluation is not implemented. Durable outbound retry and bounce queues are not implemented.
 
-Set the host name to `mail.mk8n.com`. Configure the firewall for TCP ports 25, 465, 587, 143, and 993.
+Spam classification and malware scanning are not implemented. Do not direct public MX traffic to this service until these controls exist.
 
-Request a PTR record that maps the public address to `mail.mk8n.com`. The forward address must map to the same public address.
+The API has no controllers or administrative endpoints. The service cannot provision a domain or inbox through a supported interface.
 
-## Local secrets
+## Target host
 
-Create the ignored `deploy/secrets` directory. Store each secret in its named file without an additional line.
+The prepared host uses Debian 13 at `192.168.89.251`. Its current public IPv4 address is `176.61.153.171`.
 
-```sh
-mkdir -p deploy/secrets
-openssl rand -base64 48 > deploy/secrets/database_password
-openssl rand -base64 48 > deploy/secrets/superadmin_password
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out deploy/secrets/dkim_private_key.pem
-```
+Nftables drops unmatched input. SSH permits public-key access from `192.168.89.0/24` only. PostgreSQL listens on loopback addresses only.
 
-Copy the complete certificate chain to `deploy/secrets/tls_certificate.pem`. Copy its private key to `deploy/secrets/tls_private_key.pem`.
+The public service rules permit IPv4 only. Do not publish an AAAA record before you add and test a complete IPv6 path.
 
-Restrict all secret files to the deployment administrator. Do not add these files to Git.
+Nginx owns TCP ports 80 and 443. The mail service will own TCP ports 25, 465, 587, and 993.
 
-Extract the DKIM public-key value after private-key creation.
+The host has .NET 10.0.11 and PostgreSQL 17. PostgreSQL uses SCRAM authentication and page checksums.
 
-```sh
-openssl pkey -in deploy/secrets/dkim_private_key.pem -pubout -outform DER | openssl base64 -A
-```
+The mail service is installed from commit `caabd4e169a1`. A systemd condition keeps it stopped until the database schema is approved.
 
-## Container checks
+## Host hardening assets
 
-Validate the Compose model before each deployment.
+The versioned hardening files reproduce the target security settings. Install their required Debian packages before you run the installer.
 
 ```sh
-docker compose config --quiet
+apt-get install apparmor apparmor-utils auditd fail2ban nftables unattended-upgrades needrestart debsums aide aide-common acct sysstat libpam-pwquality libpam-tmpdir
+deploy/scripts/install-host-hardening /path/to/mk8.email
+reboot
 ```
 
-Build the image with current base-image security updates.
+The installer permits SSH only from `192.168.89.0/24`. Keep a working console or tested key session during this operation.
+
+The nftables asset replaces the complete host ruleset. Review it before use on a host that runs another network service.
+
+Configure NetworkManager with the router and two independent public resolvers. The prepared host uses `192.168.89.1`, `1.1.1.1`, and `9.9.9.9`.
 
 ```sh
-docker compose build --pull
+nmcli connection modify 'Wired connection 1' ipv4.ignore-auto-dns yes ipv4.dns '192.168.89.1,1.1.1.1,9.9.9.9' ipv6.ignore-auto-dns yes
+nmcli device reapply enp0s31f6
 ```
 
-Start the services only after all remaining blockers are complete.
+Initialize AIDE after the final trusted configuration is present.
 
 ```sh
-docker compose up -d
-docker compose ps
+aideinit --yes --force
 ```
 
-The mail container runs without root privileges. It binds high internal ports, while Docker publishes the standard mail ports.
+The measured Lynis hardening index is 82. The scan had no warning-level findings after the applied corrections.
 
-The database is only attached to the internal backend network. The mail container also uses an edge network for remote delivery.
+Review .NET and Synapse updates each week. Apply those third-party updates during a tested maintenance window.
 
-## DNS preparation
+## Protected values
 
-Replace `203.0.113.10` with the server address. Create equivalent records at the authoritative DNS provider.
+The workstation stores host and service values below `D:\keys\shitbox1`. Windows permits access only to the current user and `SYSTEM`.
 
-```dns
-mail.mk8n.com. 300 IN A 203.0.113.10
-mk8n.com. 300 IN MX 10 mail.mk8n.com.
-mk8n.com. 300 IN TXT "v=spf1 mx -all"
-default._domainkey.mk8n.com. 300 IN TXT "v=DKIM1; k=rsa; p=REPLACE_WITH_DKIM_PUBLIC_KEY"
-_dmarc.mk8n.com. 300 IN TXT "v=DMARC1; p=none; rua=mailto:dmarc@mk8n.com"
+The target stores mail values below `/etc/mk8email`. Files with private values use the `root:mk8email` owner and group.
+
+Never add a private value to Git. Never copy a private value into a command argument.
+
+## Native release
+
+Build from a clean worktree. Use locked NuGet restore before tests.
+
+```powershell
+dotnet restore mk8.email.slnx --locked-mode
+dotnet test mk8.email.slnx --configuration Release --no-restore
+dotnet publish mk8.email.CLI\mk8.email.Application.CLI.csproj --configuration Release --no-restore --output publish
 ```
 
-Replace `REPLACE_WITH_DKIM_PUBLIC_KEY` with the command output. Confirm a test signature before the DNS cutover.
+Create a release archive from the publish directory. Transfer the archive through the dedicated SSH key.
 
-Change the DMARC policy only after measured mail-flow results.
+Run the installer with an immutable Git commit identifier.
 
-## Operations
+```sh
+install-native-release /root/mk8email-release.tar.gz caabd4e169a1
+```
 
-Back up the PostgreSQL volume each day. Test database restoration before mail delivery starts.
+Install `deploy/native/mk8email.config.json` as `/etc/mk8email/mk8email.config.json`. Set ownership to `root:mk8email` and mode `0640`.
 
-Monitor connection failures, authentication failures, rejected messages, queue failures, disk use, certificate expiry, and database health.
+Install `deploy/systemd/mk8email.service` as `/etc/systemd/system/mk8email.service`. Reload systemd after installation.
 
-Replace renewed TLS files and recreate the mail container. Confirm STARTTLS and implicit TLS after each certificate change.
+The unit requires `/etc/mk8email/schema-ready`. Do not create this file before the first approved database migration exists.
 
-## Remaining production blockers
+## Database initialization
 
-The repository contains no Entity Framework migrations. The user must explicitly authorize migration creation before database deployment can work.
+The hardening installer installs the PostgreSQL tuning and access-control files. It keeps PostgreSQL on loopback addresses.
 
-Outbound delivery uses MX routing and opportunistic STARTTLS. It still lacks durable retries, bounce creation, MTA-STS, and DANE policy checks.
+Initialize the two restricted roles and databases from protected password files.
 
-Authenticated submission accepts only an active inbox owned by the account. The message `From` and optional `Sender` fields must match the envelope sender.
+```sh
+deploy/scripts/initialize-postgresql /etc/mk8email/secrets/database_password /etc/matrix-synapse/secrets/database_password
+```
 
-Inbound SPF, DKIM verification, and DMARC evaluation are not implemented and stay disabled.
+This script enables PostgreSQL page checksums before it creates data. It does not create the application schema.
 
-Transport tests cover SMTP and IMAP greetings, STARTTLS, authentication exposure, and SMTP size limits. Broader mailbox interoperability still needs automated tests.
+Generate an Entity Framework migration only after explicit approval. Review its SQL before application.
 
-External deliverability tests must confirm behavior before the DNS cutover.
+Create a database backup before each schema change. Apply the migration during a measured maintenance window.
+
+Create `/etc/mk8email/schema-ready` only after the schema validation passes. Start the service after that marker exists.
+
+The first start creates only the `postmaster@mk8n.com` user row. Its password is in the protected workstation directory.
+
+Implement and test an authenticated administration path before activation. Then provision the domain and all required inboxes through that path.
+
+Create the `postmaster@mk8n.com`, `dmarc@mk8n.com`, and `tlsrpt@mk8n.com` inboxes before the DNS cutover.
+
+## TLS certificate
+
+The installed certificate is temporary and self-signed. Do not use it for public mail.
+
+Apply the RouterOS preflight rules first. Import `deploy/dns/mk8n.com-preflight.zone` after external HTTP and HTTPS checks pass.
+
+The preflight zone adds only three address records. It does not change mail routing or sender policy.
+
+Issue the mail certificate after the three `mk8n.com` names resolve to this host.
+
+```sh
+certbot certonly --webroot --webroot-path /var/www/letsencrypt --cert-name mk8-mail --deploy-hook '/usr/local/sbin/deploy-mk8-certificate mail' -d mail.mk8n.com -d mta-sts.mk8n.com -d autoconfig.mk8n.com
+```
+
+Run the deployment hook once after the first issuance. Confirm certificate names and expiry before service activation.
+
+Matrix uses a separate certificate and deployment hook. This separation keeps the current Matrix DNS record on the source during preparation.
+
+## Backups
+
+The `mk8-backup.timer` creates a local backup each day. It keeps 14 days of database, configuration, and Matrix media snapshots.
+
+Local backups do not protect against host loss. Copy each completed snapshot to a different system.
+
+Each snapshot contains database credentials, signing keys, and TLS keys. Encrypt off-host copies and restrict their access.
+
+Test restoration each month. Keep the test separate from the live databases.
+
+## Activation tests
+
+Run `systemctl status mk8email` after activation. Run the built-in health check with the production configuration.
+
+```sh
+sudo -u mk8email env MK8EMAIL_CONFIG_FILE=/etc/mk8email/mk8email.config.json /usr/bin/dotnet /opt/mk8email/current/mk8.email.Application.CLI.dll --healthcheck
+```
+
+Test SMTP STARTTLS on ports 25 and 587. Test implicit TLS on ports 465 and 993.
+
+Send mail only between controlled test accounts first. Confirm sender authorization and DKIM validation.
+
+Test delivery to three independent providers. Confirm that each provider accepts the message and validates SPF, DKIM, and DMARC.
+
+Keep DMARC in monitoring mode during initial tests. Change MTA-STS from `testing` only after stable mail-flow evidence exists.

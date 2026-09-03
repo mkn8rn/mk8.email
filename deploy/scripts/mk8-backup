@@ -1,0 +1,85 @@
+#!/bin/sh
+set -eu
+
+backup_root=/var/backups/mk8
+timestamp=$(date --utc +%Y%m%dT%H%M%SZ)
+stage="$backup_root/.incomplete-$timestamp"
+final="$backup_root/$timestamp"
+
+cleanup() {
+    case "$stage" in
+        /var/backups/mk8/.incomplete-*)
+            if [ -d "$stage" ]; then
+                rm -rf -- "$stage"
+            fi
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+if [ -e "$stage" ] || [ -e "$final" ]; then
+    printf '%s\n' "The backup target already exists." >&2
+    exit 1
+fi
+
+umask 077
+install -d -o root -g root -m 0700 "$backup_root" "$stage"
+
+runuser -u postgres -- pg_dump --format=custom --compress=9 mk8email > "$stage/mk8email.dump"
+runuser -u postgres -- pg_dump --format=custom --compress=9 --exclude-table-data=e2e_one_time_keys_json synapse > "$stage/synapse.dump"
+runuser -u postgres -- pg_dumpall --globals-only > "$stage/postgresql-globals.sql"
+readlink -f /opt/mk8email/current > "$stage/mk8email-release.txt"
+
+tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
+    etc/aide \
+    etc/apt/apt.conf.d/20auto-upgrades \
+    etc/apt/apt.conf.d/52mk8-unattended-upgrades \
+    etc/audit \
+    etc/default/aide \
+    etc/default/debsums \
+    etc/default/sysstat \
+    etc/fail2ban \
+    etc/mk8email \
+    etc/matrix-synapse \
+    etc/modprobe.d/90-mk8-server.conf \
+    etc/nginx \
+    etc/nftables.conf \
+    etc/postgresql \
+    etc/profile.d/90-mk8-umask.sh \
+    etc/security/pwquality.conf.d/90-mk8-server.conf \
+    etc/ssh/sshd_config \
+    etc/ssh/sshd_config.d \
+    etc/sysctl.d/90-mk8-server.conf \
+    etc/systemd/journald.conf.d/90-mk8-server.conf \
+    etc/systemd/logind.conf.d/90-mk8-server.conf \
+    etc/systemd/system/coturn.service.d \
+    etc/systemd/system/matrix-synapse.service.d \
+    etc/systemd/system/mk8-backup.service \
+    etc/systemd/system/mk8-backup.timer \
+    etc/systemd/system/mk8email.service \
+    etc/systemd/system/nginx.service.d \
+    etc/systemd/system/postgresql@.service.d \
+    etc/tmpfiles.d/mk8-postgresql.conf \
+    etc/turnserver.conf \
+    etc/turnserver-ready \
+    var/lib/aide/aide.db \
+    var/www/autoconfig \
+    var/www/mta-sts
+
+install -d -m 0700 "$stage/matrix-media"
+if [ -d /var/lib/matrix-synapse/media ]; then
+    previous=$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%f\n' | sort | tail -n 1)
+    if [ -n "$previous" ] && [ -d "$backup_root/$previous/matrix-media" ]; then
+        rsync --archive --delete --link-dest="$backup_root/$previous/matrix-media" /var/lib/matrix-synapse/media/ "$stage/matrix-media/"
+    else
+        rsync --archive --delete /var/lib/matrix-synapse/media/ "$stage/matrix-media/"
+    fi
+fi
+
+(cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "$stage/SHA256SUMS"
+mv "$stage" "$final"
+stage=
+
+find /var/backups/mk8 -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -mtime +14 -exec rm -rf -- {} +
+
+printf '%s\n' "$final"

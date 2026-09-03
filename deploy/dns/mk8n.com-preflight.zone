@@ -1,0 +1,6 @@
+$ORIGIN mk8n.com.
+$TTL 300
+
+mail                            IN A 176.61.153.171 ; cf_tags=cf-proxied:false
+mta-sts                         IN A 176.61.153.171 ; cf_tags=cf-proxied:false
+autoconfig                      IN A 176.61.153.171 ; cf_tags=cf-proxied:false
