@@ -90,6 +90,8 @@ The repository contains no Entity Framework migrations. The user must explicitly
 
 Outbound delivery uses MX routing and opportunistic STARTTLS. It still lacks durable retries, bounce creation, MTA-STS, and DANE policy checks.
 
+Authenticated submission accepts only an active inbox owned by the account. The message `From` and optional `Sender` fields must match the envelope sender.
+
 Inbound SPF, DKIM verification, and DMARC evaluation are not implemented and stay disabled.
 
 Transport tests cover SMTP and IMAP greetings, STARTTLS, authentication exposure, and SMTP size limits. Broader mailbox interoperability still needs automated tests.

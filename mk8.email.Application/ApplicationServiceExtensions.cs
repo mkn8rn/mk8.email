@@ -19,6 +19,7 @@ public static class ApplicationServiceExtensions
         services.AddSingleton<IMailExchangeResolver, DnsMailExchangeResolver>();
         services.AddSingleton<IOutboundMailRelay, OutboundSmtpRelay>();
         services.AddSingleton<IDkimSigningService, MimeKitDkimSigningService>();
+        services.AddScoped<ISenderAuthorizationService, SenderAuthorizationService>();
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IInboxService, InboxService>();
         services.AddScoped<IAddressService, AddressService>();

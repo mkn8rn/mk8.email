@@ -178,17 +178,7 @@ public sealed class TransportSecurityTests
         server.DkimSigningService.ThrowOnSign = true;
         await using var connection = await ProtocolConnection.ConnectAsync(port);
 
-        await connection.ReadLineAsync();
-        await connection.WriteLineAsync("EHLO client.example");
-        await connection.ReadSmtpResponseAsync();
-        await connection.WriteLineAsync("STARTTLS");
-        await connection.ReadLineAsync();
-        await connection.UpgradeToTlsAsync("mail.mk8n.com");
-        await connection.WriteLineAsync("EHLO client.example");
-        await connection.ReadSmtpResponseAsync();
-        var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes($"\0{TestUsername}\0{TestPassword}"));
-        await connection.WriteLineAsync($"AUTH PLAIN {credentials}");
-        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("235 ", StringComparison.Ordinal));
+        await AuthenticateSmtpAsync(connection);
         await connection.WriteLineAsync($"MAIL FROM:<{TestUsername}>");
         await connection.ReadLineAsync();
         await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
@@ -208,6 +198,132 @@ public sealed class TransportSecurityTests
 
         await connection.WriteLineAsync("NOOP");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task SmtpAcceptsOwnedSenderWithMatchingFromHeader()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await AuthenticateSmtpAsync(connection);
+        await connection.WriteLineAsync($"MAIL FROM:<{TestUsername}>");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync("DATA");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("354 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync($"From: Test User <{TestUsername}>");
+        await connection.WriteLineAsync("To: recipient@example.com");
+        await connection.WriteLineAsync("Subject: authorized sender");
+        await connection.WriteLineAsync(string.Empty);
+        await connection.WriteLineAsync("body");
+        await connection.WriteLineAsync(".");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        Assert.AreEqual(1, server.EmailService.DeliverCalls);
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task SmtpRejectsUnownedEnvelopeSender()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await AuthenticateSmtpAsync(connection);
+        await connection.WriteLineAsync("MAIL FROM:<other@mk8n.com>");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("553 ", StringComparison.Ordinal));
+        Assert.AreEqual(0, server.EmailService.DeliverCalls);
+        await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("503 ", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task SmtpRejectsMismatchedFromHeaderBeforeSigning()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port, enableDkimSigning: true);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await AuthenticateSmtpAsync(connection);
+        await connection.WriteLineAsync($"MAIL FROM:<{TestUsername}>");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("DATA");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("From: other@mk8n.com");
+        await connection.WriteLineAsync("To: recipient@example.com");
+        await connection.WriteLineAsync("Subject: rejected sender");
+        await connection.WriteLineAsync(string.Empty);
+        await connection.WriteLineAsync("body");
+        await connection.WriteLineAsync(".");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("550 ", StringComparison.Ordinal));
+        Assert.AreEqual(0, server.DkimSigningService.SignCalls);
+        Assert.AreEqual(0, server.EmailService.DeliverCalls);
+        await connection.WriteLineAsync("DATA");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("503 ", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task SmtpRejectsAuthenticationDuringMailTransaction()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await UpgradeSmtpToTlsAsync(connection);
+        await connection.WriteLineAsync("MAIL FROM:<other@mk8n.com>");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes($"\0{TestUsername}\0{TestPassword}"));
+        await connection.WriteLineAsync($"AUTH PLAIN {credentials}");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("503 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync("RSET");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync($"AUTH PLAIN {credentials}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("235 ", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task SmtpRechecksSenderOwnershipBeforeDelivery()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port, enableDkimSigning: true);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await AuthenticateSmtpAsync(connection);
+        await connection.WriteLineAsync($"MAIL FROM:<{TestUsername}>");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        await server.DisableOwnedAddressAsync();
+        await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("DATA");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync($"From: {TestUsername}");
+        await connection.WriteLineAsync("To: recipient@example.com");
+        await connection.WriteLineAsync("Subject: disabled sender");
+        await connection.WriteLineAsync(string.Empty);
+        await connection.WriteLineAsync("body");
+        await connection.WriteLineAsync(".");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("550 ", StringComparison.Ordinal));
+        Assert.AreEqual(0, server.DkimSigningService.SignCalls);
+        Assert.AreEqual(0, server.EmailService.DeliverCalls);
     }
 
     [TestMethod]
@@ -310,6 +426,26 @@ public sealed class TransportSecurityTests
         return port;
     }
 
+    private static async Task AuthenticateSmtpAsync(ProtocolConnection connection)
+    {
+        await UpgradeSmtpToTlsAsync(connection);
+        var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes($"\0{TestUsername}\0{TestPassword}"));
+        await connection.WriteLineAsync($"AUTH PLAIN {credentials}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("235 ", StringComparison.Ordinal));
+    }
+
+    private static async Task UpgradeSmtpToTlsAsync(ProtocolConnection connection)
+    {
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("EHLO client.example");
+        await connection.ReadSmtpResponseAsync();
+        await connection.WriteLineAsync("STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("220 ", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("mail.mk8n.com");
+        await connection.WriteLineAsync("EHLO client.example");
+        await connection.ReadSmtpResponseAsync();
+    }
+
     private sealed class ServerFixture(
         ServiceProvider services,
         IHostedService hostedService,
@@ -351,6 +487,15 @@ public sealed class TransportSecurityTests
             await services.DisposeAsync();
         }
 
+        public async Task DisableOwnedAddressAsync()
+        {
+            using var scope = services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+            var address = await database.Addresses.SingleAsync(item => item.Domain == "mk8n.com");
+            address.IsActive = false;
+            await database.SaveChangesAsync();
+        }
+
         private static (
             ServiceProvider Services,
             StubEmailService EmailService,
@@ -361,19 +506,41 @@ public sealed class TransportSecurityTests
             var databaseName = $"transport-{Guid.NewGuid():N}";
             var serviceCollection = new ServiceCollection();
             serviceCollection.AddSingleton<IEmailService>(emailService);
+            serviceCollection.AddScoped<ISenderAuthorizationService, SenderAuthorizationService>();
             serviceCollection.AddDbContext<EmailDbContext>(options =>
                 options.UseInMemoryDatabase(databaseName));
             var services = serviceCollection.BuildServiceProvider();
             using (var scope = services.CreateScope())
             {
                 var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-                database.Users.Add(new UserDB
+                var company = new CompanyDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Name = "Test Company",
+                    IsActive = true,
+                };
+                var address = new AddressDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Domain = "mk8n.com",
+                    IsActive = true,
+                    Company = company,
+                };
+                var user = new UserDB
                 {
                     Id = Guid.CreateVersion7(),
                     Username = TestUsername,
                     PasswordHash = PasswordHasher.Hash(TestPassword),
                     Role = nameof(UserRole.User),
                     IsActive = true,
+                    Company = company,
+                };
+                database.Inboxes.Add(new InboxDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Name = "user",
+                    Address = address,
+                    Owner = user,
                 });
                 database.SaveChanges();
             }

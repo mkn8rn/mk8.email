@@ -127,6 +127,7 @@ public class SmtpServerService(
 
                 using var scope = scopeFactory.CreateScope();
                 var emailService = scope.ServiceProvider.GetRequiredService<IEmailService>();
+                var senderAuthorization = scope.ServiceProvider.GetRequiredService<ISenderAuthorizationService>();
                 var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
                 Stream stream = client.GetStream();
@@ -157,7 +158,17 @@ public class SmtpServerService(
                 };
                 await writer.WriteLineAsync($"220 {config.SmtpHostname} ESMTP mk8.email");
 
-                await RunSmtpSessionAsync(reader, writer, session, emailService, db, config, timeout, stream, remoteIp.ToString());
+                await RunSmtpSessionAsync(
+                    reader,
+                    writer,
+                    session,
+                    emailService,
+                    senderAuthorization,
+                    db,
+                    config,
+                    timeout,
+                    stream,
+                    remoteIp.ToString());
             }
         }
         catch (OperationCanceledException)
@@ -176,7 +187,8 @@ public class SmtpServerService(
 
     private async Task RunSmtpSessionAsync(
         BoundedLineReader reader, StreamWriter writer, SmtpSession session,
-        IEmailService emailService, EmailDbContext db, GlobalConfigDB config,
+        IEmailService emailService, ISenderAuthorizationService senderAuthorization,
+        EmailDbContext db, GlobalConfigDB config,
         CancellationTokenSource timeout, Stream? upgradableStream = null, string? clientIp = null)
     {
 
@@ -219,6 +231,16 @@ public class SmtpServerService(
                     else
                     {
                         var raw = session.DataBuilder.ToString();
+
+                        if (session.IsAuthenticated
+                            && (!await senderAuthorization.CanSendAsAsync(
+                                    session.AuthenticatedUser!, session.Sender!, timeout.Token)
+                                || !senderAuthorization.HasMatchingFromAddress(raw, session.Sender!)))
+                        {
+                            await writer.WriteLineAsync("550 5.7.1 Sender identity is not authorized");
+                            session.Reset();
+                            continue;
+                        }
 
                         // DKIM signing for authenticated outbound messages
                         var signedRaw = raw;
@@ -320,6 +342,11 @@ public class SmtpServerService(
                         await writer.WriteLineAsync("538 5.7.11 Encryption required for authentication");
                         break;
                     }
+                    if (session.Sender is not null)
+                    {
+                        await writer.WriteLineAsync("503 5.5.1 Mail transaction is already active");
+                        break;
+                    }
                     await HandleAuthAsync(line, reader, writer, session, db, timeout.Token);
                     break;
 
@@ -335,7 +362,15 @@ public class SmtpServerService(
                         break;
                     }
                     session.Reset();
-                    session.Sender = ExtractAddress(line);
+                    var sender = ExtractAddress(line);
+                    if (session.IsAuthenticated
+                        && !await senderAuthorization.CanSendAsAsync(
+                            session.AuthenticatedUser!, sender, timeout.Token))
+                    {
+                        await writer.WriteLineAsync("553 5.7.1 Sender address is not authorized");
+                        break;
+                    }
+                    session.Sender = sender;
                     await writer.WriteLineAsync("250 2.1.0 OK");
                     break;
 
@@ -407,7 +442,16 @@ public class SmtpServerService(
                         session.AuthenticatedUser = null;
                         session.IsSecure = true;
 
-                        await RunSmtpSessionAsync(tlsReader, tlsWriter, session, emailService, db, config, timeout, clientIp: clientIp);
+                        await RunSmtpSessionAsync(
+                            tlsReader,
+                            tlsWriter,
+                            session,
+                            emailService,
+                            senderAuthorization,
+                            db,
+                            config,
+                            timeout,
+                            clientIp: clientIp);
                         return;
                     }
                     else
@@ -574,7 +618,7 @@ public class SmtpServerService(
             return;
         }
 
-        session.AuthenticatedUser = username;
+        session.AuthenticatedUser = user.Username;
         await writer.WriteLineAsync("235 2.7.0 Authentication successful");
     }
 
