@@ -34,8 +34,9 @@
     "CertificateKeyPath": "/run/secrets/tls_private_key"
   },
   "Dkim": {
+    "PrivateKeyPath": "/run/secrets/dkim_private_key",
     "Selector": "default",
-    "EnableSigning": false
+    "EnableSigning": true
   },
   "Security": {
     "EnableSpfCheck": false,

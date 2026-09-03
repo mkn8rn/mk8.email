@@ -28,4 +28,15 @@ internal static class TestCertificateFactory
         File.WriteAllBytes(path, certificate.Export(X509ContentType.Pkcs12));
         return path;
     }
+
+    public static TestDkimKey CreateDkimKey(string directory)
+    {
+        using var key = RSA.Create(2048);
+        var privateKeyPath = Path.Combine(directory, "dkim-private.pem");
+        File.WriteAllText(privateKeyPath, key.ExportPkcs8PrivateKeyPem());
+        var publicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
+        return new TestDkimKey(privateKeyPath, $"v=DKIM1; k=rsa; p={publicKey}");
+    }
 }
+
+internal sealed record TestDkimKey(string PrivateKeyPath, string PublicDnsRecord);

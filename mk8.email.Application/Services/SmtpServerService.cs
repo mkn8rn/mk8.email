@@ -20,6 +20,7 @@ namespace mk8.email.Application.Services;
 public class SmtpServerService(
     IServiceScopeFactory scopeFactory,
     EnvironmentConfig env,
+    IDkimSigningService dkimSigningService,
     ILogger<SmtpServerService> logger) : BackgroundService
 {
     private const int MaximumCommandLineCharacters = 4096;
@@ -227,7 +228,21 @@ public class SmtpServerService(
                             var senderDomain = session.Sender.Contains('@')
                                 ? session.Sender[(session.Sender.IndexOf('@') + 1)..]
                                 : config.SmtpHostname;
-                            signedRaw = emailService.SignWithDkim(raw, senderDomain, config.DkimSelector, config.DkimPrivateKeyPath);
+                            try
+                            {
+                                signedRaw = dkimSigningService.Sign(
+                                    raw,
+                                    senderDomain,
+                                    config.DkimSelector,
+                                    config.DkimPrivateKeyPath);
+                            }
+                            catch (DkimSigningException exception)
+                            {
+                                logger.LogError(exception, "DKIM signing failed for {Domain}", senderDomain);
+                                await writer.WriteLineAsync("451 4.3.0 Message signing failed");
+                                session.Reset();
+                                continue;
+                            }
                         }
 
                         // SPF/DKIM/DMARC verification for inbound messages

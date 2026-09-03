@@ -44,6 +44,7 @@ services:
       - superadmin_password
       - tls_certificate
       - tls_private_key
+      - dkim_private_key
     ports:
       - "25:2525"
       - "587:2587"
@@ -82,6 +83,8 @@ secrets:
     file: ./deploy/secrets/tls_certificate.pem
   tls_private_key:
     file: ./deploy/secrets/tls_private_key.pem
+  dkim_private_key:
+    file: ./deploy/secrets/dkim_private_key.pem
 
 volumes:
   postgres-data:
