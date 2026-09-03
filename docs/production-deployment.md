@@ -78,7 +78,9 @@ Replace renewed TLS files and recreate the mail container. Confirm STARTTLS and 
 
 The repository contains no Entity Framework migrations. The user must explicitly authorize migration creation before database deployment can work.
 
-Outbound delivery does not perform MX lookup. Inbound SPF, DKIM, and DMARC checks are not standards-compliant and stay disabled.
+Outbound delivery uses MX routing and opportunistic STARTTLS. It still lacks durable retries, bounce creation, MTA-STS, and DANE policy checks.
+
+Inbound SPF, DKIM, and DMARC checks are not standards-compliant and stay disabled.
 
 Transport tests cover SMTP and IMAP greetings, STARTTLS, authentication exposure, and SMTP size limits. Broader mailbox interoperability still needs automated tests.
 

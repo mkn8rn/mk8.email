@@ -32,6 +32,11 @@
           "Microsoft.Extensions.Options": "10.0.2"
         }
       },
+      "DnsClient": {
+        "type": "Transitive",
+        "resolved": "1.8.0",
+        "contentHash": "RRwtaCXkXWsx0mmsReGDqCbRLtItfUbkRJlet1FpdciVhyMGKcPd57T1+8Jki9ojHlq9fntVhXQroOOgRak8DQ=="
+      },
       "Microsoft.EntityFrameworkCore": {
         "type": "Transitive",
         "resolved": "10.0.2",
@@ -360,6 +365,7 @@
       "mk8.email.application.core": {
         "type": "Project",
         "dependencies": {
+          "DnsClient": "[1.8.0, )",
           "Microsoft.EntityFrameworkCore": "[10.0.2, )",
           "Microsoft.Extensions.Configuration.Binder": "[10.0.2, )",
           "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.2, )",

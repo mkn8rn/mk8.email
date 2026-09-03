@@ -9,7 +9,7 @@ using mk8.email.Infrastructure.Models;
 
 namespace mk8.email.Application.Services;
 
-public class EmailService(EmailDbContext db) : IEmailService
+public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRelay) : IEmailService
 {
     public async Task<bool> CanReceiveAsync(string recipient)
     {
@@ -233,97 +233,7 @@ public class EmailService(EmailDbContext db) : IEmailService
 
     public async Task<bool> RelayAsync(string sender, string recipient, string rawMessage)
     {
-        var (_, domain) = ParseRecipient(recipient);
-        if (domain is null)
-            return false;
-
-        try
-        {
-            var mxHost = await ResolveMxAsync(domain);
-            if (mxHost is null)
-                return false;
-
-            using var client = new TcpClient();
-            await client.ConnectAsync(mxHost, 25);
-
-            await using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-            await using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true)
-            {
-                AutoFlush = true,
-                NewLine = "\r\n"
-            };
-
-            var greeting = await reader.ReadLineAsync();
-            if (greeting is null || !greeting.StartsWith("220"))
-                return false;
-
-            await writer.WriteLineAsync($"EHLO {Environment.MachineName}");
-            await ReadUntilLastLineAsync(reader);
-
-            await writer.WriteLineAsync($"MAIL FROM:<{sender}>");
-            var mailResp = await reader.ReadLineAsync();
-            if (mailResp is null || !mailResp.StartsWith("250"))
-                return false;
-
-            await writer.WriteLineAsync($"RCPT TO:<{recipient}>");
-            var rcptResp = await reader.ReadLineAsync();
-            if (rcptResp is null || !rcptResp.StartsWith("250"))
-                return false;
-
-            await writer.WriteLineAsync("DATA");
-            var dataResp = await reader.ReadLineAsync();
-            if (dataResp is null || !dataResp.StartsWith("354"))
-                return false;
-
-            foreach (var line in rawMessage.Split("\r\n"))
-            {
-                if (line.StartsWith('.'))
-                    await writer.WriteAsync('.');
-                await writer.WriteLineAsync(line);
-            }
-            await writer.WriteLineAsync(".");
-
-            var endResp = await reader.ReadLineAsync();
-            if (endResp is null || !endResp.StartsWith("250"))
-                return false;
-
-            await writer.WriteLineAsync("QUIT");
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static async Task<string?> ResolveMxAsync(string domain)
-    {
-        try
-        {
-            // Use system DNS to look up MX records via nslookup-style approach
-            // .NET does not have built-in MX resolution, so we resolve and fall back to A record
-            var hostEntry = await System.Net.Dns.GetHostEntryAsync(domain);
-            if (hostEntry.AddressList.Length > 0)
-                return domain; // fallback to A record
-
-            return null;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static async Task ReadUntilLastLineAsync(StreamReader reader)
-    {
-        // SMTP multiline responses have a dash after the code; the last line has a space
-        while (true)
-        {
-            var line = await reader.ReadLineAsync();
-            if (line is null || (line.Length >= 4 && line[3] == ' '))
-                break;
-        }
+        return await outboundMailRelay.RelayAsync(sender, recipient, rawMessage);
     }
 
     // ?? DKIM signing ??
