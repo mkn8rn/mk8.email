@@ -12,6 +12,7 @@
     <Project Path="mk8.email.Utils/mk8.email.Utils.csproj" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="mk8.email.Application.Tests/mk8.email.Application.Tests.csproj" />
     <Project Path="mk8.email.Infrastructure.Tests/mk8.email.Infrastructure.Tests.csproj" />
   </Folder>
 </Solution>

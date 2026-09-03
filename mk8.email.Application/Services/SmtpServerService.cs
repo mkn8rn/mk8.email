@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using mk8.email.Application.Interfaces;
+using mk8.email.Application.Protocol;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
 using mk8.email.Infrastructure.Models;
@@ -21,6 +22,10 @@ public class SmtpServerService(
     EnvironmentConfig env,
     ILogger<SmtpServerService> logger) : BackgroundService
 {
+    private const int MaximumCommandLineCharacters = 4096;
+    private const int MaximumDataLineCharacters = 64 * 1024;
+    private static readonly Encoding ProtocolEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private enum ListenerMode { Smtp, Submission, ImplicitTls }
 
     private sealed class SmtpSession
@@ -32,6 +37,8 @@ public class SmtpServerService(
         public string? Sender { get; set; }
         public List<string> Recipients { get; } = [];
         public StringBuilder DataBuilder { get; } = new();
+        public int DataByteCount { get; set; }
+        public bool MessageTooLarge { get; set; }
         public bool InDataMode { get; set; }
 
         public void Reset()
@@ -39,6 +46,10 @@ public class SmtpServerService(
             Sender = null;
             Recipients.Clear();
             DataBuilder.Clear();
+            if (DataBuilder.Capacity > 4096)
+                DataBuilder.Capacity = 4096;
+            DataByteCount = 0;
+            MessageTooLarge = false;
             InDataMode = false;
         }
     }
@@ -130,8 +141,9 @@ public class SmtpServerService(
                     stream = sslStream;
                 }
 
-                using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
-                await using var writer = new StreamWriter(stream, Encoding.UTF8, bufferSize: 4096, leaveOpen: true)
+                using var streamReader = new StreamReader(stream, ProtocolEncoding, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+                var reader = new BoundedLineReader(streamReader);
+                await using var writer = new StreamWriter(stream, ProtocolEncoding, bufferSize: 4096, leaveOpen: true)
                 {
                     AutoFlush = true,
                     NewLine = "\r\n"
@@ -162,30 +174,51 @@ public class SmtpServerService(
     }
 
     private async Task RunSmtpSessionAsync(
-        StreamReader reader, StreamWriter writer, SmtpSession session,
+        BoundedLineReader reader, StreamWriter writer, SmtpSession session,
         IEmailService emailService, EmailDbContext db, GlobalConfigDB config,
         CancellationTokenSource timeout, Stream? upgradableStream = null, string? clientIp = null)
     {
 
         while (!timeout.IsCancellationRequested)
         {
-            var line = await reader.ReadLineAsync(timeout.Token);
-            if (line is null)
+            var maximumLineLength = session.InDataMode
+                ? Math.Min(config.MaxMessageSizeBytes, MaximumDataLineCharacters)
+                : MaximumCommandLineCharacters;
+            var readResult = await reader.ReadLineAsync(maximumLineLength, timeout.Token);
+            if (readResult.Value is null && !readResult.IsTooLong)
                 break;
+
+            if (readResult.IsTooLong)
+            {
+                if (session.InDataMode)
+                {
+                    session.MessageTooLarge = true;
+                    session.DataBuilder.Clear();
+                }
+                else
+                {
+                    await writer.WriteLineAsync("500 5.5.2 Line too long");
+                }
+
+                continue;
+            }
+
+            var line = readResult.Value!;
 
             if (session.InDataMode)
             {
                 if (line == ".")
                 {
                     session.InDataMode = false;
-                    var raw = session.DataBuilder.ToString();
-
-                    if (Encoding.UTF8.GetByteCount(raw) > config.MaxMessageSizeBytes)
+                    if (session.MessageTooLarge)
                     {
-                        await writer.WriteLineAsync("552 5.3.4 Message exceeds maximum size");
+                        await writer.WriteLineAsync("552 5.3.4 Message exceeds server limits");
+                        session.Reset();
                     }
                     else
                     {
+                        var raw = session.DataBuilder.ToString();
+
                         // DKIM signing for authenticated outbound messages
                         var signedRaw = raw;
                         if (session.IsAuthenticated && config.EnableDkimSigning
@@ -216,6 +249,7 @@ public class SmtpServerService(
                             if (config.EnableDmarcCheck && !dmarcPass)
                             {
                                 await writer.WriteLineAsync("550 5.7.1 DMARC policy failure");
+                                session.Reset();
                                 continue;
                             }
                         }
@@ -227,11 +261,27 @@ public class SmtpServerService(
                             await emailService.SaveSentCopyAsync(session.Sender!, signedRaw);
 
                         await writer.WriteLineAsync(delivered + relayed > 0 ? "250 2.0.0 OK" : "550 5.1.1 Delivery failed");
+                        session.Reset();
                     }
                 }
                 else
                 {
-                    session.DataBuilder.Append(line.StartsWith("..") ? line[1..] : line).Append("\r\n");
+                    var messageLine = line.StartsWith("..", StringComparison.Ordinal) ? line[1..] : line;
+                    var lineByteCount = Encoding.UTF8.GetByteCount(messageLine) + 2;
+
+                    if (!session.MessageTooLarge)
+                    {
+                        if (lineByteCount > config.MaxMessageSizeBytes - session.DataByteCount)
+                        {
+                            session.MessageTooLarge = true;
+                            session.DataBuilder.Clear();
+                        }
+                        else
+                        {
+                            session.DataBuilder.Append(messageLine).Append("\r\n");
+                            session.DataByteCount += lineByteCount;
+                        }
+                    }
                 }
                 continue;
             }
@@ -330,8 +380,9 @@ public class SmtpServerService(
                         var tlsStream = new SslStream(upgradableStream, leaveInnerStreamOpen: false);
                         await tlsStream.AuthenticateAsServerAsync(cert);
 
-                        var tlsReader = new StreamReader(tlsStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
-                        var tlsWriter = new StreamWriter(tlsStream, Encoding.UTF8, bufferSize: 4096, leaveOpen: true)
+                        var tlsStreamReader = new StreamReader(tlsStream, ProtocolEncoding, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+                        var tlsReader = new BoundedLineReader(tlsStreamReader);
+                        var tlsWriter = new StreamWriter(tlsStream, ProtocolEncoding, bufferSize: 4096, leaveOpen: true)
                         {
                             AutoFlush = true,
                             NewLine = "\r\n"
@@ -400,7 +451,7 @@ public class SmtpServerService(
     }
 
     private static async Task HandleAuthAsync(
-        string line, StreamReader reader, StreamWriter writer,
+        string line, BoundedLineReader reader, StreamWriter writer,
         SmtpSession session, EmailDbContext db, CancellationToken ct)
     {
         if (session.IsAuthenticated)
@@ -429,7 +480,13 @@ public class SmtpServerService(
                     if (encoded is null)
                     {
                         await writer.WriteLineAsync("334 ");
-                        encoded = await reader.ReadLineAsync(ct);
+                        var encodedResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
+                        encoded = encodedResult.Value;
+                        if (encodedResult.IsTooLong)
+                        {
+                            await writer.WriteLineAsync("501 Authentication response is too long");
+                            return;
+                        }
                         if (encoded is null || encoded == "*")
                         {
                             await writer.WriteLineAsync("501 Authentication cancelled");
@@ -458,11 +515,15 @@ public class SmtpServerService(
             case "LOGIN":
                 {
                     await writer.WriteLineAsync("334 VXNlcm5hbWU6");
-                    var userB64 = await reader.ReadLineAsync(ct);
+                    var userResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
+                    var userB64 = userResult.Value;
+                    if (userResult.IsTooLong) { await writer.WriteLineAsync("501 Authentication response is too long"); return; }
                     if (userB64 is null or "*") { await writer.WriteLineAsync("501 Authentication cancelled"); return; }
 
                     await writer.WriteLineAsync("334 UGFzc3dvcmQ6");
-                    var passB64 = await reader.ReadLineAsync(ct);
+                    var passwordResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
+                    var passB64 = passwordResult.Value;
+                    if (passwordResult.IsTooLong) { await writer.WriteLineAsync("501 Authentication response is too long"); return; }
                     if (passB64 is null or "*") { await writer.WriteLineAsync("501 Authentication cancelled"); return; }
 
                     try
