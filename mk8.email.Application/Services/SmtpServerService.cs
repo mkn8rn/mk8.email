@@ -26,6 +26,7 @@ public class SmtpServerService(
     private sealed class SmtpSession
     {
         public required ListenerMode Mode { get; init; }
+        public bool IsSecure { get; set; }
         public string? AuthenticatedUser { get; set; }
         public bool IsAuthenticated => AuthenticatedUser is not null;
         public string? Sender { get; set; }
@@ -118,8 +119,11 @@ public class SmtpServerService(
 
                 Stream stream = client.GetStream();
 
-                if (mode == ListenerMode.ImplicitTls && config.TlsCertificatePath is not null)
+                if (mode == ListenerMode.ImplicitTls)
                 {
+                    if (config.TlsCertificatePath is null)
+                        throw new InvalidOperationException("Implicit TLS requires a certificate.");
+
                     var cert = LoadCertificate(config);
                     var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
                     await sslStream.AuthenticateAsServerAsync(cert);
@@ -133,7 +137,11 @@ public class SmtpServerService(
                     NewLine = "\r\n"
                 };
 
-                var session = new SmtpSession { Mode = mode };
+                var session = new SmtpSession
+                {
+                    Mode = mode,
+                    IsSecure = mode == ListenerMode.ImplicitTls,
+                };
                 await writer.WriteLineAsync($"220 {config.SmtpHostname} ESMTP mk8.email");
 
                 await RunSmtpSessionAsync(reader, writer, session, emailService, db, config, timeout, stream, remoteIp.ToString());
@@ -234,20 +242,28 @@ public class SmtpServerService(
             switch (verb)
             {
                 case "EHLO":
-                    clientIp = ExtractEhloIp(line);
-                    await WriteEhloAsync(writer, config);
+                    await WriteEhloAsync(writer, config, session.IsSecure);
                     break;
 
                 case "HELO":
-                    clientIp = ExtractEhloIp(line);
                     await writer.WriteLineAsync($"250 {config.SmtpHostname}");
                     break;
 
                 case "AUTH":
+                    if (!session.IsSecure)
+                    {
+                        await writer.WriteLineAsync("538 5.7.11 Encryption required for authentication");
+                        break;
+                    }
                     await HandleAuthAsync(line, reader, writer, session, db, timeout.Token);
                     break;
 
                 case "MAIL":
+                    if (!session.IsSecure && (session.Mode == ListenerMode.Submission || config.RequireTls))
+                    {
+                        await writer.WriteLineAsync("530 5.7.0 Issue STARTTLS first");
+                        break;
+                    }
                     if (session.Mode is ListenerMode.Submission && !session.IsAuthenticated && config.RequireAuth)
                     {
                         await writer.WriteLineAsync("530 5.7.0 Authentication required");
@@ -300,7 +316,11 @@ public class SmtpServerService(
                     break;
 
                 case "STARTTLS":
-                    if (config.EnableStartTls && config.TlsCertificatePath is not null
+                    if (session.IsSecure)
+                    {
+                        await writer.WriteLineAsync("503 5.5.1 TLS is already active");
+                    }
+                    else if (config.EnableStartTls && config.TlsCertificatePath is not null
                         && upgradableStream is not null)
                     {
                         await writer.WriteLineAsync("220 Ready to start TLS");
@@ -319,6 +339,7 @@ public class SmtpServerService(
 
                         session.Reset();
                         session.AuthenticatedUser = null;
+                        session.IsSecure = true;
 
                         await RunSmtpSessionAsync(tlsReader, tlsWriter, session, emailService, db, config, timeout, clientIp: clientIp);
                         return;
@@ -357,16 +378,17 @@ public class SmtpServerService(
         }
     }
 
-    private static async Task WriteEhloAsync(StreamWriter writer, GlobalConfigDB config)
+    private static async Task WriteEhloAsync(StreamWriter writer, GlobalConfigDB config, bool isSecure)
     {
         await writer.WriteLineAsync($"250-{config.SmtpHostname}");
         await writer.WriteLineAsync($"250-SIZE {config.MaxMessageSizeBytes}");
         await writer.WriteLineAsync("250-8BITMIME");
         await writer.WriteLineAsync("250-PIPELINING");
         await writer.WriteLineAsync("250-ENHANCEDSTATUSCODES");
-        if (config.EnableStartTls)
+        if (config.EnableStartTls && !isSecure)
             await writer.WriteLineAsync("250-STARTTLS");
-        await writer.WriteLineAsync("250-AUTH PLAIN LOGIN");
+        if (isSecure)
+            await writer.WriteLineAsync("250-AUTH PLAIN LOGIN");
         await writer.WriteLineAsync("250 OK");
     }
 
@@ -374,7 +396,7 @@ public class SmtpServerService(
     {
         if (config.TlsCertificateKeyPath is not null)
             return X509Certificate2.CreateFromPemFile(config.TlsCertificatePath!, config.TlsCertificateKeyPath);
-        return new X509Certificate2(config.TlsCertificatePath!);
+        return X509CertificateLoader.LoadPkcs12FromFile(config.TlsCertificatePath!, password: null);
     }
 
     private static async Task HandleAuthAsync(
@@ -499,16 +521,6 @@ public class SmtpServerService(
             }
         }
         return (delivered, relayed);
-    }
-
-    private static string? ExtractEhloIp(string line)
-    {
-        // EHLO/HELO lines sometimes contain the client IP in brackets
-        var start = line.IndexOf('[');
-        var end = line.IndexOf(']');
-        if (start >= 0 && end > start)
-            return line[(start + 1)..end];
-        return null;
     }
 
     private static string ExtractAddress(string line)

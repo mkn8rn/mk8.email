@@ -1,0 +1,54 @@
+{
+  "Database": {
+    "Host": "database",
+    "Port": 5432,
+    "Name": "mk8email",
+    "Username": "mk8email",
+    "PasswordFile": "/run/secrets/database_password"
+  },
+  "SuperAdmin": {
+    "Username": "postmaster@mk8n.com",
+    "PasswordFile": "/run/secrets/superadmin_password"
+  },
+  "Smtp": {
+    "Hostname": "mail.mk8n.com",
+    "Port": 2525,
+    "SubmissionPort": 2587,
+    "ImplicitTlsPort": 2465,
+    "EnableSmtp": true,
+    "EnableSubmission": true,
+    "EnableImplicitTls": true,
+    "EnableStartTls": true,
+    "RequireTls": false,
+    "RequireAuth": true,
+    "AllowRelay": true
+  },
+  "Imap": {
+    "Port": 2143,
+    "ImplicitTlsPort": 2993,
+    "EnableImap": true,
+    "EnableImplicitTls": true
+  },
+  "Tls": {
+    "CertificatePath": "/run/secrets/tls_certificate",
+    "CertificateKeyPath": "/run/secrets/tls_private_key"
+  },
+  "Dkim": {
+    "Selector": "default",
+    "EnableSigning": false
+  },
+  "Security": {
+    "EnableSpfCheck": false,
+    "EnableDmarcCheck": false,
+    "PasswordHashScheme": "PBKDF2-SHA256"
+  },
+  "Limits": {
+    "MaxMessageSizeBytes": 26214400,
+    "MaxRecipientsPerMessage": 100,
+    "ConnectionTimeoutSeconds": 300,
+    "MaxConnectionsPerIp": 20
+  },
+  "General": {
+    "AllowRegistration": false
+  }
+}

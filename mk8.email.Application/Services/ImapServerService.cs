@@ -27,6 +27,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     private sealed class ImapSession
     {
         public required ListenerMode Mode { get; init; }
+        public bool IsSecure { get; set; }
         public ImapState State { get; set; } = ImapState.NotAuthenticated;
         public Guid UserId { get; set; }
         public string? UserName { get; set; }
@@ -112,15 +113,22 @@ ILogger<ImapServerService> logger) : BackgroundService
                 Stream stream = client.GetStream();
                 SslStream? sslStream = null;
 
-                if (mode == ListenerMode.ImplicitTls && config.TlsCertificatePath is not null)
+                if (mode == ListenerMode.ImplicitTls)
                 {
+                    if (config.TlsCertificatePath is null)
+                        throw new InvalidOperationException("Implicit TLS requires a certificate.");
+
                     var cert = LoadCertificate(config);
                     sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
                     await sslStream.AuthenticateAsServerAsync(cert);
                     stream = sslStream;
                 }
 
-                var session = new ImapSession { Mode = mode };
+                var session = new ImapSession
+                {
+                    Mode = mode,
+                    IsSecure = mode == ListenerMode.ImplicitTls,
+                };
                 var sendGreeting = true;
 
                 SessionUpgrade upgrade;
@@ -135,6 +143,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                         var tlsStream = new SslStream(stream, leaveInnerStreamOpen: false);
                         await tlsStream.AuthenticateAsServerAsync(cert);
                         stream = tlsStream;
+                        session.IsSecure = true;
                     }
                     else if (upgrade == SessionUpgrade.Compress)
                     {
@@ -197,7 +206,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             switch (command)
             {
                 case "CAPABILITY":
-                    await HandleCapabilityAsync(writer, tag, config);
+                    await HandleCapabilityAsync(writer, tag, config, session);
                     break;
 
                 case "NOOP":
@@ -211,6 +220,16 @@ ILogger<ImapServerService> logger) : BackgroundService
                     break;
 
                 case "STARTTLS":
+                    if (session.IsSecure)
+                    {
+                        await writer.WriteLineAsync($"{tag} BAD TLS is already active");
+                        break;
+                    }
+                    if (session.State != ImapState.NotAuthenticated)
+                    {
+                        await writer.WriteLineAsync($"{tag} BAD STARTTLS is only available before authentication");
+                        break;
+                    }
                     if (config.EnableStartTls && config.TlsCertificatePath is not null)
                     {
                         await writer.WriteLineAsync($"{tag} OK Begin TLS negotiation");
@@ -522,22 +541,40 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        // Signal OK — the caller will upgrade the stream
+        // Signal OK â€” the caller will upgrade the stream
         await writer.WriteLineAsync($"{tag} OK COMPRESS DEFLATE active");
         await writer.FlushAsync();
     }
 
-    private static async Task HandleCapabilityAsync(StreamWriter writer, string tag, GlobalConfigDB config)
+    private static async Task HandleCapabilityAsync(
+        StreamWriter writer,
+        string tag,
+        GlobalConfigDB config,
+        ImapSession session)
     {
-        var caps = "IMAP4rev1 LITERAL+ IDLE NAMESPACE SPECIAL-USE MOVE UNSELECT ID QUOTA UIDPLUS ENABLE LIST-STATUS SORT THREAD=REFERENCES THREAD=ORDEREDSUBJECT CONDSTORE QRESYNC ESEARCH MULTIAPPEND COMPRESS=DEFLATE BINARY OBJECTID AUTH=PLAIN";
-        if (config.EnableStartTls)
-            caps += " STARTTLS";
+        var caps = "IMAP4rev1 LITERAL+ IDLE NAMESPACE SPECIAL-USE MOVE UNSELECT ID QUOTA UIDPLUS ENABLE LIST-STATUS SORT THREAD=REFERENCES THREAD=ORDEREDSUBJECT CONDSTORE QRESYNC ESEARCH MULTIAPPEND COMPRESS=DEFLATE BINARY OBJECTID";
+        if (session.IsSecure)
+        {
+            caps += " AUTH=PLAIN";
+        }
+        else
+        {
+            caps += " LOGINDISABLED";
+            if (config.EnableStartTls)
+                caps += " STARTTLS";
+        }
         await writer.WriteLineAsync($"* CAPABILITY {caps}");
         await writer.WriteLineAsync($"{tag} OK CAPABILITY completed");
     }
 
     private async Task HandleLoginAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
+        if (!session.IsSecure)
+        {
+            await writer.WriteLineAsync($"{tag} NO [PRIVACYREQUIRED] TLS is required for authentication");
+            return;
+        }
+
         if (session.State != ImapState.NotAuthenticated)
         {
             await writer.WriteLineAsync($"{tag} BAD Already authenticated");
@@ -567,6 +604,12 @@ ILogger<ImapServerService> logger) : BackgroundService
     private async Task HandleAuthenticateAsync(
         StreamReader reader, StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
+        if (!session.IsSecure)
+        {
+            await writer.WriteLineAsync($"{tag} NO [PRIVACYREQUIRED] TLS is required for authentication");
+            return;
+        }
+
         if (session.State != ImapState.NotAuthenticated)
         {
             await writer.WriteLineAsync($"{tag} BAD Already authenticated");
@@ -1776,7 +1819,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     {
         if (config.TlsCertificateKeyPath is not null)
             return X509Certificate2.CreateFromPemFile(config.TlsCertificatePath!, config.TlsCertificateKeyPath);
-        return new X509Certificate2(config.TlsCertificatePath!);
+        return X509CertificateLoader.LoadPkcs12FromFile(config.TlsCertificatePath!, password: null);
     }
 
     private static bool ShouldSetSeen(string fetchItems)
@@ -2684,7 +2727,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             out result);
     }
 
-    // — ESEARCH helpers (RFC 4731) —
+    // â€” ESEARCH helpers (RFC 4731) â€”
 
     private static (string[]? returnOpts, string searchCriteria) ParseEsearchReturn(string args)
     {
@@ -2955,7 +2998,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
             if (field == "REVERSE" || field == "(REVERSE")
             {
-                // REVERSE applies to the next criterion — handled by checking context
+                // REVERSE applies to the next criterion â€” handled by checking context
                 continue;
             }
 
@@ -3248,7 +3291,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             db.Emails.Add(email);
             allUids.Add(email.Uid);
 
-            // Read the next line — could be empty (single APPEND) or contain another message spec (MULTIAPPEND)
+            // Read the next line â€” could be empty (single APPEND) or contain another message spec (MULTIAPPEND)
             var nextLine = await reader.ReadLineAsync(ct);
             if (nextLine is null || nextLine.Length == 0 || !nextLine.TrimStart().StartsWith('(') && !nextLine.TrimStart().StartsWith('{'))
                 break;

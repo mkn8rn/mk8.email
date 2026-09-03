@@ -13,7 +13,7 @@ public class AuthService(EmailDbContext db) : IAuthService
     public async Task<LoginResultDTO> LoginAsync(LoginRequestDTO request)
     {
         var user = await db.Users.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Username == request.Username);
+            .FirstOrDefaultAsync(u => u.Username == request.Username && u.IsActive);
 
         if (user is null || !PasswordHasher.Verify(request.Password, user.PasswordHash))
             return new LoginResultDTO(false, null, "Invalid username or password.");
@@ -23,6 +23,17 @@ public class AuthService(EmailDbContext db) : IAuthService
 
     public async Task<LoginResultDTO> RegisterAsync(RegisterRequestDTO request)
     {
+        var registrationAllowed = await db.GlobalConfig.AsNoTracking()
+            .Select(config => config.AllowRegistration)
+            .FirstOrDefaultAsync();
+        if (!registrationAllowed)
+            return new LoginResultDTO(false, null, "Registration is disabled.");
+
+        if (string.IsNullOrWhiteSpace(request.Username) || string.IsNullOrWhiteSpace(request.Password))
+            return new LoginResultDTO(false, null, "A username and password are required.");
+        if (request.Password.Length < 12)
+            return new LoginResultDTO(false, null, "The password must contain at least 12 characters.");
+
         if (await db.Users.AnyAsync(u => u.Username == request.Username))
             return new LoginResultDTO(false, null, "An account with this username already exists.");
 

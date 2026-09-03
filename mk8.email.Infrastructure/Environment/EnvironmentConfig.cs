@@ -1,21 +1,142 @@
 using mk8.email.Infrastructure.Models;
+using Npgsql;
 
 namespace mk8.email.Infrastructure.Environment;
 
 public sealed class EnvironmentConfig
 {
-    public required DatabaseConfig Database { get; init; }
-    public required SuperAdminConfig SuperAdmin { get; init; }
-    public required SmtpConfig Smtp { get; init; }
-    public required ImapConfig Imap { get; init; }
-    public required TlsConfig Tls { get; init; }
-    public required DkimConfig Dkim { get; init; }
-    public required SecurityConfig Security { get; init; }
-    public required LimitsConfig Limits { get; init; }
-    public required GeneralConfig General { get; init; }
+    public DatabaseConfig Database { get; init; } = new();
+    public SuperAdminConfig SuperAdmin { get; init; } = new();
+    public SmtpConfig Smtp { get; init; } = new();
+    public ImapConfig Imap { get; init; } = new();
+    public TlsConfig Tls { get; init; } = new();
+    public DkimConfig Dkim { get; init; } = new();
+    public SecurityConfig Security { get; init; } = new();
+    public LimitsConfig Limits { get; init; } = new();
+    public GeneralConfig General { get; init; } = new();
 
-    public string BuildConnectionString() =>
-        $"Host={Database.Host};Port={Database.Port};Database={Database.Name};Username={Database.Username};Password={Database.Password}";
+    public string BuildConnectionString()
+    {
+        return new NpgsqlConnectionStringBuilder
+        {
+            Host = Database.Host,
+            Port = Database.Port,
+            Database = Database.Name,
+            Username = Database.Username,
+            Password = Database.Password,
+            ApplicationName = "mk8.email",
+        }.ConnectionString;
+    }
+
+    public IReadOnlyList<string> Validate(bool isDevelopment = false)
+    {
+        var errors = new List<string>();
+
+        RequireValue(errors, Database.Host, "Database.Host is required.");
+        RequirePort(errors, Database.Port, "Database.Port");
+        RequireValue(errors, Database.Name, "Database.Name is required.");
+        RequireValue(errors, Database.Username, "Database.Username is required.");
+        RequireSecret(errors, Database.Password, "Database.Password", isDevelopment);
+
+        RequireValue(errors, SuperAdmin.Username, "SuperAdmin.Username is required.");
+        RequireSecret(errors, SuperAdmin.Password, "SuperAdmin.Password", isDevelopment);
+
+        if (Uri.CheckHostName(Smtp.Hostname) != UriHostNameType.Dns)
+            errors.Add("Smtp.Hostname must be a valid DNS name.");
+        if (!isDevelopment && !Smtp.Hostname.Contains('.'))
+            errors.Add("Smtp.Hostname must be a fully qualified DNS name in production.");
+
+        var enabledPorts = new List<(string Name, int Port)>();
+        AddEnabledPort(enabledPorts, Smtp.EnableSmtp, "Smtp.Port", Smtp.Port);
+        AddEnabledPort(enabledPorts, Smtp.EnableSubmission, "Smtp.SubmissionPort", Smtp.SubmissionPort);
+        AddEnabledPort(enabledPorts, Smtp.EnableImplicitTls, "Smtp.ImplicitTlsPort", Smtp.ImplicitTlsPort);
+        AddEnabledPort(enabledPorts, Imap.EnableImap, "Imap.Port", Imap.Port);
+        AddEnabledPort(enabledPorts, Imap.EnableImplicitTls, "Imap.ImplicitTlsPort", Imap.ImplicitTlsPort);
+
+        if (enabledPorts.Count == 0)
+            errors.Add("Enable at least one SMTP or IMAP listener.");
+
+        foreach (var enabledPort in enabledPorts)
+            RequirePort(errors, enabledPort.Port, enabledPort.Name);
+
+        foreach (var duplicate in enabledPorts.GroupBy(item => item.Port).Where(group => group.Count() > 1))
+            errors.Add($"Enabled listeners cannot share port {duplicate.Key}.");
+
+        if (Smtp.EnableSubmission && !Smtp.EnableStartTls)
+            errors.Add("SMTP submission requires STARTTLS.");
+        if (Smtp.AllowRelay && !Smtp.RequireAuth)
+            errors.Add("SMTP relay requires authentication.");
+        if (Smtp.RequireTls && !Smtp.EnableStartTls && !Smtp.EnableImplicitTls)
+            errors.Add("Smtp.RequireTls requires STARTTLS or implicit TLS.");
+        if (!isDevelopment && Imap.EnableImap && !Smtp.EnableStartTls)
+            errors.Add("The production IMAP listener requires STARTTLS.");
+
+        var needsCertificate = Smtp.EnableStartTls || Smtp.EnableImplicitTls || Imap.EnableImplicitTls;
+        if (needsCertificate)
+            RequireFile(errors, Tls.CertificatePath, "Tls.CertificatePath");
+        if (!string.IsNullOrWhiteSpace(Tls.CertificateKeyPath))
+            RequireFile(errors, Tls.CertificateKeyPath, "Tls.CertificateKeyPath");
+        if (Dkim.EnableSigning)
+            RequireFile(errors, Dkim.PrivateKeyPath, "Dkim.PrivateKeyPath");
+
+        if (!string.Equals(Security.PasswordHashScheme, "PBKDF2-SHA256", StringComparison.Ordinal))
+            errors.Add("Security.PasswordHashScheme must be PBKDF2-SHA256.");
+        if (!isDevelopment && (Security.EnableSpfCheck || Security.EnableDmarcCheck))
+            errors.Add("The built-in SPF and DMARC checks are not approved for production.");
+
+        if (Limits.MaxMessageSizeBytes < 64 * 1024)
+            errors.Add("Limits.MaxMessageSizeBytes must be at least 65536.");
+        if (Limits.MaxRecipientsPerMessage is < 1 or > 1000)
+            errors.Add("Limits.MaxRecipientsPerMessage must be from 1 through 1000.");
+        if (Limits.ConnectionTimeoutSeconds is < 10 or > 3600)
+            errors.Add("Limits.ConnectionTimeoutSeconds must be from 10 through 3600.");
+        if (Limits.MaxConnectionsPerIp is < 1 or > 10000)
+            errors.Add("Limits.MaxConnectionsPerIp must be from 1 through 10000.");
+
+        return errors;
+    }
+
+    private static void AddEnabledPort(List<(string Name, int Port)> ports, bool enabled, string name, int port)
+    {
+        if (enabled)
+            ports.Add((name, port));
+    }
+
+    private static void RequireFile(List<string> errors, string? path, string name)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            errors.Add($"{name} is required.");
+            return;
+        }
+
+        if (!File.Exists(Path.GetFullPath(path)))
+            errors.Add($"{name} does not exist.");
+    }
+
+    private static void RequirePort(List<string> errors, int port, string name)
+    {
+        if (port is < 1 or > 65535)
+            errors.Add($"{name} must be from 1 through 65535.");
+    }
+
+    private static void RequireSecret(List<string> errors, string value, string name, bool isDevelopment)
+    {
+        if (string.IsNullOrWhiteSpace(value) || string.Equals(value, "CHANGE_ME", StringComparison.OrdinalIgnoreCase))
+        {
+            errors.Add($"{name} is required.");
+            return;
+        }
+
+        if (!isDevelopment && value.Length < 16)
+            errors.Add($"{name} must contain at least 16 characters in production.");
+    }
+
+    private static void RequireValue(List<string> errors, string value, string message)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            errors.Add(message);
+    }
 
     public GlobalConfigDB ToGlobalConfig() => new()
     {
@@ -62,13 +183,15 @@ public sealed class DatabaseConfig
     public int Port { get; init; } = 5432;
     public string Name { get; init; } = "mk8email";
     public string Username { get; init; } = "postgres";
-    public string Password { get; init; } = "CHANGE_ME";
+    public string Password { get; set; } = string.Empty;
+    public string? PasswordFile { get; init; }
 }
 
 public sealed class SuperAdminConfig
 {
     public string Username { get; init; } = "admin";
-    public string Password { get; init; } = "CHANGE_ME";
+    public string Password { get; set; } = string.Empty;
+    public string? PasswordFile { get; init; }
 }
 
 public sealed class SmtpConfig
