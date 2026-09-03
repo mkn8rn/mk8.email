@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    printf '%s\n' "Usage: install-native-release ARCHIVE RELEASE_ID" >&2
+    exit 2
+fi
+
+archive=$1
+release_id=$2
+
+if [ ! -f "$archive" ]; then
+    printf '%s\n' "The release archive does not exist." >&2
+    exit 1
+fi
+
+case "$release_id" in
+    *[!0-9a-f]*|'')
+        printf '%s\n' "The release identifier is not valid." >&2
+        exit 1
+        ;;
+esac
+
+release_root=/opt/mk8email/releases
+release_dir="$release_root/$release_id"
+stage="$release_root/.installing-$release_id"
+
+if [ -e "$release_dir" ] || [ -e "$stage" ]; then
+    printf '%s\n' "The release target already exists." >&2
+    exit 1
+fi
+
+cleanup() {
+    case "$stage" in
+        /opt/mk8email/releases/.installing-*)
+            if [ -d "$stage" ]; then
+                rm -rf -- "$stage"
+            fi
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+install -d -o root -g root -m 0755 /opt/mk8email "$release_root" "$stage"
+tar --extract --gzip --file="$archive" --directory="$stage" --no-same-owner
+test -f "$stage/mk8.email.Application.CLI.dll"
+
+chown -R root:root "$stage"
+find "$stage" -type d -exec chmod 0555 {} +
+find "$stage" -type f -exec chmod 0444 {} +
+mv "$stage" "$release_dir"
+stage=
+ln -sfn "$release_dir" /opt/mk8email/current
+
+printf '%s\n' "$release_dir"

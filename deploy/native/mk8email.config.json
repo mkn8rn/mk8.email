@@ -1,20 +1,20 @@
 {
   "Database": {
-    "Host": "database",
+    "Host": "127.0.0.1",
     "Port": 5432,
     "Name": "mk8email",
     "Username": "mk8email",
-    "PasswordFile": "/run/secrets/database_password"
+    "PasswordFile": "/etc/mk8email/secrets/database_password"
   },
   "SuperAdmin": {
     "Username": "postmaster@mk8n.com",
-    "PasswordFile": "/run/secrets/superadmin_password"
+    "PasswordFile": "/etc/mk8email/secrets/superadmin_password"
   },
   "Smtp": {
     "Hostname": "mail.mk8n.com",
-    "Port": 2525,
-    "SubmissionPort": 2587,
-    "ImplicitTlsPort": 2465,
+    "Port": 25,
+    "SubmissionPort": 587,
+    "ImplicitTlsPort": 465,
     "EnableSmtp": true,
     "EnableSubmission": true,
     "EnableImplicitTls": true,
@@ -24,17 +24,17 @@
     "AllowRelay": true
   },
   "Imap": {
-    "Port": 2143,
-    "ImplicitTlsPort": 2993,
+    "Port": 143,
+    "ImplicitTlsPort": 993,
     "EnableImap": false,
     "EnableImplicitTls": true
   },
   "Tls": {
-    "CertificatePath": "/run/secrets/tls_certificate",
-    "CertificateKeyPath": "/run/secrets/tls_private_key"
+    "CertificatePath": "/etc/mk8email/tls/fullchain.pem",
+    "CertificateKeyPath": "/etc/mk8email/tls/privkey.pem"
   },
   "Dkim": {
-    "PrivateKeyPath": "/run/secrets/dkim_private_key",
+    "PrivateKeyPath": "/etc/mk8email/dkim/s202609.private.pem",
     "Selector": "s202609",
     "EnableSigning": true
   },

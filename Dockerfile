@@ -22,7 +22,7 @@ COPY --from=build --chown=app:app /app/publish .
 
 USER app
 
-EXPOSE 2525 2587 2465 2143 2993
+EXPOSE 2525 2587 2465 2993
 
 HEALTHCHECK --interval=30s --timeout=12s --start-period=30s --retries=3 \
     CMD ["dotnet", "mk8.email.Application.CLI.dll", "--healthcheck"]
