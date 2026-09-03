@@ -41,6 +41,11 @@
           "MSTest.Analyzers": "4.3.3"
         }
       },
+      "DnsClient": {
+        "type": "Transitive",
+        "resolved": "1.8.0",
+        "contentHash": "RRwtaCXkXWsx0mmsReGDqCbRLtItfUbkRJlet1FpdciVhyMGKcPd57T1+8Jki9ojHlq9fntVhXQroOOgRak8DQ=="
+      },
       "Microsoft.ApplicationInsights": {
         "type": "Transitive",
         "resolved": "2.23.0",
@@ -275,6 +280,7 @@
       "mk8.email.application.core": {
         "type": "Project",
         "dependencies": {
+          "DnsClient": "[1.8.0, )",
           "Microsoft.EntityFrameworkCore": "[10.0.2, )",
           "Microsoft.Extensions.Configuration.Binder": "[10.0.2, )",
           "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.2, )",

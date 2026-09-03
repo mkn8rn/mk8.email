@@ -1,8 +1,6 @@
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -27,7 +25,7 @@ public sealed class TransportSecurityTests
     {
         _testDirectory = Path.Combine(Path.GetTempPath(), $"mk8email-transport-{Guid.NewGuid():N}");
         Directory.CreateDirectory(_testDirectory);
-        _certificatePath = CreateCertificate(_testDirectory);
+        _certificatePath = TestCertificateFactory.Create(_testDirectory);
     }
 
     [TestCleanup]
@@ -252,30 +250,6 @@ public sealed class TransportSecurityTests
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
-    }
-
-    private static string CreateCertificate(string directory)
-    {
-        using var key = RSA.Create(2048);
-        var request = new CertificateRequest(
-            "CN=mail.mk8n.com",
-            key,
-            HashAlgorithmName.SHA256,
-            RSASignaturePadding.Pkcs1);
-        var names = new SubjectAlternativeNameBuilder();
-        names.AddDnsName("mail.mk8n.com");
-        request.CertificateExtensions.Add(names.Build());
-        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
-        request.CertificateExtensions.Add(new X509KeyUsageExtension(
-            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
-            false));
-
-        using var certificate = request.CreateSelfSigned(
-            DateTimeOffset.UtcNow.AddMinutes(-1),
-            DateTimeOffset.UtcNow.AddDays(1));
-        var path = Path.Combine(directory, "server.pfx");
-        File.WriteAllBytes(path, certificate.Export(X509ContentType.Pkcs12));
-        return path;
     }
 
     private sealed class ServerFixture(
