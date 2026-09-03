@@ -51,6 +51,14 @@ public sealed class EnvironmentConfigTests
     }
 
     [TestMethod]
+    public void ProductionDkimSigningRejectsInvalidSelector()
+    {
+        var errors = CreateValidConfiguration(enableDkimSigning: true, dkimSelector: "-invalid").Validate();
+
+        StringAssert.Contains(string.Join('|', errors), "Dkim.Selector must be a DNS label.");
+    }
+
+    [TestMethod]
     public void LoaderReadsPasswordsFromSecretFiles()
     {
         var databasePasswordPath = WriteFile("database-password", "database-secret-value");
@@ -82,7 +90,9 @@ public sealed class EnvironmentConfigTests
         string? adminPasswordFile = null,
         bool enableStartTls = true,
         bool enableImap = true,
-        bool enableSpfCheck = false)
+        bool enableSpfCheck = false,
+        bool enableDkimSigning = false,
+        string dkimSelector = "default")
     {
         return new EnvironmentConfig
         {
@@ -128,7 +138,9 @@ public sealed class EnvironmentConfigTests
             },
             Dkim = new DkimConfig
             {
-                EnableSigning = false,
+                PrivateKeyPath = enableDkimSigning ? _certificatePath : null,
+                Selector = dkimSelector,
+                EnableSigning = enableDkimSigning,
             },
             Security = new SecurityConfig
             {

@@ -2,7 +2,7 @@
 
 ## Current boundary
 
-Do not route `mk8n.com` mail to this service yet. Database migrations and standards-compliant mail authentication remain required.
+Do not route `mk8n.com` mail to this service yet. Database migrations and standards-compliant inbound mail authentication remain required.
 
 This foundation provides strict configuration, secret files, non-root execution, isolated PostgreSQL networking, TLS ports, and a container health check.
 
@@ -22,11 +22,18 @@ Create the ignored `deploy/secrets` directory. Store each secret in its named fi
 mkdir -p deploy/secrets
 openssl rand -base64 48 > deploy/secrets/database_password
 openssl rand -base64 48 > deploy/secrets/superadmin_password
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out deploy/secrets/dkim_private_key.pem
 ```
 
 Copy the complete certificate chain to `deploy/secrets/tls_certificate.pem`. Copy its private key to `deploy/secrets/tls_private_key.pem`.
 
 Restrict all secret files to the deployment administrator. Do not add these files to Git.
+
+Extract the DKIM public-key value after private-key creation.
+
+```sh
+openssl pkey -in deploy/secrets/dkim_private_key.pem -pubout -outform DER | openssl base64 -A
+```
 
 ## Container checks
 
@@ -61,10 +68,13 @@ Replace `203.0.113.10` with the server address. Create equivalent records at the
 mail.mk8n.com. 300 IN A 203.0.113.10
 mk8n.com. 300 IN MX 10 mail.mk8n.com.
 mk8n.com. 300 IN TXT "v=spf1 mx -all"
+default._domainkey.mk8n.com. 300 IN TXT "v=DKIM1; k=rsa; p=REPLACE_WITH_DKIM_PUBLIC_KEY"
 _dmarc.mk8n.com. 300 IN TXT "v=DMARC1; p=none; rua=mailto:dmarc@mk8n.com"
 ```
 
-Do not publish a DKIM selector until the server has standards-compliant signing. Change the DMARC policy only after measured mail-flow results.
+Replace `REPLACE_WITH_DKIM_PUBLIC_KEY` with the command output. Confirm a test signature before the DNS cutover.
+
+Change the DMARC policy only after measured mail-flow results.
 
 ## Operations
 
@@ -80,7 +90,7 @@ The repository contains no Entity Framework migrations. The user must explicitly
 
 Outbound delivery uses MX routing and opportunistic STARTTLS. It still lacks durable retries, bounce creation, MTA-STS, and DANE policy checks.
 
-Inbound SPF, DKIM, and DMARC checks are not standards-compliant and stay disabled.
+Inbound SPF, DKIM verification, and DMARC evaluation are not implemented and stay disabled.
 
 Transport tests cover SMTP and IMAP greetings, STARTTLS, authentication exposure, and SMTP size limits. Broader mailbox interoperability still needs automated tests.
 

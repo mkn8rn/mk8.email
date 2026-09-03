@@ -8,8 +8,11 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using mk8.email.Application.Interfaces;
 using mk8.email.Application.Services;
+using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
+using mk8.email.Infrastructure.Models;
+using mk8.email.Utils;
 
 namespace mk8.email.Application.Tests;
 
@@ -17,6 +20,9 @@ namespace mk8.email.Application.Tests;
 [DoNotParallelize]
 public sealed class TransportSecurityTests
 {
+    private const string TestUsername = "user@mk8n.com";
+    private const string TestPassword = "correct horse battery staple";
+
     private string _testDirectory = null!;
     private string _certificatePath = null!;
 
@@ -164,6 +170,48 @@ public sealed class TransportSecurityTests
 
     [TestMethod]
     [Timeout(10_000)]
+    public async Task SmtpReturnsTemporaryFailureWhenDkimSigningFails()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port, enableDkimSigning: true);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        server.DkimSigningService.ThrowOnSign = true;
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("EHLO client.example");
+        await connection.ReadSmtpResponseAsync();
+        await connection.WriteLineAsync("STARTTLS");
+        await connection.ReadLineAsync();
+        await connection.UpgradeToTlsAsync("mail.mk8n.com");
+        await connection.WriteLineAsync("EHLO client.example");
+        await connection.ReadSmtpResponseAsync();
+        var credentials = Convert.ToBase64String(Encoding.UTF8.GetBytes($"\0{TestUsername}\0{TestPassword}"));
+        await connection.WriteLineAsync($"AUTH PLAIN {credentials}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("235 ", StringComparison.Ordinal));
+        await connection.WriteLineAsync($"MAIL FROM:<{TestUsername}>");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("RCPT TO:<recipient@example.com>");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("DATA");
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync($"From: {TestUsername}");
+        await connection.WriteLineAsync("To: recipient@example.com");
+        await connection.WriteLineAsync("Subject: signing failure");
+        await connection.WriteLineAsync(string.Empty);
+        await connection.WriteLineAsync("body");
+        await connection.WriteLineAsync(".");
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("451 ", StringComparison.Ordinal));
+        Assert.AreEqual(1, server.DkimSigningService.SignCalls);
+        Assert.AreEqual(0, server.EmailService.DeliverCalls);
+
+        await connection.WriteLineAsync("NOOP");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
     public async Task ImapClearTextDisablesLoginAndHasNoByteOrderMark()
     {
         var port = ReservePort();
@@ -205,7 +253,11 @@ public sealed class TransportSecurityTests
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
     }
 
-    private EnvironmentConfig CreateEnvironment(int? smtpPort = null, int? submissionPort = null, int? imapPort = null)
+    private EnvironmentConfig CreateEnvironment(
+        int? smtpPort = null,
+        int? submissionPort = null,
+        int? imapPort = null,
+        bool enableDkimSigning = false)
     {
         return new EnvironmentConfig
         {
@@ -233,6 +285,12 @@ public sealed class TransportSecurityTests
             {
                 CertificatePath = _certificatePath,
             },
+            Dkim = new DkimConfig
+            {
+                PrivateKeyPath = enableDkimSigning ? "unused-test-key.pem" : null,
+                Selector = "default",
+                EnableSigning = enableDkimSigning,
+            },
             Limits = new LimitsConfig
             {
                 MaxMessageSizeBytes = 65_536,
@@ -255,30 +313,33 @@ public sealed class TransportSecurityTests
     private sealed class ServerFixture(
         ServiceProvider services,
         IHostedService hostedService,
-        StubEmailService emailService) : IAsyncDisposable
+        StubEmailService emailService,
+        StubDkimSigningService dkimSigningService) : IAsyncDisposable
     {
         public StubEmailService EmailService { get; } = emailService;
+        public StubDkimSigningService DkimSigningService { get; } = dkimSigningService;
 
         public static async Task<ServerFixture> StartSmtpAsync(EnvironmentConfig environment, int port)
         {
-            var (services, emailService) = CreateServices();
+            var (services, emailService, dkimSigningService) = CreateServices();
             var hostedService = new SmtpServerService(
                 services.GetRequiredService<IServiceScopeFactory>(),
                 environment,
+                dkimSigningService,
                 NullLogger<SmtpServerService>.Instance);
-            var fixture = new ServerFixture(services, hostedService, emailService);
+            var fixture = new ServerFixture(services, hostedService, emailService, dkimSigningService);
             await fixture.StartAsync(port);
             return fixture;
         }
 
         public static async Task<ServerFixture> StartImapAsync(EnvironmentConfig environment, int port)
         {
-            var (services, emailService) = CreateServices();
+            var (services, emailService, dkimSigningService) = CreateServices();
             var hostedService = new ImapServerService(
                 services.GetRequiredService<IServiceScopeFactory>(),
                 environment,
                 NullLogger<ImapServerService>.Instance);
-            var fixture = new ServerFixture(services, hostedService, emailService);
+            var fixture = new ServerFixture(services, hostedService, emailService, dkimSigningService);
             await fixture.StartAsync(port);
             return fixture;
         }
@@ -290,13 +351,33 @@ public sealed class TransportSecurityTests
             await services.DisposeAsync();
         }
 
-        private static (ServiceProvider Services, StubEmailService EmailService) CreateServices()
+        private static (
+            ServiceProvider Services,
+            StubEmailService EmailService,
+            StubDkimSigningService DkimSigningService) CreateServices()
         {
             var emailService = new StubEmailService();
+            var dkimSigningService = new StubDkimSigningService();
+            var databaseName = $"transport-{Guid.NewGuid():N}";
             var serviceCollection = new ServiceCollection();
             serviceCollection.AddSingleton<IEmailService>(emailService);
-            serviceCollection.AddScoped(_ => new EmailDbContext(new DbContextOptionsBuilder<EmailDbContext>().Options));
-            return (serviceCollection.BuildServiceProvider(), emailService);
+            serviceCollection.AddDbContext<EmailDbContext>(options =>
+                options.UseInMemoryDatabase(databaseName));
+            var services = serviceCollection.BuildServiceProvider();
+            using (var scope = services.CreateScope())
+            {
+                var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+                database.Users.Add(new UserDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Username = TestUsername,
+                    PasswordHash = PasswordHasher.Hash(TestPassword),
+                    Role = nameof(UserRole.User),
+                    IsActive = true,
+                });
+                database.SaveChanges();
+            }
+            return (services, emailService, dkimSigningService);
         }
 
         private async Task StartAsync(int port)
@@ -425,11 +506,23 @@ public sealed class TransportSecurityTests
 
         public Task<bool> RelayAsync(string sender, string recipient, string rawMessage) => Task.FromResult(false);
 
-        public string SignWithDkim(string rawMessage, string domain, string selector, string privateKeyPath) => rawMessage;
-
         public Task<(bool spfPass, bool dkimPass, bool dmarcPass)> VerifyInboundAuthAsync(
             string senderDomain,
             string rawMessage,
             string? clientIp) => Task.FromResult((false, false, false));
+    }
+
+    private sealed class StubDkimSigningService : IDkimSigningService
+    {
+        public bool ThrowOnSign { get; set; }
+        public int SignCalls { get; private set; }
+
+        public string Sign(string rawMessage, string domain, string selector, string privateKeyPath)
+        {
+            SignCalls++;
+            if (ThrowOnSign)
+                throw new DkimSigningException("Test signing failure.", new InvalidOperationException());
+            return rawMessage;
+        }
     }
 }

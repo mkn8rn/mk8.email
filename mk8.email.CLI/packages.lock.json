@@ -32,6 +32,11 @@
           "Microsoft.Extensions.Options": "10.0.2"
         }
       },
+      "BouncyCastle.Cryptography": {
+        "type": "Transitive",
+        "resolved": "2.6.2",
+        "contentHash": "7oWOcvnntmMKNzDLsdxAYqApt+AjpRpP2CShjMfIa3umZ42UQMvH0tl1qAliYPNYO6vTdcGMqnRrCPmsfzTI1w=="
+      },
       "DnsClient": {
         "type": "Transitive",
         "resolved": "1.8.0",
@@ -339,6 +344,15 @@
         "resolved": "10.0.2",
         "contentHash": "QmSiO+oLBEooGgB3i0GRXyeYRDHjllqt3k365jwfZlYWhvSHA3UL2NEVV5m8aZa041eIlblo6KMI5txvTMpTwA=="
       },
+      "MimeKit": {
+        "type": "Transitive",
+        "resolved": "4.17.0",
+        "contentHash": "h/KXsCreJf8RpR/PSAtlbvYtZFndp9N8Wn1Bs248AL7ITyhn+AiIY5bLTvt60tbN2mu6g8KadtBNWygTji2lqg==",
+        "dependencies": {
+          "BouncyCastle.Cryptography": "2.6.2",
+          "System.Security.Cryptography.Pkcs": "10.0.0"
+        }
+      },
       "Npgsql": {
         "type": "Transitive",
         "resolved": "10.0.0",
@@ -362,6 +376,11 @@
         "resolved": "10.0.2",
         "contentHash": "TJPpTLF5MFPobq09c9BQ5X8QuviQfsKvH0Jbm7MkGylGvfIdRqJQLZDPC5sMRFkk9aZhmgir1NJKekip2NxfaA=="
       },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.0",
+        "contentHash": "UPWqLSygJlFerRi9XNIuM0a1VC8gHUIufyP24xQ0sc+XimqUAEcjpOz9DhKpyDjH+5B/wO3RpC0KpkEeDj/ddg=="
+      },
       "mk8.email.application.core": {
         "type": "Project",
         "dependencies": {
@@ -371,6 +390,7 @@
           "Microsoft.Extensions.DependencyInjection.Abstractions": "[10.0.2, )",
           "Microsoft.Extensions.Hosting.Abstractions": "[10.0.2, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.2, )",
+          "MimeKit": "[4.17.0, )",
           "mk8.email.Contracts": "[1.0.0, )",
           "mk8.email.Infrastructure": "[1.0.0, )",
           "mk8.email.Utils": "[1.0.0, )"

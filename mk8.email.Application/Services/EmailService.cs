@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using mk8.email.Application.Interfaces;
@@ -236,127 +235,10 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
         return await outboundMailRelay.RelayAsync(sender, recipient, rawMessage);
     }
 
-    // ?? DKIM signing ??
-
-    public string SignWithDkim(string rawMessage, string domain, string selector, string privateKeyPath)
-    {
-        try
-        {
-            var (_, body, headers) = ParseMessage(rawMessage);
-
-            // Canonicalize body (simple): ensure trailing CRLF
-            var canonBody = body.TrimEnd() + "\r\n";
-            var bodyHash = Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(canonBody)));
-
-            // Headers to sign
-            var signedHeaders = "from:to:subject:date:message-id";
-
-            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-            // Build DKIM header without b= value for signing
-            var dkimTemplate = $"v=1; a=rsa-sha256; c=simple/simple; d={domain}; s={selector}; " +
-                               $"t={timestamp}; h={signedHeaders}; bh={bodyHash}; b=";
-
-            // Build header block to sign
-            var headerBlock = new StringBuilder();
-            foreach (var headerName in signedHeaders.Split(':'))
-            {
-                var value = ExtractHeaderValue(headers, headerName.Trim());
-                if (!string.IsNullOrEmpty(value))
-                    headerBlock.Append($"{headerName.Trim()}: {value}\r\n");
-            }
-            headerBlock.Append($"dkim-signature: {dkimTemplate}");
-
-            // Sign
-            var keyPem = File.ReadAllText(privateKeyPath);
-            using var rsa = RSA.Create();
-            rsa.ImportFromPem(keyPem);
-
-            var signature = rsa.SignData(
-                Encoding.UTF8.GetBytes(headerBlock.ToString()),
-                HashAlgorithmName.SHA256,
-                RSASignaturePadding.Pkcs1);
-
-            var b64Signature = Convert.ToBase64String(signature);
-
-            return $"DKIM-Signature: {dkimTemplate}{b64Signature}\r\n{rawMessage}";
-        }
-        catch
-        {
-            // If signing fails, return the original message unsigned
-            return rawMessage;
-        }
-    }
-
     // ?? SPF / DKIM / DMARC verification (inbound) ??
 
-    public async Task<(bool spfPass, bool dkimPass, bool dmarcPass)> VerifyInboundAuthAsync(
-        string senderDomain, string rawMessage, string? clientIp)
-    {
-        var spfPass = await CheckSpfAsync(senderDomain, clientIp);
-        var dkimPass = VerifyDkimSignature(rawMessage);
-        // DMARC passes if at least one of SPF or DKIM passes and aligns with domain
-        var dmarcPass = spfPass || dkimPass;
-        return (spfPass, dkimPass, dmarcPass);
-    }
+    public Task<(bool spfPass, bool dkimPass, bool dmarcPass)> VerifyInboundAuthAsync(
+        string senderDomain, string rawMessage, string? clientIp) =>
+        Task.FromResult((false, false, false));
 
-    private static async Task<bool> CheckSpfAsync(string domain, string? clientIp)
-    {
-        if (string.IsNullOrEmpty(clientIp))
-            return false;
-
-        try
-        {
-            // SPF check: resolve the sender domain and verify the client IP is in its address list
-            var hostEntry = await System.Net.Dns.GetHostEntryAsync(domain);
-            var clientAddr = System.Net.IPAddress.Parse(clientIp);
-            return Array.Exists(hostEntry.AddressList, a => a.Equals(clientAddr));
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool VerifyDkimSignature(string rawMessage)
-    {
-        // Extract DKIM-Signature header
-        var (_, _, headers) = ParseMessage(rawMessage);
-        var dkimHeader = ExtractHeaderValue(headers, "DKIM-Signature");
-        if (string.IsNullOrEmpty(dkimHeader))
-            return false;
-
-        // Parse DKIM fields
-        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var part in dkimHeader.Split(';'))
-        {
-            var eqIdx = part.IndexOf('=');
-            if (eqIdx > 0)
-            {
-                var key = part[..eqIdx].Trim();
-                var val = part[(eqIdx + 1)..].Trim();
-                fields.TryAdd(key, val);
-            }
-        }
-
-        if (!fields.TryGetValue("d", out var domain) ||
-            !fields.TryGetValue("s", out var selector) ||
-            !fields.TryGetValue("b", out _) ||
-            !fields.TryGetValue("bh", out var bodyHashB64))
-            return false;
-
-        // Verify body hash
-        var (_, body, _) = ParseMessage(rawMessage);
-        var canonBody = body.TrimEnd() + "\r\n";
-        var computedBodyHash = Convert.ToBase64String(SHA256.HashData(Encoding.UTF8.GetBytes(canonBody)));
-
-        if (computedBodyHash != bodyHashB64)
-            return false;
-
-        // Signature verification requires fetching the public key from DNS (selector._domainkey.domain TXT record).
-        // Full DNS TXT lookup is not available in base .NET; accept body-hash-verified messages as partially valid.
-        _ = domain;
-        _ = selector;
-        return true;
-    }
 }

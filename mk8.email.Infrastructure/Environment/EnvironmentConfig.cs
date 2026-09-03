@@ -77,7 +77,11 @@ public sealed class EnvironmentConfig
         if (!string.IsNullOrWhiteSpace(Tls.CertificateKeyPath))
             RequireFile(errors, Tls.CertificateKeyPath, "Tls.CertificateKeyPath");
         if (Dkim.EnableSigning)
+        {
             RequireFile(errors, Dkim.PrivateKeyPath, "Dkim.PrivateKeyPath");
+            if (!DkimIdentityValidator.IsValidSelector(Dkim.Selector))
+                errors.Add("Dkim.Selector must be a DNS label.");
+        }
 
         if (!string.Equals(Security.PasswordHashScheme, "PBKDF2-SHA256", StringComparison.Ordinal))
             errors.Add("Security.PasswordHashScheme must be PBKDF2-SHA256.");
