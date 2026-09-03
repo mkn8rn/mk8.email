@@ -1,0 +1,159 @@
+using System.Text.Json;
+using mk8.email.Infrastructure.Environment;
+
+namespace mk8.email.Infrastructure.Tests;
+
+[TestClass]
+public sealed class EnvironmentConfigTests
+{
+    private string _testDirectory = null!;
+    private string _certificatePath = null!;
+
+    [TestInitialize]
+    public void Initialize()
+    {
+        _testDirectory = Path.Combine(Path.GetTempPath(), $"mk8email-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_testDirectory);
+        _certificatePath = WriteFile("certificate.pem", "test certificate");
+    }
+
+    [TestCleanup]
+    public void Cleanup()
+    {
+        if (Directory.Exists(_testDirectory))
+            Directory.Delete(_testDirectory, recursive: true);
+    }
+
+    [TestMethod]
+    public void ValidProductionConfigurationHasNoErrors()
+    {
+        var errors = CreateValidConfiguration().Validate();
+
+        Assert.AreEqual(0, errors.Count, string.Join(System.Environment.NewLine, errors));
+    }
+
+    [TestMethod]
+    public void ProductionSubmissionRequiresStartTls()
+    {
+        var errors = CreateValidConfiguration(enableStartTls: false, enableImap: false).Validate();
+
+        StringAssert.Contains(string.Join('|', errors), "SMTP submission requires STARTTLS.");
+    }
+
+    [TestMethod]
+    public void ProductionRejectsSimplifiedInboundAuthenticationChecks()
+    {
+        var errors = CreateValidConfiguration(enableSpfCheck: true).Validate();
+
+        StringAssert.Contains(
+            string.Join('|', errors),
+            "The built-in SPF and DMARC checks are not approved for production.");
+    }
+
+    [TestMethod]
+    public void LoaderReadsPasswordsFromSecretFiles()
+    {
+        var databasePasswordPath = WriteFile("database-password", "database-secret-value");
+        var adminPasswordPath = WriteFile("admin-password", "superadmin-secret-value");
+        var configuration = CreateValidConfiguration(databasePasswordPath, adminPasswordPath);
+        var configurationPath = WriteFile(
+            "mk8email.config.json",
+            JsonSerializer.Serialize(configuration));
+
+        var loaded = EnvironmentLoader.LoadFromFile(configurationPath);
+
+        Assert.AreEqual("database-secret-value", loaded.Database.Password);
+        Assert.AreEqual("superadmin-secret-value", loaded.SuperAdmin.Password);
+    }
+
+    [TestMethod]
+    public void LoaderRejectsUnknownConfigurationProperties()
+    {
+        var configurationPath = WriteFile("invalid.json", "{\"UnknownProperty\":true}");
+
+        var exception = Assert.ThrowsExactly<InvalidOperationException>(
+            () => EnvironmentLoader.LoadFromFile(configurationPath));
+
+        StringAssert.Contains(exception.Message, "The configuration file is not valid JSON");
+    }
+
+    private EnvironmentConfig CreateValidConfiguration(
+        string? databasePasswordFile = null,
+        string? adminPasswordFile = null,
+        bool enableStartTls = true,
+        bool enableImap = true,
+        bool enableSpfCheck = false)
+    {
+        return new EnvironmentConfig
+        {
+            Database = new DatabaseConfig
+            {
+                Host = "database",
+                Port = 5432,
+                Name = "mk8email",
+                Username = "mk8email",
+                Password = databasePasswordFile is null ? "database-secret-value" : string.Empty,
+                PasswordFile = databasePasswordFile,
+            },
+            SuperAdmin = new SuperAdminConfig
+            {
+                Username = "postmaster@mk8n.com",
+                Password = adminPasswordFile is null ? "superadmin-secret-value" : string.Empty,
+                PasswordFile = adminPasswordFile,
+            },
+            Smtp = new SmtpConfig
+            {
+                Hostname = "mail.mk8n.com",
+                Port = 2525,
+                SubmissionPort = 2587,
+                ImplicitTlsPort = 2465,
+                EnableSmtp = true,
+                EnableSubmission = true,
+                EnableImplicitTls = true,
+                EnableStartTls = enableStartTls,
+                RequireTls = false,
+                RequireAuth = true,
+                AllowRelay = true,
+            },
+            Imap = new ImapConfig
+            {
+                Port = 2143,
+                ImplicitTlsPort = 2993,
+                EnableImap = enableImap,
+                EnableImplicitTls = true,
+            },
+            Tls = new TlsConfig
+            {
+                CertificatePath = _certificatePath,
+            },
+            Dkim = new DkimConfig
+            {
+                EnableSigning = false,
+            },
+            Security = new SecurityConfig
+            {
+                EnableSpfCheck = enableSpfCheck,
+                EnableDmarcCheck = false,
+                PasswordHashScheme = "PBKDF2-SHA256",
+            },
+            Limits = new LimitsConfig
+            {
+                MaxMessageSizeBytes = 25 * 1024 * 1024,
+                MaxRecipientsPerMessage = 100,
+                ConnectionTimeoutSeconds = 300,
+                MaxConnectionsPerIp = 20,
+            },
+            General = new GeneralConfig
+            {
+                AllowRegistration = false,
+            },
+        };
+    }
+
+    private string WriteFile(string name, string content)
+    {
+        var path = Path.Combine(_testDirectory, name);
+        File.WriteAllText(path, content);
+        return path;
+    }
+}
