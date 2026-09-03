@@ -22,6 +22,8 @@ IServiceScopeFactory scopeFactory,
 EnvironmentConfig env,
 ILogger<ImapServerService> logger) : BackgroundService
 {
+    private static readonly Encoding ProtocolEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private enum ListenerMode { Imap, ImplicitTls }
 
     private sealed class ImapSession
@@ -173,8 +175,8 @@ ILogger<ImapServerService> logger) : BackgroundService
     {
         var ct = timeout.Token;
 
-        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
-        await using var writer = new StreamWriter(stream, Encoding.UTF8, bufferSize: 4096, leaveOpen: true)
+        using var reader = new StreamReader(stream, ProtocolEncoding, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+        await using var writer = new StreamWriter(stream, ProtocolEncoding, bufferSize: 4096, leaveOpen: true)
         {
             AutoFlush = true,
             NewLine = "\r\n"

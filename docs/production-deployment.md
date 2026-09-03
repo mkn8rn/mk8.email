@@ -80,4 +80,6 @@ The repository contains no Entity Framework migrations. The user must explicitly
 
 Outbound delivery does not perform MX lookup. Inbound SPF, DKIM, and DMARC checks are not standards-compliant and stay disabled.
 
-Protocol interoperability requires automated SMTP and IMAP tests. External deliverability tests must confirm behavior before the DNS cutover.
+Transport tests cover SMTP and IMAP greetings, STARTTLS, authentication exposure, and SMTP size limits. Broader mailbox interoperability still needs automated tests.
+
+External deliverability tests must confirm behavior before the DNS cutover.
