@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: configure-apt-sources DEBIAN_SOURCE_FILE" >&2
+    exit 2
+fi
+
+source_file=$1
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+check_secure_file() {
+    checked_file=$1
+    [ -f "$checked_file" ] || fail "The Debian source file is missing."
+    [ ! -L "$checked_file" ] || fail "The Debian source file must not be a symbolic link."
+    [ "$(stat -c '%U:%G' "$checked_file")" = root:root ] \
+        || fail "Root must own the Debian source file."
+    if find "$checked_file" -prune -perm /022 -print -quit | grep -q .; then
+        fail "Another identity can write the Debian source file."
+    fi
+}
+
+check_secure_directory() {
+    checked_directory=$1
+    [ -d "$checked_directory" ] || fail "A required APT directory is missing."
+    [ ! -L "$checked_directory" ] || fail "An APT directory must not be a symbolic link."
+    [ "$(stat -c '%U:%G' "$checked_directory")" = root:root ] \
+        || fail "Root must own each APT directory."
+    if find "$checked_directory" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+        fail "Another identity can write an APT directory."
+    fi
+}
+
+check_secure_file "$source_file"
+check_secure_directory /etc/apt
+check_secure_directory /etc/apt/sources.list.d
+
+if grep -Eiq '(^|[[:space:]])(http|ftp|file):' "$source_file"; then
+    fail "The Debian source file contains a non-HTTPS transport."
+fi
+all_uri_count=$(grep -c '^URIs:' "$source_file" || true)
+uri_count=$(grep -c '^URIs: https://' "$source_file" || true)
+keyring_count=$(grep -c \
+    '^Signed-By: /usr/share/keyrings/debian-archive-keyring\.pgp$' \
+    "$source_file" || true)
+[ "$all_uri_count" -eq 2 ] || fail "The Debian source file must contain two archive addresses."
+[ "$uri_count" -eq 2 ] || fail "The Debian source file must contain two HTTPS archives."
+[ "$keyring_count" -eq 2 ] || fail "The Debian source file does not select the approved keyring."
+
+for managed_file in \
+    /etc/apt/sources.list \
+    /etc/apt/sources.list.d/debian.sources; do
+    if [ -L "$managed_file" ]; then
+        fail "A managed APT source path must not be a symbolic link."
+    fi
+    if [ -e "$managed_file" ] && [ ! -f "$managed_file" ]; then
+        fail "A managed APT source path must be a regular file."
+    fi
+done
+
+install -o root -g root -m 0644 "$source_file" \
+    /etc/apt/sources.list.d/debian.sources
+rm -f -- /etc/apt/sources.list
+
+[ ! -e /etc/apt/sources.list ] || fail "The deprecated Debian source file remains active."
+cmp --silent "$source_file" /etc/apt/sources.list.d/debian.sources \
+    || fail "The active Debian source file differs from the reviewed file."
+
+printf '%s\n' "Debian APT sources use the reviewed HTTPS configuration."

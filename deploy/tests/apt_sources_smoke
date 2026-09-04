@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 2 ]; then
+    printf '%s\n' "Usage: apt_sources_smoke [CONFIGURE_SCRIPT [DEBIAN_SOURCE_FILE]]" >&2
+    exit 2
+fi
+
+configure_script=${1:-/usr/local/sbin/configure-apt-sources}
+source_file=${2:-/usr/local/share/mk8email/prerequisites/debian.sources}
+[ -r "$configure_script" ] || {
+    printf '%s\n' "The APT source configuration script is not readable." >&2
+    exit 1
+}
+[ -r "$source_file" ] || {
+    printf '%s\n' "The reviewed Debian source file is not readable." >&2
+    exit 1
+}
+
+test_root=$(mktemp -d /run/mk8-apt-sources.XXXXXX)
+cleanup() {
+    case "$test_root" in
+        /run/mk8-apt-sources.*) rm -rf -- "$test_root" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+insecure_source="$test_root/insecure.sources"
+sed '0,/https:\/\//s//http:\/\//' "$source_file" > "$insecure_source"
+chown root:root "$insecure_source"
+chmod 0644 "$insecure_source"
+if sh "$configure_script" "$insecure_source" \
+    > "$test_root/insecure-source.log" 2>&1; then
+    printf '%s\n' "APT source configuration accepted HTTP transport." >&2
+    exit 1
+fi
+grep -F "The Debian source file contains a non-HTTPS transport." \
+    "$test_root/insecure-source.log" >/dev/null
+
+test_apt="$test_root/apt"
+install -d -o root -g root -m 0755 "$test_apt/sources.list.d"
+printf '%s\n' "deb http://deb.debian.org/debian trixie main" \
+    > "$test_apt/sources.list"
+install -o root -g root -m 0644 /dev/null "$test_root/symlink-target"
+ln -s "$test_root/symlink-target" "$test_apt/sources.list.d/debian.sources"
+
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+unshare --mount sh -eu -c '
+    mount --make-rprivate /
+    mount --bind "$1" /etc/apt
+    if sh "$2" "$3" > "$4/symlink.log" 2>&1; then
+        printf "%s\n" "APT source configuration accepted a symbolic link." >&2
+        exit 1
+    fi
+    grep -F "A managed APT source path must not be a symbolic link." \
+        "$4/symlink.log" >/dev/null
+    test -L /etc/apt/sources.list.d/debian.sources
+    rm /etc/apt/sources.list.d/debian.sources
+    sh "$2" "$3" >/dev/null
+    test ! -e /etc/apt/sources.list
+    test -f /etc/apt/sources.list.d/debian.sources
+    test ! -L /etc/apt/sources.list.d/debian.sources
+    test "$(stat -c "%U:%G %a" /etc/apt/sources.list.d/debian.sources)" \
+        = "root:root 644"
+    cmp --silent "$3" /etc/apt/sources.list.d/debian.sources
+    sh "$2" "$3" >/dev/null
+    cmp --silent "$3" /etc/apt/sources.list.d/debian.sources
+' sh "$test_apt" "$configure_script" "$source_file" "$test_root"
+
+test ! -s "$test_root/symlink-target"
+
+printf '%s\n' "APT source safety, migration, and idempotence tests passed."

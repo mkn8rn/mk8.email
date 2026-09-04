@@ -102,12 +102,39 @@ release_id='$releaseId'
 activate_requested='$activationRequested'
 was_active=false
 changes_started=false
+apt_sources_changing=false
 backup_path=
 previous_release=
+apt_source_backup=
+
+restore_apt_sources() {
+    restore_status=0
+    rm -f -- /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources || restore_status=1
+    if [ -f "`$apt_source_backup/sources.list" ]; then
+        cp --archive "`$apt_source_backup/sources.list" /etc/apt/sources.list \
+            || restore_status=1
+    fi
+    if [ -f "`$apt_source_backup/debian.sources" ]; then
+        cp --archive "`$apt_source_backup/debian.sources" \
+            /etc/apt/sources.list.d/debian.sources || restore_status=1
+    fi
+    return "`$restore_status"
+}
 
 finish() {
     deployment_status=`$?
     trap - EXIT HUP INT TERM
+    if [ "`$deployment_status" -ne 0 ] && [ "`$apt_sources_changing" = true ]; then
+        printf '%s\n' "The deployment failed. The prior APT sources will be restored." >&2
+        set +e
+        restore_apt_sources
+        apt_rollback_status=`$?
+        if [ "`$apt_rollback_status" -ne 0 ]; then
+            printf '%s\n' "APT source rollback failed. Immediate operator action is required." >&2
+        fi
+        set -e
+    fi
     if [ "`$deployment_status" -ne 0 ] && [ "`$changes_started" = true ] && [ "`$was_active" = true ]; then
         printf '%s\n' "The deployment failed. The prior release will be restored." >&2
         set +e
@@ -141,13 +168,12 @@ install -d -o root -g root -m 0700 "`$remote_root/assets"
 tar --extract --gzip --file="`$remote_root/mk8email-assets.tar.gz" --directory="`$remote_root/assets"
 chown root:root \
     "`$remote_root/assets/deploy/prerequisites/debian-13-runtime.txt" \
-    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list"
+    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list" \
+    "`$remote_root/assets/deploy/prerequisites/debian.sources"
 chmod 0644 \
     "`$remote_root/assets/deploy/prerequisites/debian-13-runtime.txt" \
-    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list"
-timeout 180s apt-get update
-sh "`$remote_root/assets/deploy/scripts/verify-host-prerequisites" \
-    "`$remote_root/assets/deploy/prerequisites"
+    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list" \
+    "`$remote_root/assets/deploy/prerequisites/debian.sources"
 
 if [ -f /etc/mk8email/mail-stack-ready ]; then
     was_active=true
@@ -156,12 +182,46 @@ if [ -f /etc/mk8email/mail-stack-ready ]; then
         /opt/mk8email/releases/*) ;;
         *) printf '%s\n' "The current release path is not valid." >&2; exit 1 ;;
     esac
+    timeout 180s apt-get update
+    /usr/local/sbin/verify-host-prerequisites
     backup_path=`$(/usr/local/sbin/mk8-backup)
     case "`$backup_path" in
         /var/backups/mk8/20??????T??????Z) ;;
         *) printf '%s\n' "The deployment backup path is not valid." >&2; exit 1 ;;
     esac
+elif [ -x /usr/local/sbin/verify-host-prerequisites ] \
+    && [ -d /usr/local/share/mk8email/prerequisites ]; then
+    timeout 180s apt-get update
+    /usr/local/sbin/verify-host-prerequisites
 fi
+
+apt_source_backup="`$remote_root/apt-source-backup"
+install -d -o root -g root -m 0700 "`$apt_source_backup"
+for managed_source in \
+    /etc/apt/sources.list \
+    /etc/apt/sources.list.d/debian.sources; do
+    if [ -L "`$managed_source" ] \
+        || { [ -e "`$managed_source" ] && [ ! -f "`$managed_source" ]; }; then
+        printf '%s\n' "A managed APT source path is unsafe." >&2
+        exit 1
+    fi
+done
+if [ -f /etc/apt/sources.list ]; then
+    cp --archive /etc/apt/sources.list "`$apt_source_backup/sources.list"
+fi
+if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+    cp --archive /etc/apt/sources.list.d/debian.sources \
+        "`$apt_source_backup/debian.sources"
+fi
+apt_sources_changing=true
+sh "`$remote_root/assets/deploy/scripts/configure-apt-sources" \
+    "`$remote_root/assets/deploy/prerequisites/debian.sources"
+timeout 180s apt-get update
+sh "`$remote_root/assets/deploy/scripts/verify-host-prerequisites" \
+    "`$remote_root/assets/deploy/prerequisites"
+sh "`$remote_root/assets/deploy/tests/apt_sources_smoke" \
+    "`$remote_root/assets/deploy/scripts/configure-apt-sources" \
+    "`$remote_root/assets/deploy/prerequisites/debian.sources"
 
 if [ -n "`$backup_path" ] && [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
     backup_name=`${backup_path##*/}
@@ -186,6 +246,7 @@ if [ "`$activate_requested" = true ] || [ "`$was_active" = true ]; then
     /usr/local/sbin/activate-mail-stack
     /usr/local/lib/mk8email/tests/management_cli_smoke
 fi
+apt_sources_changing=false
 "@
     [IO.File]::WriteAllText($remoteScript, $remoteScriptText, [Text.UTF8Encoding]::new($false))
 

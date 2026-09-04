@@ -25,6 +25,9 @@ install -d -o root -g root -m 0755 "$test_root"
 install -o root -g root -m 0644 \
     "$installed_root/debian-13-sources.list" \
     "$test_root/debian-13-sources.list"
+install -o root -g root -m 0644 \
+    "$installed_root/debian.sources" \
+    "$test_root/debian.sources"
 
 printf '%s\n' "mk8-package-that-must-not-exist" \
     > "$test_root/debian-13-runtime.txt"
@@ -46,6 +49,17 @@ grep -Fq "The package manifest contains an invalid package name." \
 install -o root -g root -m 0644 \
     "$installed_root/debian-13-runtime.txt" \
     "$test_root/debian-13-runtime.txt"
+sed -i '0,/https:\/\//s//http:\/\//' "$test_root/debian.sources"
+if "$verifier" "$test_root" > "$work_directory/http-source.log" 2>&1; then
+    printf '%s\n' "The verifier accepted an HTTP APT source." >&2
+    exit 1
+fi
+grep -Fq "A reviewed APT source uses unencrypted HTTP transport." \
+    "$work_directory/http-source.log"
+
+install -o root -g root -m 0644 \
+    "$installed_root/debian.sources" \
+    "$test_root/debian.sources"
 printf '%s\n' "deb https://invalid.example/debian trixie main" \
     >> "$test_root/debian-13-sources.list"
 if "$verifier" "$test_root" > "$work_directory/source-drift.log" 2>&1; then
