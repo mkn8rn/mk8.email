@@ -1,0 +1,12 @@
+[Unit]
+Description=Inert mk8.email mail storage
+Before=dovecot.service
+
+[Mount]
+What=/var/vmail
+Where=/var/vmail
+Type=none
+Options=bind,nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target

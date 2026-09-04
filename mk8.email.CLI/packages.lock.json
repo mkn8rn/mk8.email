@@ -32,6 +32,11 @@
           "Microsoft.Extensions.Options": "10.0.2"
         }
       },
+      "BCrypt.Net-Next": {
+        "type": "Transitive",
+        "resolved": "4.2.0",
+        "contentHash": "gwLD2KfCuwQesP17aVh4h6lpiMPEVt5Lbpndo0ej903hNUUTtyxt3ARdDjmuydBRTAUICc7OVKVbaOvc6SQYXA=="
+      },
       "BouncyCastle.Cryptography": {
         "type": "Transitive",
         "resolved": "2.6.2",
@@ -407,7 +412,10 @@
         }
       },
       "mk8.email.utils": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "BCrypt.Net-Next": "[4.2.0, )"
+        }
       }
     }
   }

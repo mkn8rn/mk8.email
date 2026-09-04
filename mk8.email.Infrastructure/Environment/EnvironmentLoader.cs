@@ -49,11 +49,6 @@ public static class EnvironmentLoader
             config.Database.Password,
             config.Database.PasswordFile,
             "database password");
-        config.SuperAdmin.Password = ResolveSecret(
-            config.SuperAdmin.Password,
-            config.SuperAdmin.PasswordFile,
-            "SuperAdmin password");
-
         var errors = config.Validate(isDevelopment);
         if (errors.Count > 0)
         {

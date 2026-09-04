@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@ViewData["Title"] - mk8.email</title>
+    <link rel="stylesheet" href="~/css/site.css" asp-append-version="true" />
+</head>
+<body>
+    <header>
+        <a class="brand" asp-page="/Index">mk8.email</a>
+        @if (User.Identity?.IsAuthenticated == true)
+        {
+            <nav aria-label="Main navigation">
+                <a asp-page="/Index">Status</a>
+                <a asp-page="/Domains/Index">Domains</a>
+                <a asp-page="/Accounts/Index">Accounts</a>
+                <form method="post" asp-page="/Logout">
+                    <button class="link-button" type="submit">Sign out</button>
+                </form>
+            </nav>
+        }
+    </header>
+    <main>
+        @RenderBody()
+    </main>
+</body>
+</html>

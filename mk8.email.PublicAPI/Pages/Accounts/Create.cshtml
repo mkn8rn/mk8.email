@@ -1,0 +1,21 @@
+@page
+@model CreateAccountModel
+@{
+    ViewData["Title"] = "Add account";
+}
+
+<section class="panel narrow">
+    <h1>Add account</h1>
+    <form method="post">
+        <div asp-validation-summary="ModelOnly" class="validation"></div>
+        <label asp-for="Input.Address"></label>
+        <input asp-for="Input.Address" autocomplete="off" />
+        <span asp-validation-for="Input.Address" class="validation"></span>
+        <label asp-for="Input.Role"></label>
+        <select asp-for="Input.Role" asp-items="Html.GetEnumSelectList<mk8.email.Contracts.Enums.UserRole>()"></select>
+        <label asp-for="Input.Password"></label>
+        <input asp-for="Input.Password" autocomplete="new-password" />
+        <span asp-validation-for="Input.Password" class="validation"></span>
+        <button type="submit">Create account</button>
+    </form>
+</section>

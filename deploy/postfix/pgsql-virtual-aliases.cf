@@ -1,0 +1,5 @@
+hosts = unix:/run/postgresql
+user = postfix
+dbname = mk8email
+query = WITH source AS (SELECT i.alias_for_inbox_id FROM inboxes i JOIN addresses a ON a.id = i.address_id JOIN companies c ON c.id = a.company_id JOIN users u ON u.id = i.owner_id WHERE i.name IN (lower('%u'), '*') AND a.domain = lower('%d') AND a.is_active AND c.is_active AND u.is_active ORDER BY CASE WHEN i.name = lower('%u') THEN 0 ELSE 1 END LIMIT 1) SELECT target.name || '@' || target_domain.domain FROM source JOIN inboxes target ON target.id = source.alias_for_inbox_id JOIN addresses target_domain ON target_domain.id = target.address_id JOIN companies target_company ON target_company.id = target_domain.company_id JOIN users target_user ON target_user.id = target.owner_id WHERE target.alias_for_inbox_id IS NULL AND target_domain.is_active AND target_company.is_active AND target_user.is_active
+expansion_limit = 1

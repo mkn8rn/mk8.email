@@ -1,0 +1,22 @@
+/var/log/mk8email-admin/audit.jsonl {
+    daily
+    rotate 90
+    compress
+    delaycompress
+    missingok
+    notifempty
+    su mk8email mk8email
+    create 0600 mk8email mk8email
+}
+
+/var/log/clamav/clamav.log /var/log/clamav/freshclam.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su clamav clamav
+    create 0640 clamav adm
+}

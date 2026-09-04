@@ -9,6 +9,19 @@ public static class ApplicationServiceExtensions
 {
     public static IServiceCollection AddApplication(this IServiceCollection services)
     {
+        services.AddScoped<IAuthService, AuthService>();
+        services.AddScoped<IInboxService, InboxService>();
+        services.AddScoped<IAddressService, AddressService>();
+        services.AddScoped<ICompanyService, CompanyService>();
+        services.AddScoped<IMailAdministrationService, MailAdministrationService>();
+        services.AddScoped<ISeederService, SeederService>();
+        services.AddScoped<IDatabaseInitializationService, DatabaseInitializationService>();
+
+        return services;
+    }
+
+    public static IServiceCollection AddExperimentalMailProtocolServers(this IServiceCollection services)
+    {
         services.AddSingleton<ILookupClient>(_ => new LookupClient(new LookupClientOptions
         {
             UseCache = true,
@@ -20,11 +33,6 @@ public static class ApplicationServiceExtensions
         services.AddSingleton<IOutboundMailRelay, OutboundSmtpRelay>();
         services.AddSingleton<IDkimSigningService, MimeKitDkimSigningService>();
         services.AddScoped<ISenderAuthorizationService, SenderAuthorizationService>();
-        services.AddScoped<IAuthService, AuthService>();
-        services.AddScoped<IInboxService, InboxService>();
-        services.AddScoped<IAddressService, AddressService>();
-        services.AddScoped<ICompanyService, CompanyService>();
-        services.AddScoped<ISeederService, SeederService>();
         services.AddScoped<IEmailService, EmailService>();
         services.AddHostedService<SmtpServerService>();
         services.AddHostedService<ImapServerService>();

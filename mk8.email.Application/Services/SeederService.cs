@@ -1,46 +1,24 @@
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging;
 using mk8.email.Application.Interfaces;
-using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
-using mk8.email.Infrastructure.Models;
-using mk8.email.Utils;
 
 namespace mk8.email.Application.Services;
 
 public class SeederService(
     EmailDbContext db,
-    EnvironmentConfig env,
-    ILogger<SeederService> logger) : ISeederService
+    EnvironmentConfig env) : ISeederService
 {
-    public async Task SeedAsync()
+    public async Task SeedAsync(CancellationToken cancellationToken = default)
     {
-        await MigrateAsync();
-        await SyncGlobalConfigAsync();
-        await SeedSuperAdminAsync();
+        await SyncGlobalConfigAsync(cancellationToken);
     }
 
-    private async Task MigrateAsync()
+    private async Task SyncGlobalConfigAsync(CancellationToken cancellationToken)
     {
-        var pending = (await db.Database.GetPendingMigrationsAsync()).ToList();
-        if (pending.Count > 0)
-        {
-            logger.LogInformation("Applying {Count} pending migration(s): {Migrations}",
-                pending.Count, string.Join(", ", pending));
-            await db.Database.MigrateAsync();
-            logger.LogInformation("Database migrations applied successfully.");
-        }
-    }
-
-    private async Task SyncGlobalConfigAsync()
-    {
-        var config = await db.GlobalConfig.FirstOrDefaultAsync();
+        var config = await db.GlobalConfig.SingleOrDefaultAsync(cancellationToken);
         if (config is null)
-        {
-            logger.LogWarning("GlobalConfig not found in database — skipping sync");
-            return;
-        }
+            throw new InvalidOperationException("The database schema is not initialized.");
 
         config.SmtpHostname = env.Smtp.Hostname;
         config.SmtpPort = env.Smtp.Port;
@@ -79,28 +57,6 @@ public class SeederService(
 
         config.UpdatedAt = DateTime.UtcNow;
 
-        await db.SaveChangesAsync();
-        logger.LogInformation("GlobalConfig synced from environment file");
-    }
-
-    private async Task SeedSuperAdminAsync()
-    {
-        if (await db.Users.AnyAsync(u => u.Role == nameof(UserRole.SuperAdmin)))
-            return;
-
-        var admin = new UserDB
-        {
-            Id = Guid.CreateVersion7(),
-            Username = env.SuperAdmin.Username,
-            PasswordHash = PasswordHasher.Hash(env.SuperAdmin.Password),
-            Role = nameof(UserRole.SuperAdmin),
-        };
-
-        db.Users.Add(admin);
-        await db.SaveChangesAsync();
-
-        logger.LogWarning(
-            "Default SuperAdmin account created (username: {Username}). Change the password immediately.",
-            env.SuperAdmin.Username);
+        await db.SaveChangesAsync(cancellationToken);
     }
 }

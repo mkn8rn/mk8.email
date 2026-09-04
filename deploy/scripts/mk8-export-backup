@@ -1,0 +1,68 @@
+#!/bin/bash
+set -euo pipefail
+
+backup_root=/var/backups/mk8
+export_root=/var/backups/mk8-export
+recipient_file=/etc/mk8email/secrets/backup-age-recipient
+
+if [[ $# -gt 1 ]]; then
+    printf '%s\n' "Usage: mk8-export-backup [BACKUP_NAME]" >&2
+    exit 2
+fi
+
+if [[ $# -eq 1 ]]; then
+    backup_name=$1
+else
+    backup_name=$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d \
+        -name '20??????T??????Z' -printf '%f\n' | sort | tail -n 1)
+fi
+
+case "$backup_name" in
+    20??????T??????Z) ;;
+    *)
+        printf '%s\n' "The backup name is not valid." >&2
+        exit 64
+        ;;
+esac
+
+test -d "$backup_root/$backup_name"
+test -s "$backup_root/$backup_name/SHA256SUMS"
+test -s "$recipient_file"
+
+recipient=$(tr -d '\r\n' < "$recipient_file")
+case "$recipient" in
+    age1[0-9a-z]*) ;;
+    *)
+        printf '%s\n' "The backup encryption recipient is not valid." >&2
+        exit 1
+        ;;
+esac
+
+umask 077
+install -d -o root -g root -m 0700 "$export_root"
+stage="$export_root/.incomplete-$backup_name.tar.gz.age"
+final="$export_root/$backup_name.tar.gz.age"
+
+cleanup() {
+    case "$stage" in
+        /var/backups/mk8-export/.incomplete-*.tar.gz.age) rm -f -- "$stage" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+if [[ -e "$stage" || -e "$final" ]]; then
+    printf '%s\n' "The encrypted backup export already exists." >&2
+    exit 1
+fi
+
+tar --create --gzip --directory="$backup_root" "$backup_name" \
+    | age --recipient "$recipient" --output "$stage"
+mv "$stage" "$final"
+stage=
+
+(cd "$export_root" && sha256sum "$(basename "$final")") > "$final.sha256"
+find "$export_root" -mindepth 1 -maxdepth 1 -type f \
+    \( -name '20??????T??????Z.tar.gz.age' -o -name '20??????T??????Z.tar.gz.age.sha256' \) \
+    -mtime +14 -delete
+
+printf '%s\n' "$final"

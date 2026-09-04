@@ -1,0 +1,4 @@
+postmaster: root
+mailer-daemon: postmaster
+abuse: postmaster
+root: admin@mk8n.com

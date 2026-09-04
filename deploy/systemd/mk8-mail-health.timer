@@ -1,0 +1,12 @@
+[Unit]
+Description=Check mk8 mail service health every five minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=5m
+RandomizedDelaySec=30s
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

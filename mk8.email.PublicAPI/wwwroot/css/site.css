@@ -1,0 +1,138 @@
+:root {
+    color-scheme: dark;
+    font-family: system-ui, sans-serif;
+    background: #101318;
+    color: #eef2f7;
+}
+
+body {
+    margin: 0;
+}
+
+header {
+    align-items: center;
+    background: #171c24;
+    border-bottom: 1px solid #2a3340;
+    display: flex;
+    justify-content: space-between;
+    padding: 1rem 2rem;
+}
+
+nav, nav form, .title-row, .actions {
+    align-items: center;
+    display: flex;
+    gap: 1rem;
+}
+
+a, .link-button {
+    color: #8dc7ff;
+}
+
+.brand {
+    color: #ffffff;
+    font-size: 1.25rem;
+    font-weight: 700;
+    text-decoration: none;
+}
+
+main {
+    margin: 2rem auto;
+    max-width: 1100px;
+    padding: 0 1rem;
+}
+
+.panel, .card {
+    background: #171c24;
+    border: 1px solid #2a3340;
+    border-radius: 0.6rem;
+    margin-bottom: 1rem;
+    padding: 1.25rem;
+}
+
+.narrow {
+    margin: 4rem auto;
+    max-width: 34rem;
+}
+
+.cards, .split {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.metric {
+    display: block;
+    font-size: 2.25rem;
+    font-weight: 700;
+}
+
+label {
+    display: block;
+    font-weight: 600;
+    margin-top: 0.8rem;
+}
+
+input, select, button, .button {
+    border: 1px solid #475569;
+    border-radius: 0.35rem;
+    box-sizing: border-box;
+    font: inherit;
+    padding: 0.6rem 0.75rem;
+}
+
+input, select {
+    background: #0f141b;
+    color: #ffffff;
+    margin-top: 0.3rem;
+    width: 100%;
+}
+
+button, .button {
+    background: #1769aa;
+    color: #ffffff;
+    cursor: pointer;
+    display: inline-block;
+    margin-top: 1rem;
+    text-decoration: none;
+}
+
+.link-button {
+    background: none;
+    border: 0;
+    margin: 0;
+    padding: 0;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th, td {
+    border-bottom: 1px solid #2a3340;
+    padding: 0.7rem;
+    text-align: left;
+}
+
+.validation {
+    color: #ff9c9c;
+}
+
+.status {
+    background: #183926;
+    border: 1px solid #2f7d4a;
+    border-radius: 0.35rem;
+    padding: 0.8rem;
+}
+
+@media (max-width: 700px) {
+    header, nav, .title-row, .actions {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    table {
+        display: block;
+        overflow-x: auto;
+    }
+}

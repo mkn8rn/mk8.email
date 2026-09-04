@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' "Run this command as root." >&2
+    exit 2
+fi
+
+systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service
+rm -f -- /etc/mk8email/mail-stack-ready
+printf '%s\n' "The public mail services are inactive."

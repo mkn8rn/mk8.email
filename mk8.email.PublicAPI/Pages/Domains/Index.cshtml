@@ -1,0 +1,51 @@
+@page
+@model DomainsModel
+@{
+    ViewData["Title"] = "Domains";
+}
+
+<h1>Domains</h1>
+@if (!string.IsNullOrEmpty(Model.StatusMessage))
+{
+    <p class="status">@Model.StatusMessage</p>
+}
+<section class="panel">
+    <h2>Current domains</h2>
+    <table>
+        <thead><tr><th>Domain</th><th>Company</th><th>Accounts</th><th>Catch-all target</th><th>State</th></tr></thead>
+        <tbody>
+        @foreach (var domain in Model.Domains)
+        {
+            <tr>
+                <td>@domain.Domain</td>
+                <td>@domain.Company</td>
+                <td>@domain.AccountCount</td>
+                <td>@(domain.CatchAllTarget ?? "Not set")</td>
+                <td>@(domain.IsActive ? "Active" : "Disabled")</td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</section>
+<div class="split">
+    <section class="panel">
+        <h2>Add a domain</h2>
+        <form method="post" asp-page-handler="Create">
+            <label asp-for="CreateInput.CompanyName"></label>
+            <input asp-for="CreateInput.CompanyName" />
+            <label asp-for="CreateInput.Domain"></label>
+            <input asp-for="CreateInput.Domain" />
+            <button type="submit">Add domain</button>
+        </form>
+    </section>
+    <section class="panel">
+        <h2>Set a catch-all route</h2>
+        <form method="post" asp-page-handler="CatchAll">
+            <label asp-for="CatchAllInput.Domain"></label>
+            <input asp-for="CatchAllInput.Domain" />
+            <label asp-for="CatchAllInput.TargetAddress"></label>
+            <input asp-for="CatchAllInput.TargetAddress" />
+            <button type="submit">Set catch-all route</button>
+        </form>
+    </section>
+</div>

@@ -13,9 +13,9 @@ public class GlobalConfigDB
     // ?? General ??
 
     [Column("allow_registration")]
-    public bool AllowRegistration { get; set; } = true;
+    public bool AllowRegistration { get; set; }
 
-    // ?? SMTP · Networking ??
+    // ?? SMTP Â· Networking ??
 
     [Required]
     [MaxLength(255)]
@@ -31,7 +31,7 @@ public class GlobalConfigDB
     [Column("smtp_implicit_tls_port")]
     public int SmtpImplicitTlsPort { get; set; } = 465;
 
-    // ?? SMTP · Protocol toggles ??
+    // ?? SMTP Â· Protocol toggles ??
 
     [Column("enable_smtp")]
     public bool EnableSmtp { get; set; } = true;
@@ -42,7 +42,7 @@ public class GlobalConfigDB
     [Column("enable_implicit_tls")]
     public bool EnableImplicitTls { get; set; }
 
-    // ?? SMTP · TLS ??
+    // ?? SMTP Â· TLS ??
 
     [Column("enable_starttls")]
     public bool EnableStartTls { get; set; }
@@ -63,7 +63,7 @@ public class GlobalConfigDB
     [Required]
     [MaxLength(50)]
     [Column("password_hash_scheme")]
-    public string PasswordHashScheme { get; set; } = "PBKDF2-SHA256";
+    public string PasswordHashScheme { get; set; } = "BLF-CRYPT";
 
     [Column("require_auth")]
     public bool RequireAuth { get; set; } = true;

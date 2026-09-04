@@ -1,4 +1,4 @@
-name: mk8-email
+name: mk8-email-control-plane
 
 services:
   database:
@@ -26,8 +26,8 @@ services:
         max-size: 10m
         max-file: "3"
 
-  mail:
-    image: mk8.email:local
+  admin:
+    image: mk8.email-admin:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -37,19 +37,19 @@ services:
       database:
         condition: service_healthy
     environment:
+      ASPNETCORE_URLS: http://0.0.0.0:8080
       MK8EMAIL_CONFIG_FILE: /run/secrets/mk8email_config
     secrets:
       - mk8email_config
       - database_password
-      - superadmin_password
       - tls_certificate
       - tls_private_key
       - dkim_private_key
     ports:
-      - "25:2525"
-      - "587:2587"
-      - "465:2465"
-      - "993:2993"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - admin-state:/var/lib/mk8email-admin
+      - admin-logs:/var/log/mk8email-admin
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -76,8 +76,6 @@ secrets:
     file: ./deploy/mk8email.config.json
   database_password:
     file: ./deploy/secrets/database_password
-  superadmin_password:
-    file: ./deploy/secrets/superadmin_password
   tls_certificate:
     file: ./deploy/secrets/tls_certificate.pem
   tls_private_key:
@@ -87,8 +85,13 @@ secrets:
 
 volumes:
   postgres-data:
+  admin-state:
+  admin-logs:
 
 networks:
   backend:
     internal: true
   edge:
+    ipam:
+      config:
+        - subnet: 172.30.8.0/24

@@ -43,13 +43,16 @@ trap cleanup EXIT INT TERM
 
 install -d -o root -g root -m 0755 /opt/mk8email "$release_root" "$stage"
 tar --extract --gzip --file="$archive" --directory="$stage" --no-same-owner
-test -f "$stage/mk8.email.Application.CLI.dll"
+test -f "$stage/cli/mk8.email.Application.CLI.dll"
+test -f "$stage/cli/mk8.email.Application.CLI.runtimeconfig.json"
+test -f "$stage/admin/mk8.email.PublicAPI.dll"
+test -f "$stage/admin/mk8.email.PublicAPI.runtimeconfig.json"
 
 chown -R root:root "$stage"
 find "$stage" -type d -exec chmod 0555 {} +
 find "$stage" -type f -exec chmod 0444 {} +
 mv "$stage" "$release_dir"
 stage=
-ln -sfn "$release_dir" /opt/mk8email/current
+ln -sfnT "$release_dir" /opt/mk8email/current
 
 printf '%s\n' "$release_dir"

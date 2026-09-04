@@ -10,12 +10,16 @@ namespace mk8.email.Application.Services;
 
 public class AuthService(EmailDbContext db) : IAuthService
 {
+    private static readonly string DummyPasswordHash = PasswordHasher.Hash(Guid.NewGuid().ToString("N"));
+
     public async Task<LoginResultDTO> LoginAsync(LoginRequestDTO request)
     {
+        var username = request.Username.Trim().ToLowerInvariant();
         var user = await db.Users.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Username == request.Username && u.IsActive);
+            .FirstOrDefaultAsync(u => u.Username == username && u.IsActive);
 
-        if (user is null || !PasswordHasher.Verify(request.Password, user.PasswordHash))
+        var passwordMatches = PasswordHasher.Verify(request.Password, user?.PasswordHash ?? DummyPasswordHash);
+        if (user is null || !passwordMatches)
             return new LoginResultDTO(false, null, "Invalid username or password.");
 
         return new LoginResultDTO(true, ToDTO(user), null);
@@ -25,7 +29,7 @@ public class AuthService(EmailDbContext db) : IAuthService
     {
         var registrationAllowed = await db.GlobalConfig.AsNoTracking()
             .Select(config => config.AllowRegistration)
-            .FirstOrDefaultAsync();
+            .SingleOrDefaultAsync();
         if (!registrationAllowed)
             return new LoginResultDTO(false, null, "Registration is disabled.");
 

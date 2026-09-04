@@ -62,8 +62,7 @@ public sealed class EnvironmentConfigTests
     public void LoaderReadsPasswordsFromSecretFiles()
     {
         var databasePasswordPath = WriteFile("database-password", "database-secret-value");
-        var adminPasswordPath = WriteFile("admin-password", "superadmin-secret-value");
-        var configuration = CreateValidConfiguration(databasePasswordPath, adminPasswordPath);
+        var configuration = CreateValidConfiguration(databasePasswordPath);
         var configurationPath = WriteFile(
             "mk8email.config.json",
             JsonSerializer.Serialize(configuration));
@@ -71,7 +70,6 @@ public sealed class EnvironmentConfigTests
         var loaded = EnvironmentLoader.LoadFromFile(configurationPath);
 
         Assert.AreEqual("database-secret-value", loaded.Database.Password);
-        Assert.AreEqual("superadmin-secret-value", loaded.SuperAdmin.Password);
     }
 
     [TestMethod]
@@ -87,7 +85,6 @@ public sealed class EnvironmentConfigTests
 
     private EnvironmentConfig CreateValidConfiguration(
         string? databasePasswordFile = null,
-        string? adminPasswordFile = null,
         bool enableStartTls = true,
         bool enableImap = true,
         bool enableSpfCheck = false,
@@ -104,12 +101,6 @@ public sealed class EnvironmentConfigTests
                 Username = "mk8email",
                 Password = databasePasswordFile is null ? "database-secret-value" : string.Empty,
                 PasswordFile = databasePasswordFile,
-            },
-            SuperAdmin = new SuperAdminConfig
-            {
-                Username = "postmaster@mk8n.com",
-                Password = adminPasswordFile is null ? "superadmin-secret-value" : string.Empty,
-                PasswordFile = adminPasswordFile,
             },
             Smtp = new SmtpConfig
             {
@@ -146,7 +137,7 @@ public sealed class EnvironmentConfigTests
             {
                 EnableSpfCheck = enableSpfCheck,
                 EnableDmarcCheck = false,
-                PasswordHashScheme = "PBKDF2-SHA256",
+                PasswordHashScheme = "BLF-CRYPT",
             },
             Limits = new LimitsConfig
             {
@@ -158,6 +149,13 @@ public sealed class EnvironmentConfigTests
             General = new GeneralConfig
             {
                 AllowRegistration = false,
+            },
+            Admin = new AdminConfig
+            {
+                AllowedNetworks = ["127.0.0.0/8"],
+                DataProtectionKeyPath = Path.Combine(_testDirectory, "data-protection"),
+                AuditLogPath = Path.Combine(_testDirectory, "audit", "admin.jsonl"),
+                SessionMinutes = 30,
             },
         };
     }

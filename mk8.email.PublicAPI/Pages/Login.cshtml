@@ -1,0 +1,21 @@
+@page
+@model LoginModel
+@{
+    ViewData["Title"] = "Administrator sign in";
+}
+
+<section class="panel narrow">
+    <h1>Administrator sign in</h1>
+    <p>This service accepts connections from the local network only.</p>
+    <form method="post">
+        <div asp-validation-summary="ModelOnly" class="validation"></div>
+        <input type="hidden" asp-for="ReturnUrl" />
+        <label asp-for="Input.Username"></label>
+        <input asp-for="Input.Username" autocomplete="username" autofocus />
+        <span asp-validation-for="Input.Username" class="validation"></span>
+        <label asp-for="Input.Password"></label>
+        <input asp-for="Input.Password" autocomplete="current-password" />
+        <span asp-validation-for="Input.Password" class="validation"></span>
+        <button type="submit">Sign in</button>
+    </form>
+</section>

@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  build-test-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: "**/packages.lock.json"
+
+      - name: Restore locked dependencies
+        run: dotnet restore mk8.email.slnx --locked-mode
+
+      - name: Build
+        run: dotnet build mk8.email.slnx --configuration Release --no-restore --property:TreatWarningsAsErrors=true --property:ContinuousIntegrationBuild=true
+
+      - name: Validate operations code
+        run: |
+          shellcheck \
+            deploy/scripts/activate-mail-stack \
+            deploy/scripts/configure-mail-database-access \
+            deploy/scripts/deactivate-mail-stack \
+            deploy/scripts/deploy-admin-certificate \
+            deploy/scripts/deploy-mk8-certificate \
+            deploy/scripts/initialize-postgresql \
+            deploy/scripts/install-host-hardening \
+            deploy/scripts/install-mail-stack \
+            deploy/scripts/install-native-release \
+            deploy/scripts/mk8-backup \
+            deploy/scripts/mk8-export-backup \
+            deploy/scripts/mk8-mail-health \
+            deploy/tests/backup_restore_smoke \
+            deploy/tests/disruption_smoke \
+            deploy/tests/tls_smoke
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \
+            python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py
+
+      - name: Test application
+        run: dotnet test mk8.email.Application.Tests/mk8.email.Application.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=application.trx" --results-directory artifacts/test-results
+
+      - name: Test infrastructure
+        run: dotnet test mk8.email.Infrastructure.Tests/mk8.email.Infrastructure.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=infrastructure.trx" --results-directory artifacts/test-results
+
+      - name: Publish management command
+        run: dotnet publish mk8.email.CLI/mk8.email.Application.CLI.csproj --configuration Release --no-build --output artifacts/cli --property:UseAppHost=false
+
+      - name: Publish administrator dashboard
+        run: dotnet publish mk8.email.PublicAPI/mk8.email.PublicAPI.csproj --configuration Release --no-build --output artifacts/admin --property:UseAppHost=false
+
+      - name: Package release
+        run: |
+          tar --create --gzip --file=artifacts/mk8email-linux-x64.tar.gz --directory=artifacts cli admin
+          sha256sum artifacts/mk8email-linux-x64.tar.gz > artifacts/mk8email-linux-x64.tar.gz.sha256
+
+      - name: Save evidence and release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mk8email-${{ github.sha }}
+          path: |
+            artifacts/mk8email-linux-x64.tar.gz
+            artifacts/mk8email-linux-x64.tar.gz.sha256
+            artifacts/test-results/*.trx
+          if-no-files-found: error
+          retention-days: 14

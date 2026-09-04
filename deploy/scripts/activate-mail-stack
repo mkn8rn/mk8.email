@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' "Run this command as root." >&2
+    exit 2
+fi
+
+test -f /etc/mk8email/schema-ready
+test -s /etc/mk8email/tls/fullchain.pem
+test -s /etc/mk8email/tls/privkey.pem
+test -s /etc/mk8email/admin-tls/fullchain.pem
+test -s /etc/mk8email/admin-tls/privkey.pem
+test -s /etc/mk8email/dkim/s202609.private.pem
+
+/usr/local/sbin/configure-mail-database-access
+postfix check
+doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
+rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict >/dev/null
+nginx -t
+nft -c -f /etc/nftables.conf
+
+activated=no
+cleanup() {
+    if [ "$activated" != yes ]; then
+        rm -f -- /etc/mk8email/mail-stack-ready
+        systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+if ! find /var/lib/clamav -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -print -quit | grep -q .; then
+    runuser -u clamav -- freshclam --config-file=/etc/clamav/freshclam.conf --quiet
+fi
+
+systemctl enable valkey-server.service clamav-daemon.socket clamav-daemon.service \
+    clamav-freshclam.service dovecot.service rspamd.service postfix.service \
+    mk8email-admin.service mk8-mail-health.timer
+systemctl start valkey-server.service clamav-daemon.socket clamav-daemon.service clamav-freshclam.service
+systemctl is-active --quiet valkey-server.service clamav-daemon.service clamav-freshclam.service
+
+install -o root -g root -m 0644 /dev/null /etc/mk8email/mail-stack-ready
+systemctl start dovecot.service rspamd.service postfix.service mk8email-admin.service
+systemctl start mk8-mail-health.timer
+systemctl is-active --quiet dovecot.service rspamd.service postfix.service mk8email-admin.service
+pg_isready --host=127.0.0.1 --port=5432 --dbname=mk8email --quiet
+valkey-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG
+clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1
+
+dashboard_ready=false
+for _ in $(seq 1 30); do
+    if curl --silent --fail --insecure --max-time 3 --noproxy '*' \
+        --resolve admin.mk8n.com:8443:192.0.2.251 \
+        https://admin.mk8n.com:8443/health/ready >/dev/null; then
+        dashboard_ready=true
+        break
+    fi
+    sleep 1
+done
+[ "$dashboard_ready" = true ]
+
+if ! /usr/local/sbin/mk8-mail-health --deep --strict; then
+    printf '%s\n' "The mail stack is active, but an operational health check reported a problem." >&2
+fi
+
+activated=yes
+trap - EXIT INT TERM
+printf '%s\n' "The local production mail stack is active."
