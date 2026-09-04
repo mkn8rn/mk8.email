@@ -56,6 +56,7 @@
     ],
     "DataProtectionKeyPath": "/var/lib/mk8email-admin/data-protection",
     "AuditLogPath": "/var/log/mk8email-admin/audit.jsonl",
+    "HealthStatusPath": "/var/lib/mk8email-admin/health-status.json",
     "SessionMinutes": 30
   }
 }

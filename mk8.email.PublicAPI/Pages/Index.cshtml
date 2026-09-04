@@ -20,6 +20,39 @@
     </section>
 </div>
 <section class="panel">
+    <div class="title-row">
+        <h2>Operational health</h2>
+        <span class="health-state @Model.OperationalClass">@Model.OperationalState</span>
+    </div>
+    <p>Last automated check: @Model.LastCheck</p>
+    <div class="cards">
+        <div class="card compact">
+            <span class="metric">@(Model.SystemStatus.QueueCount?.ToString() ?? "—")</span>
+            <span>Queued messages</span>
+        </div>
+        <div class="card compact">
+            <span class="metric">@(Model.SystemStatus.MailStorageUsedPercent is null ? "—" : $"{Model.SystemStatus.MailStorageUsedPercent}%")</span>
+            <span>Mail storage used</span>
+        </div>
+        <div class="card compact">
+            <span class="metric small">@IndexModel.FormatAge(Model.SystemStatus.BackupExportAgeSeconds)</span>
+            <span>Latest encrypted backup</span>
+        </div>
+        <div class="card compact">
+            <span class="metric small">@IndexModel.FormatAge(Model.SystemStatus.ClamSignatureAgeSeconds)</span>
+            <span>ClamAV signature age</span>
+        </div>
+        <div class="card compact">
+            <span class="metric small">@IndexModel.FormatRemaining(Model.SystemStatus.MailCertificateRemainingSeconds)</span>
+            <span>Mail certificate remaining</span>
+        </div>
+        <div class="card compact">
+            <span class="metric small">@IndexModel.FormatRemaining(Model.SystemStatus.AdminCertificateRemainingSeconds)</span>
+            <span>Administrator certificate remaining</span>
+        </div>
+    </div>
+</section>
+<section class="panel">
     <h2>Control boundary</h2>
     <p>The public mail services use Postfix, Dovecot, Rspamd, and ClamAV.</p>
     <p>This dashboard controls domains and accounts. It does not render message content.</p>

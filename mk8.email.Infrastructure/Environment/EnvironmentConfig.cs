@@ -100,6 +100,8 @@ public sealed class EnvironmentConfig
             errors.Add("Admin.DataProtectionKeyPath must be an absolute path in production.");
         if (!isDevelopment && !Path.IsPathFullyQualified(Admin.AuditLogPath))
             errors.Add("Admin.AuditLogPath must be an absolute path in production.");
+        if (!isDevelopment && !Path.IsPathFullyQualified(Admin.HealthStatusPath))
+            errors.Add("Admin.HealthStatusPath must be an absolute path in production.");
         if (Admin.SessionMinutes is < 5 or > 480)
             errors.Add("Admin.SessionMinutes must be from 5 through 480.");
 
@@ -258,5 +260,6 @@ public sealed class AdminConfig
     public IReadOnlyList<string> AllowedNetworks { get; init; } = [];
     public string DataProtectionKeyPath { get; init; } = "data-protection";
     public string AuditLogPath { get; init; } = "audit/admin.jsonl";
+    public string HealthStatusPath { get; init; } = "health/status.json";
     public int SessionMinutes { get; init; } = 30;
 }

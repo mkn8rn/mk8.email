@@ -24,6 +24,7 @@ activated=no
 cleanup() {
     if [ "$activated" != yes ]; then
         rm -f -- /etc/mk8email/mail-stack-ready
+        systemctl stop mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer 2>/dev/null || true
         systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service 2>/dev/null || true
     fi
 }
@@ -35,13 +36,13 @@ fi
 
 systemctl enable valkey-server.service clamav-daemon.socket clamav-daemon.service \
     clamav-freshclam.service dovecot.service rspamd.service postfix.service \
-    mk8email-admin.service mk8-mail-health.timer
+    mk8email-admin.service mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer
 systemctl start valkey-server.service clamav-daemon.socket clamav-daemon.service clamav-freshclam.service
 systemctl is-active --quiet valkey-server.service clamav-daemon.service clamav-freshclam.service
 
 install -o root -g root -m 0644 /dev/null /etc/mk8email/mail-stack-ready
 systemctl start dovecot.service rspamd.service postfix.service mk8email-admin.service
-systemctl start mk8-mail-health.timer
+systemctl start mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer
 systemctl is-active --quiet dovecot.service rspamd.service postfix.service mk8email-admin.service
 pg_isready --host=127.0.0.1 --port=5432 --dbname=mk8email --quiet
 valkey-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG
@@ -61,6 +62,12 @@ done
 
 if ! /usr/local/sbin/mk8-mail-health --deep --strict; then
     printf '%s\n' "The mail stack is active, but an operational health check reported a problem." >&2
+    exit 1
+fi
+systemctl reset-failed mk8-mail-health.service
+if ! systemctl start mk8-mail-health.service; then
+    printf '%s\n' "The restricted health service could not complete." >&2
+    exit 1
 fi
 
 activated=yes

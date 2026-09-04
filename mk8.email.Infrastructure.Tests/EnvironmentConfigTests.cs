@@ -155,6 +155,7 @@ public sealed class EnvironmentConfigTests
                 AllowedNetworks = ["127.0.0.0/8"],
                 DataProtectionKeyPath = Path.Combine(_testDirectory, "data-protection"),
                 AuditLogPath = Path.Combine(_testDirectory, "audit", "admin.jsonl"),
+                HealthStatusPath = Path.Combine(_testDirectory, "health", "status.json"),
                 SessionMinutes = 30,
             },
         };

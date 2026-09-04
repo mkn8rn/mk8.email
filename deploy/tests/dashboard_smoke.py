@@ -59,6 +59,10 @@ def main() -> None:
     with opener.open(request, timeout=30) as response:
         status_page = response.read().decode("utf-8")
     require("Mail service status" in status_page, "The administrator login did not reach the status page.")
+    require("Operational health" in status_page, "The dashboard did not show operational health.")
+    require("Healthy" in status_page, "The dashboard did not show a healthy current snapshot.")
+    require("Queued messages" in status_page, "The dashboard did not show the mail queue metric.")
+    require("ClamAV signature age" in status_page, "The dashboard did not show signature freshness.")
 
     session_cookie = next((cookie for cookie in cookies if cookie.name == "__Host-mk8admin"), None)
     require(session_cookie is not None and session_cookie.secure, "The secure administrator cookie is missing.")
@@ -75,7 +79,7 @@ def main() -> None:
     else:
         raise RuntimeError("The dashboard accepted a request without an antiforgery token.")
 
-    print("Dashboard login, account visibility, secure cookie, and antiforgery tests passed.")
+    print("Dashboard health, login, account visibility, secure cookie, and antiforgery tests passed.")
 
 
 if __name__ == "__main__":

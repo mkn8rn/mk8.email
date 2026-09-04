@@ -16,6 +16,7 @@ done
 
 state_directory=/var/lib/mk8-mail-health
 state_file=$state_directory/status
+status_json=$state_directory/status.json
 backup_lock=/run/lock/mk8-backup.lock
 exec 8>"$backup_lock"
 if ! flock --shared --nonblock 8; then
@@ -25,18 +26,58 @@ fi
 
 errors=$(mktemp /run/mk8-mail-health.XXXXXX)
 queue_data=$(mktemp /run/mk8-mail-queue.XXXXXX)
-trap 'rm -f -- "$errors" "$queue_data"' EXIT INT TERM
+install -d -o root -g mk8email -m 2750 "$state_directory"
+status_snapshot=$(mktemp "$state_directory/status.json.XXXXXX")
+trap 'rm -f -- "$errors" "$queue_data" "$status_snapshot"' EXIT INT TERM
 
-install -d -o root -g root -m 0750 "$state_directory"
+check_epoch=$(date +%s)
+queue_count=0
+oldest_age=null
+used_percent=null
+backup_age=null
+signature_age=null
+mail_certificate_remaining=null
+admin_certificate_remaining=null
 
 record_error() {
     printf '%s\n' "$1" >> "$errors"
 }
 
+certificate_remaining() {
+    certificate_path=$1
+    not_after=$(openssl x509 -in "$certificate_path" -noout -enddate 2>/dev/null) || {
+        printf '%s\n' null
+        return
+    }
+    expiry_epoch=$(date --date="${not_after#notAfter=}" +%s 2>/dev/null) || {
+        printf '%s\n' null
+        return
+    }
+    printf '%s\n' "$((expiry_epoch - check_epoch))"
+}
+
+write_status_snapshot() {
+    health_state=$1
+    checked_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+    error_count=$(wc -l < "$errors" | tr -d ' ')
+    printf '{"state":"%s","checkedAt":"%s","queueCount":%s,"oldestQueuedMessageSeconds":%s,"mailStorageUsedPercent":%s,"backupExportAgeSeconds":%s,"clamSignatureAgeSeconds":%s,"mailCertificateRemainingSeconds":%s,"adminCertificateRemainingSeconds":%s,"errorCount":%s}\n' \
+        "$health_state" "$checked_at" "$queue_count" "$oldest_age" "$used_percent" \
+        "$backup_age" "$signature_age" "$mail_certificate_remaining" \
+        "$admin_certificate_remaining" "$error_count" > "$status_snapshot"
+    chmod 0640 "$status_snapshot"
+    mv -f -- "$status_snapshot" "$status_json"
+}
+
 for service_name in postgresql.service postfix.service dovecot.service rspamd.service \
     clamav-daemon.service clamav-freshclam.service valkey-server.service \
-    mk8email-admin.service nginx.service nftables.service fail2ban.service; do
+    mk8email-admin.service nginx.service nftables.service fail2ban.service \
+    mk8-backup.timer mk8-mail-health.timer dailyaidecheck.timer; do
     systemctl is-active --quiet "$service_name" || record_error "$service_name is not active."
+done
+
+for completed_service in mk8-backup.service dailyaidecheck.service; do
+    service_result=$(systemctl show "$completed_service" --property=Result --value 2>/dev/null || true)
+    [ "$service_result" = success ] || record_error "$completed_service did not finish successfully."
 done
 
 pg_isready --host=127.0.0.1 --port=5432 --dbname=mk8email --quiet \
@@ -45,13 +86,36 @@ valkey-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG \
     || record_error "Valkey is not ready."
 clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1 \
     || record_error "ClamAV is not ready."
-find /var/lib/clamav -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -mtime -2 -print -quit \
-    | grep -q . || record_error "ClamAV signatures are older than two days."
+signature_path=$(find /var/lib/clamav -maxdepth 1 -type f \
+    \( -name '*.cvd' -o -name '*.cld' \) -printf '%T@ %p\n' \
+    | sort -nr | sed -n '1s/^[^ ]* //p')
+if [ -n "$signature_path" ]; then
+    signature_epoch=$(stat -c %Y "$signature_path")
+    signature_age=$((check_epoch - signature_epoch))
+    if [ "$signature_age" -lt 0 ]; then
+        signature_age=0
+        record_error "A ClamAV signature timestamp is in the future."
+    elif [ "$signature_age" -gt 172800 ]; then
+        record_error "ClamAV signatures are older than two days."
+    fi
+else
+    record_error "ClamAV signatures are not available."
+fi
 if [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
-    if [ ! -d /var/backups/mk8-export ] \
-        || ! find /var/backups/mk8-export -maxdepth 1 -type f -name '*.tar.gz.age' -mtime -2 -print -quit \
-            | grep -q .; then
-        record_error "The encrypted backup export is older than two days."
+    latest_export=$(find /var/backups/mk8-export -maxdepth 1 -type f \
+        -name '*.tar.gz.age' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr | sed -n '1s/^[^ ]* //p')
+    if [ -z "$latest_export" ]; then
+        record_error "An encrypted backup export is not available."
+    else
+        export_epoch=$(stat -c %Y "$latest_export")
+        backup_age=$((check_epoch - export_epoch))
+        if [ "$backup_age" -lt 0 ]; then
+            backup_age=0
+            record_error "The encrypted backup timestamp is in the future."
+        elif [ "$backup_age" -gt 172800 ]; then
+            record_error "The encrypted backup export is older than two days."
+        fi
     fi
 fi
 
@@ -59,19 +123,43 @@ if postqueue -j > "$queue_data" 2>/dev/null; then
     queue_count=$(wc -l < "$queue_data" | tr -d ' ')
     [ "$queue_count" -le 100 ] || record_error "The Postfix queue contains more than 100 messages."
     oldest=$(sed -n 's/.*"arrival_time":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$queue_data" | sort -n | head -n 1)
-    if [ -n "$oldest" ] && [ "$(( $(date +%s) - oldest ))" -gt 86400 ]; then
-        record_error "The Postfix queue contains a message older than one day."
+    if [ -n "$oldest" ]; then
+        oldest_age=$((check_epoch - oldest))
+        if [ "$oldest_age" -lt 0 ]; then
+            oldest_age=0
+            record_error "A Postfix queue timestamp is in the future."
+        elif [ "$oldest_age" -gt 86400 ]; then
+            record_error "The Postfix queue contains a message older than one day."
+        fi
     fi
 else
     record_error "The Postfix queue is not available."
 fi
 
 used_percent=$(df -P /var/vmail | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
-[ "${used_percent:-100}" -lt 90 ] || record_error "Mail storage is at least 90 percent full."
+case "$used_percent" in
+    ''|*[!0-9]*)
+        used_percent=null
+        record_error "Mail storage use is not available."
+        ;;
+    *)
+        [ "$used_percent" -lt 90 ] || record_error "Mail storage is at least 90 percent full."
+        ;;
+esac
 openssl x509 -in /etc/mk8email/tls/fullchain.pem -noout -checkend 1209600 >/dev/null 2>&1 \
     || record_error "The mail certificate expires within 14 days."
+for certificate_name in mail.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com; do
+    openssl x509 -in /etc/mk8email/tls/fullchain.pem -noout \
+        -checkhost "$certificate_name" >/dev/null 2>&1 \
+        || record_error "The mail certificate does not cover $certificate_name."
+done
 openssl x509 -in /etc/mk8email/admin-tls/fullchain.pem -noout -checkend 1209600 >/dev/null 2>&1 \
     || record_error "The administrator certificate expires within 14 days."
+openssl x509 -in /etc/mk8email/admin-tls/fullchain.pem -noout \
+    -checkhost admin.mk8n.com >/dev/null 2>&1 \
+    || record_error "The administrator certificate does not cover admin.mk8n.com."
+mail_certificate_remaining=$(certificate_remaining /etc/mk8email/tls/fullchain.pem)
+admin_certificate_remaining=$(certificate_remaining /etc/mk8email/admin-tls/fullchain.pem)
 curl --silent --fail --insecure --max-time 10 \
     --noproxy '*' \
     --resolve admin.mk8n.com:8443:192.0.2.251 \
@@ -108,6 +196,7 @@ if [ ! -s "$errors" ]; then
     fi
     printf 'HEALTHY %s\n' "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$state_file.new"
     mv "$state_file.new" "$state_file"
+    write_status_snapshot healthy
     printf '%s\n' "The mail stack is healthy."
     exit 0
 fi
@@ -116,6 +205,7 @@ error_hash=$(sha256sum "$errors" | cut -d' ' -f1)
 current="UNHEALTHY $error_hash"
 printf '%s %s\n' "$current" "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$state_file.new"
 mv "$state_file.new" "$state_file"
+write_status_snapshot unhealthy
 
 if [ "$previous_key" != "$current" ]; then
     summary=$(tr '\n' ' ' < "$errors")
