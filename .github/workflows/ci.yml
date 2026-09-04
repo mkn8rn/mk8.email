@@ -54,9 +54,11 @@ jobs:
             deploy/scripts/mk8-backup \
             deploy/scripts/mk8-export-backup \
             deploy/scripts/mk8-mail-health \
+            deploy/scripts/verify-host-prerequisites \
             deploy/tests/aide_alert_smoke \
             deploy/tests/backup_restore_smoke \
             deploy/tests/disruption_smoke \
+            deploy/tests/prerequisites_smoke \
             deploy/tests/tls_smoke
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \
             python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py

@@ -6,6 +6,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 2
 fi
 
+/usr/local/sbin/verify-host-prerequisites
+
 test -f /etc/mk8email/schema-ready
 test -s /etc/mk8email/tls/fullchain.pem
 test -s /etc/mk8email/tls/privkey.pem
