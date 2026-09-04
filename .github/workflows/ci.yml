@@ -71,6 +71,7 @@ jobs:
             deploy/tests/host_hardening_smoke \
             deploy/tests/management_cli_smoke \
             deploy/tests/multi_domain_smoke \
+            deploy/tests/native_release_smoke \
             deploy/tests/prerequisites_smoke \
             deploy/tests/release_retention_smoke \
             deploy/tests/tls_smoke

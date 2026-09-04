@@ -77,6 +77,8 @@ tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'usr/local/lib/mk8email/tests/multi_domain_smoke' >/dev/null
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'usr/local/lib/mk8email/tests/native_release_smoke' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'usr/local/lib/mk8email/tests/release_retention_smoke' >/dev/null
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'usr/local/share/mk8email/prerequisites/debian-13-runtime.txt' >/dev/null

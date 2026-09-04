@@ -221,6 +221,50 @@ for active_domain in $active_domains; do
         || record_error "The MTA-STS endpoint for $active_domain is not ready."
 done
 
+current_release=$(readlink -f /opt/mk8email/current 2>/dev/null || true)
+case "$current_release" in
+    /opt/mk8email/releases/[0-9a-f]*)
+        release_id=${current_release##*/}
+        provenance=$current_release/.mk8email-release
+        if [ ! -f "$provenance" ] || [ -L "$provenance" ]; then
+            record_error "The current release provenance is not a regular file."
+        elif [ "$(stat -c '%U:%G %a' "$provenance")" != "root:root 444" ]; then
+            record_error "The current release provenance has unsafe metadata."
+        elif [ "$(wc -l < "$provenance" | tr -d ' ')" -ne 4 ]; then
+            record_error "The current release provenance has an invalid structure."
+        else
+            source_commit=$(sed -n 's/^commit=//p' "$provenance")
+            artifact_digest=$(sed -n 's/^artifact_sha256=//p' "$provenance")
+            asset_digest=$(sed -n 's/^assets_sha256=//p' "$provenance")
+            recorded_release_id=$(sed -n 's/^release_id=//p' "$provenance")
+            if [ "${#source_commit}" -ne 40 ] \
+                || ! printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+                record_error "The current release commit is not valid."
+            fi
+            case "$artifact_digest:$asset_digest" in
+                *[!0-9a-f:]*|*:*:*|'':*|*:'')
+                    record_error "A current release digest is not valid."
+                    ;;
+                *)
+                    if [ "${#artifact_digest}" -ne 64 ] \
+                        || [ "${#asset_digest}" -ne 64 ]; then
+                        record_error "A current release digest length is not valid."
+                    else
+                        expected_release_id=$(printf '%s\n%s\n' \
+                            "$artifact_digest" "$asset_digest" \
+                            | sha256sum | cut -c1-16)
+                        if [ "$recorded_release_id" != "$release_id" ] \
+                            || [ "$expected_release_id" != "$release_id" ]; then
+                            record_error "The current release provenance does not match its path."
+                        fi
+                    fi
+                    ;;
+            esac
+        fi
+        ;;
+    *) record_error "The current release path is not valid." ;;
+esac
+
 if [ "$deep" = true ]; then
     postfix check >/dev/null 2>&1 || record_error "The Postfix configuration is not valid."
     doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null 2>&1 \

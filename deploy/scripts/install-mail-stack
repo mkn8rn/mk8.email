@@ -284,6 +284,7 @@ install -o root -g root -m 0755 "$asset_root/deploy/tests/host_hardening_smoke" 
 install -o root -g root -m 0755 "$asset_root/deploy/tests/management_cli_smoke" /usr/local/lib/mk8email/tests/management_cli_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/multi_domain_smoke" /usr/local/lib/mk8email/tests/multi_domain_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/multi_domain_smoke.py" /usr/local/lib/mk8email/tests/multi_domain_smoke.py
+install -o root -g root -m 0755 "$asset_root/deploy/tests/native_release_smoke" /usr/local/lib/mk8email/tests/native_release_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/mail_smoke.py" /usr/local/lib/mk8email/tests/mail_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/prerequisites_smoke" /usr/local/lib/mk8email/tests/prerequisites_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/release_retention_smoke" /usr/local/lib/mk8email/tests/release_retention_smoke

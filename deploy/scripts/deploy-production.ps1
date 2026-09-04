@@ -13,7 +13,8 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory)] [string]$FilePath,
         [Parameter(Mandatory)] [string[]]$ArgumentList,
         [Parameter(Mandatory)] [int]$TimeoutSeconds,
-        [Parameter(Mandatory)] [string]$WorkingDirectory
+        [Parameter(Mandatory)] [string]$WorkingDirectory,
+        [switch]$PassThru
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -48,6 +49,9 @@ function Invoke-BoundedProcess {
     if ($stderr) {
         Write-Host $stderr.TrimEnd()
     }
+    if ($PassThru) {
+        return $stdout
+    }
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -63,51 +67,68 @@ $profile = Import-Mk8DeploymentProfile `
 $Target = "root@$($profile.ServerIPv4)"
 $KeyPath = $profile.SshKeyPath
 $KnownHostsPath = $profile.KnownHostsPath
+$resolvedProfilePath = [IO.Path]::GetFullPath($ProfilePath)
+$sshOptions = @(
+    '-i', $KeyPath,
+    '-o', 'BatchMode=yes',
+    '-o', 'ConnectTimeout=10',
+    '-o', 'ServerAliveInterval=10',
+    '-o', 'ServerAliveCountMax=2',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', "UserKnownHostsFile=$KnownHostsPath",
+    '-o', 'LogLevel=ERROR'
+)
 
 $taskRoot = 'D:\temp\mk8.email\deploy-production'
 $runRoot = Join-Path $taskRoot ([Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
 
 try {
-    $env:DOTNET_CLI_HOME = Join-Path $runRoot 'home'
-    $env:NUGET_PACKAGES = Join-Path $runRoot 'packages'
-    $env:TEMP = Join-Path $runRoot 'tmp'
-    $env:TMP = $env:TEMP
-    $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
-    $env:DOTNET_NOLOGO = '1'
-    $env:MSBUILDDISABLENODEREUSE = '1'
-    $artifactsRoot = Join-Path $runRoot 'artifacts'
-    [IO.Directory]::CreateDirectory($env:DOTNET_CLI_HOME) | Out-Null
-    [IO.Directory]::CreateDirectory($env:NUGET_PACKAGES) | Out-Null
-    [IO.Directory]::CreateDirectory($env:TEMP) | Out-Null
-    [IO.Directory]::CreateDirectory($artifactsRoot) | Out-Null
-
-    Invoke-BoundedProcess dotnet @('restore', 'mk8.email.slnx', '--locked-mode', '--artifacts-path', $artifactsRoot) 600 $repositoryRoot
-    Invoke-BoundedProcess dotnet @('build', 'mk8.email.slnx', '--configuration', 'Release', '--no-restore', '--artifacts-path', $artifactsRoot, '--property:TreatWarningsAsErrors=true', '--property:ContinuousIntegrationBuild=true', '--property:UseSharedCompilation=false') 600 $repositoryRoot
-    Invoke-BoundedProcess dotnet @('test', 'mk8.email.Application.Tests\mk8.email.Application.Tests.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--logger', 'trx;LogFileName=application.trx', '--results-directory', (Join-Path $runRoot 'test-results')) 600 $repositoryRoot
-    Invoke-BoundedProcess dotnet @('test', 'mk8.email.Infrastructure.Tests\mk8.email.Infrastructure.Tests.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--logger', 'trx;LogFileName=infrastructure.trx', '--results-directory', (Join-Path $runRoot 'test-results')) 600 $repositoryRoot
-
-    $cliOutput = Join-Path $runRoot 'release\cli'
-    $adminOutput = Join-Path $runRoot 'release\admin'
-    Invoke-BoundedProcess dotnet @('publish', 'mk8.email.CLI\mk8.email.Application.CLI.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--output', $cliOutput, '--property:UseAppHost=false') 600 $repositoryRoot
-    Invoke-BoundedProcess dotnet @('publish', 'mk8.email.PublicAPI\mk8.email.PublicAPI.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--output', $adminOutput, '--property:UseAppHost=false') 600 $repositoryRoot
-
-    $releaseArchive = Join-Path $runRoot 'mk8email-release.tar.gz'
-    Invoke-BoundedProcess tar.exe @('--create', '--gzip', "--file=$releaseArchive", "--directory=$(Join-Path $runRoot 'release')", 'cli', 'admin') 120 $repositoryRoot
+    $commit = (Invoke-BoundedProcess git @('rev-parse', 'HEAD') 30 $repositoryRoot -PassThru).Trim()
+    if ($commit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'Git returned an invalid commit identifier.'
+    }
+    $shortCommit = $commit.Substring(0, 12)
+    $remoteBuildOutput = Invoke-BoundedProcess ssh.exe `
+        ($sshOptions + @($Target, "timeout 900s /usr/local/sbin/mk8-build '$commit'")) `
+        930 $repositoryRoot -PassThru
+    $buildRunMatches = [regex]::Matches(
+        $remoteBuildOutput,
+        "(?m)^BUILD_RUN=(/var/lib/mk8email-build/runs/$shortCommit-[0-9]{8}T[0-9]{6}Z-[0-9]+)\r?$"
+    )
+    $artifactMatches = [regex]::Matches(
+        $remoteBuildOutput,
+        '(?m)^ARTIFACT_SHA256=([0-9a-f]{64})\r?$'
+    )
+    if ($buildRunMatches.Count -ne 1 -or $artifactMatches.Count -ne 1) {
+        throw 'The isolated build did not return one validated artifact.'
+    }
+    $buildRun = $buildRunMatches[0].Groups[1].Value
+    $releaseDigest = $artifactMatches[0].Groups[1].Value
+    $serverReleaseArchive = "$buildRun/mk8email-linux-x64.tar.gz"
 
     $assetArchive = Join-Path $runRoot 'mk8email-assets.tar.gz'
+    $sourceArchive = Join-Path $runRoot 'source.tar'
+    $sourceSnapshotRoot = Join-Path $runRoot 'source'
+    [IO.Directory]::CreateDirectory($sourceSnapshotRoot) | Out-Null
+    Invoke-BoundedProcess git @('archive', '--format=tar', "--output=$sourceArchive", $commit, 'deploy') 60 $repositoryRoot
+    Invoke-BoundedProcess tar.exe @('--extract', "--file=$sourceArchive", "--directory=$sourceSnapshotRoot") 60 $repositoryRoot
+    $snapshotSecrets = Join-Path $sourceSnapshotRoot 'deploy\secrets'
+    [IO.Directory]::CreateDirectory($snapshotSecrets) | Out-Null
+    $snapshotProfile = Join-Path $snapshotSecrets 'production-profile.json'
+    [IO.File]::Copy($resolvedProfilePath, $snapshotProfile, $false)
     $renderedAssetsRoot = Join-Path $runRoot 'rendered-assets'
     New-Mk8RenderedDeployAssets `
-        -ProfilePath $ProfilePath `
-        -RepositoryRoot $repositoryRoot `
+        -ProfilePath $snapshotProfile `
+        -RepositoryRoot $sourceSnapshotRoot `
         -Destination $renderedAssetsRoot | Out-Null
     Invoke-BoundedProcess tar.exe @('--create', '--gzip', "--file=$assetArchive", '--directory', $renderedAssetsRoot, 'deploy') 120 $repositoryRoot
-    $releaseDigest = (Get-FileHash -LiteralPath $releaseArchive -Algorithm SHA256).Hash
-    $assetDigest = (Get-FileHash -LiteralPath $assetArchive -Algorithm SHA256).Hash
+    $assetDigest = (Get-FileHash -LiteralPath $assetArchive -Algorithm SHA256).Hash.ToLowerInvariant()
     $releaseMaterial = [Text.Encoding]::ASCII.GetBytes("$releaseDigest`n$assetDigest`n")
     $releaseId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($releaseMaterial)).Substring(0, 16).ToLowerInvariant()
 
-    $remoteRoot = "/run/mk8email-deploy-$releaseId"
+    $deploymentNonce = [Guid]::NewGuid().ToString('N')
+    $remoteRoot = "/run/mk8email-deploy-$releaseId-$deploymentNonce"
     $remoteScript = Join-Path $runRoot 'remote-install.sh'
     $activationRequested = if ($Activate) { 'true' } else { 'false' }
     $remoteScriptText = @"
@@ -115,6 +136,11 @@ try {
 set -eu
 remote_root='$remoteRoot'
 release_id='$releaseId'
+source_commit='$commit'
+source_short_commit='$shortCommit'
+release_source='$serverReleaseArchive'
+release_digest='$releaseDigest'
+asset_digest='$assetDigest'
 activate_requested='$activationRequested'
 was_active=false
 changes_started=false
@@ -247,7 +273,50 @@ finish() {
 trap finish EXIT
 trap 'exit 130' HUP INT TERM
 
-install -d -o root -g root -m 0700 "`$remote_root/assets"
+deploy_lock=/run/lock/mk8email-deploy.lock
+exec 9>"`$deploy_lock"
+if ! flock --exclusive --nonblock 9; then
+    printf '%s\n' "Another production deployment is running." >&2
+    exit 1
+fi
+
+case "`$release_source" in
+    /var/lib/mk8email-build/runs/`$source_short_commit-????????T??????Z-[0-9]*/mk8email-linux-x64.tar.gz) ;;
+    *) printf '%s\n' "The isolated build artifact path is not valid." >&2; exit 1 ;;
+esac
+build_run=`${release_source%/*}
+evidence="`$build_run/evidence.txt"
+if [ -L "`$build_run" ] || [ ! -d "`$build_run" ]; then
+    printf '%s\n' "The isolated build run is not a physical directory." >&2
+    exit 1
+fi
+[ "`$(readlink -f -- "`$build_run")" = "`$build_run" ] \
+    || { printf '%s\n' "The isolated build run does not resolve to itself." >&2; exit 1; }
+if [ -L "`$release_source" ] || [ ! -f "`$release_source" ]; then
+    printf '%s\n' "The isolated build artifact is not a regular file." >&2
+    exit 1
+fi
+[ "`$(stat -c '%U:%G %a' "`$release_source")" = 'mk8build:mk8build 600' ] \
+    || { printf '%s\n' "The isolated build artifact has unsafe metadata." >&2; exit 1; }
+if [ -L "`$evidence" ] || [ ! -f "`$evidence" ]; then
+    printf '%s\n' "The isolated build evidence is not a regular file." >&2
+    exit 1
+fi
+[ "`$(stat -c '%U:%G %a' "`$evidence")" = 'mk8build:mk8build 600' ] \
+    || { printf '%s\n' "The isolated build evidence has unsafe metadata." >&2; exit 1; }
+grep -Fx "commit=`$source_commit" "`$evidence" >/dev/null \
+    || { printf '%s\n' "The isolated build evidence has the wrong commit." >&2; exit 1; }
+grep -Fx "artifact_sha256=`$release_digest" "`$evidence" >/dev/null \
+    || { printf '%s\n' "The isolated build evidence has the wrong digest." >&2; exit 1; }
+[ "`$(sha256sum "`$release_source" | cut -d' ' -f1)" = "`$release_digest" ] \
+    || { printf '%s\n' "The isolated build artifact digest is not valid." >&2; exit 1; }
+
+install -d -o root -g root -m 0700 "`$remote_root" "`$remote_root/assets"
+install -o root -g root -m 0600 "`$release_source" \
+    "`$remote_root/mk8email-release.tar.gz"
+[ "`$(sha256sum "`$remote_root/mk8email-release.tar.gz" | cut -d' ' -f1)" \
+    = "`$release_digest" ] \
+    || { printf '%s\n' "The copied release artifact digest is not valid." >&2; exit 1; }
 tar --extract --gzip --file="`$remote_root/mk8email-assets.tar.gz" --directory="`$remote_root/assets"
 chown root:root \
     "`$remote_root/assets/deploy/prerequisites/debian-13-runtime.txt" \
@@ -319,7 +388,9 @@ if [ -n "`$backup_path" ] && [ -s /etc/mk8email/secrets/backup-age-recipient ]; 
 fi
 
 changes_started=true
-sh "`$remote_root/assets/deploy/scripts/install-native-release" "`$remote_root/mk8email-release.tar.gz" '$releaseId'
+sh "`$remote_root/assets/deploy/scripts/install-native-release" \
+    "`$remote_root/mk8email-release.tar.gz" '$releaseId' \
+    "`$source_commit" "`$release_digest" "`$asset_digest"
 sh "`$remote_root/assets/deploy/scripts/install-mail-stack" "`$remote_root/assets"
 if [ -n "`$previous_release" ]; then
     /usr/local/sbin/prune-native-releases "`$previous_release"
@@ -327,6 +398,8 @@ else
     /usr/local/sbin/prune-native-releases
 fi
 /usr/local/lib/mk8email/tests/release_retention_smoke
+printf '%s\n' "Running the native release provenance smoke test." >&2
+/usr/local/lib/mk8email/tests/native_release_smoke
 if [ "`$activate_requested" = true ] || [ "`$was_active" = true ]; then
     /usr/local/sbin/activate-mail-stack
     printf '%s\n' "Running the management command smoke test." >&2
@@ -340,23 +413,12 @@ apt_sources_changing=false
 "@
     [IO.File]::WriteAllText($remoteScript, $remoteScriptText, [Text.UTF8Encoding]::new($false))
 
-    $sshOptions = @(
-        '-i', $KeyPath,
-        '-o', 'BatchMode=yes',
-        '-o', 'ConnectTimeout=10',
-        '-o', 'ServerAliveInterval=10',
-        '-o', 'ServerAliveCountMax=2',
-        '-o', 'StrictHostKeyChecking=yes',
-        '-o', "UserKnownHostsFile=$KnownHostsPath",
-        '-o', 'LogLevel=ERROR'
-    )
     Invoke-BoundedProcess ssh.exe ($sshOptions + @($Target, "install -d -o root -g root -m 0700 '$remoteRoot'")) 60 $repositoryRoot
-    Invoke-BoundedProcess scp.exe ($sshOptions + @($releaseArchive, "$Target`:$remoteRoot/mk8email-release.tar.gz")) 180 $repositoryRoot
     Invoke-BoundedProcess scp.exe ($sshOptions + @($assetArchive, "$Target`:$remoteRoot/mk8email-assets.tar.gz")) 180 $repositoryRoot
     Invoke-BoundedProcess scp.exe ($sshOptions + @($remoteScript, "$Target`:$remoteRoot/remote-install.sh")) 60 $repositoryRoot
     Invoke-BoundedProcess ssh.exe ($sshOptions + @($Target, "timeout 900s sh '$remoteRoot/remote-install.sh'")) 930 $repositoryRoot
 
-    Write-Host "Deployed release $releaseId."
+    Write-Host "Deployed server-built commit $commit as release $releaseId."
 }
 finally {
     $resolvedTaskRoot = [IO.Path]::GetFullPath($taskRoot).TrimEnd('\') + '\'

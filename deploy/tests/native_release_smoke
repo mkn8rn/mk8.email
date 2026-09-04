@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 1 ]; then
+    printf '%s\n' "Usage: native_release_smoke [INSTALL_SCRIPT]" >&2
+    exit 2
+fi
+
+install_script=${1:-/usr/local/sbin/install-native-release}
+[ -r "$install_script" ] || {
+    printf '%s\n' "The native release installer is not readable." >&2
+    exit 1
+}
+
+test_root=$(mktemp -d /run/mk8-native-release.XXXXXX)
+cleanup() {
+    case "$test_root" in
+        /run/mk8-native-release.*) rm -rf -- "$test_root" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+test_opt=$test_root/opt
+payload=$test_root/payload
+unsafe_payload=$test_root/unsafe-payload
+archive=$test_root/release.tar.gz
+unsafe_archive=$test_root/unsafe-release.tar.gz
+install -d -o root -g root -m 0755 "$test_opt/releases"
+for payload_root in "$payload" "$unsafe_payload"; do
+    install -d -o root -g root -m 0755 \
+        "$payload_root/cli" "$payload_root/admin"
+    : > "$payload_root/cli/mk8.email.Application.CLI.dll"
+    : > "$payload_root/cli/mk8.email.Application.CLI.runtimeconfig.json"
+    : > "$payload_root/admin/mk8.email.PublicAPI.dll"
+    : > "$payload_root/admin/mk8.email.PublicAPI.runtimeconfig.json"
+done
+ln -s /etc/passwd "$unsafe_payload/admin/unsafe-link"
+tar --create --gzip --file="$archive" --directory="$payload" cli admin
+tar --create --gzip --file="$unsafe_archive" \
+    --directory="$unsafe_payload" cli admin
+
+source_commit=0123456789abcdef0123456789abcdef01234567
+asset_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+artifact_digest=$(sha256sum "$archive" | cut -d' ' -f1)
+release_id=$(printf '%s\n%s\n' "$artifact_digest" "$asset_digest" \
+    | sha256sum | cut -c1-16)
+unsafe_digest=$(sha256sum "$unsafe_archive" | cut -d' ' -f1)
+unsafe_release_id=$(printf '%s\n%s\n' "$unsafe_digest" "$asset_digest" \
+    | sha256sum | cut -c1-16)
+
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+unshare --mount sh -eu -c '
+    mount --make-rprivate /
+    mount --bind "$1" /opt/mk8email
+    install_script=$2
+    archive=$3
+    release_id=$4
+    source_commit=$5
+    artifact_digest=$6
+    asset_digest=$7
+    unsafe_archive=$8
+    unsafe_release_id=$9
+
+    sh "$install_script" "$archive" "$release_id" "$source_commit" \
+        "$artifact_digest" "$asset_digest" >/dev/null
+    release=/opt/mk8email/releases/$release_id
+    test "$(readlink -f /opt/mk8email/current)" = "$release"
+    test "$(stat -c "%U:%G %a" "$release/.mk8email-release")" \
+        = "root:root 444"
+    grep -Fx "commit=$source_commit" "$release/.mk8email-release" >/dev/null
+    grep -Fx "artifact_sha256=$artifact_digest" \
+        "$release/.mk8email-release" >/dev/null
+    grep -Fx "assets_sha256=$asset_digest" \
+        "$release/.mk8email-release" >/dev/null
+    grep -Fx "release_id=$release_id" "$release/.mk8email-release" >/dev/null
+
+    if sh "$install_script" "$archive" 0000000000000000 "$source_commit" \
+        "$artifact_digest" "$asset_digest" >/dev/null 2>&1; then
+        printf "%s\n" "The installer accepted a mismatched release identifier." >&2
+        exit 1
+    fi
+    if sh "$install_script" "$unsafe_archive" "$unsafe_release_id" \
+        "$source_commit" "$(sha256sum "$unsafe_archive" | cut -d" " -f1)" \
+        "$asset_digest" >/dev/null 2>&1; then
+        printf "%s\n" "The installer accepted a symbolic link." >&2
+        exit 1
+    fi
+    test ! -e "/opt/mk8email/releases/$unsafe_release_id"
+    test -z "$(find /opt/mk8email/releases -mindepth 1 -maxdepth 1 \
+        -name ".installing-*" -print -quit)"
+' sh "$test_opt" "$install_script" "$archive" "$release_id" \
+    "$source_commit" "$artifact_digest" "$asset_digest" \
+    "$unsafe_archive" "$unsafe_release_id"
+
+printf '%s\n' "Native release provenance and rejection tests passed."

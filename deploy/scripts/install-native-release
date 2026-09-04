@@ -1,13 +1,21 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 2 ]; then
-    printf '%s\n' "Usage: install-native-release ARCHIVE RELEASE_ID" >&2
+if [ "$#" -ne 5 ]; then
+    printf '%s\n' "Usage: install-native-release ARCHIVE RELEASE_ID COMMIT ARTIFACT_SHA256 ASSET_SHA256" >&2
     exit 2
 fi
 
 archive=$1
 release_id=$2
+source_commit=$3
+artifact_digest=$4
+asset_digest=$5
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
 
 if [ ! -f "$archive" ]; then
     printf '%s\n' "The release archive does not exist." >&2
@@ -16,10 +24,25 @@ fi
 
 case "$release_id" in
     *[!0-9a-f]*|'')
-        printf '%s\n' "The release identifier is not valid." >&2
-        exit 1
+        fail "The release identifier is not valid."
         ;;
 esac
+if [ "${#source_commit}" -ne 40 ] \
+    || ! printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+    fail "The source commit is not valid."
+fi
+for digest in "$artifact_digest" "$asset_digest"; do
+    if [ "${#digest}" -ne 64 ] \
+        || ! printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'; then
+        fail "A release digest is not valid."
+    fi
+done
+expected_release_id=$(printf '%s\n%s\n' "$artifact_digest" "$asset_digest" \
+    | sha256sum | cut -c1-16)
+[ "$release_id" = "$expected_release_id" ] \
+    || fail "The release identifier does not match its digests."
+[ "$(sha256sum "$archive" | cut -d' ' -f1)" = "$artifact_digest" ] \
+    || fail "The release archive does not match its digest."
 
 release_root=/opt/mk8email/releases
 release_dir="$release_root/$release_id"
@@ -47,6 +70,17 @@ test -f "$stage/cli/mk8.email.Application.CLI.dll"
 test -f "$stage/cli/mk8.email.Application.CLI.runtimeconfig.json"
 test -f "$stage/admin/mk8.email.PublicAPI.dll"
 test -f "$stage/admin/mk8.email.PublicAPI.runtimeconfig.json"
+if find "$stage" -mindepth 1 -maxdepth 1 \
+    ! -name cli ! -name admin -print -quit | grep -q .; then
+    fail "The release archive contains an unexpected top-level entry."
+fi
+if find "$stage" ! -type d ! -type f -print -quit | grep -q .; then
+    fail "The release archive contains a special file."
+fi
+
+printf 'commit=%s\nartifact_sha256=%s\nassets_sha256=%s\nrelease_id=%s\n' \
+    "$source_commit" "$artifact_digest" "$asset_digest" "$release_id" \
+    > "$stage/.mk8email-release"
 
 chown -R root:root "$stage"
 find "$stage" -type d -exec chmod 0555 {} +

@@ -42,6 +42,11 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 [ -x "$sdk" ] || fail "The isolated build SDK is not installed."
+build_lock=/run/lock/mk8email-build.lock
+exec 9>"$build_lock"
+if ! flock --exclusive --wait 30 9; then
+    fail "Another isolated build is running."
+fi
 if [ ! -d "$repository" ] || [ -L "$repository" ]; then
     fail "The isolated build repository is not installed."
 fi
@@ -117,6 +122,7 @@ run_unit() {
         --setenv=DOTNET_NOLOGO=1 \
         --setenv=DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
         --setenv=DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1 \
+        --setenv=DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1 \
         --setenv=MSBUILDDISABLENODEREUSE=1 \
         "$@"
 }
@@ -179,6 +185,7 @@ run_unit "mk8-build-$short_commit-$$" yes /bin/sh -eu -c '
         deploy/tests/host_hardening_smoke \
         deploy/tests/management_cli_smoke \
         deploy/tests/multi_domain_smoke \
+        deploy/tests/native_release_smoke \
         deploy/tests/prerequisites_smoke \
         deploy/tests/release_retention_smoke \
         deploy/tests/tls_smoke
