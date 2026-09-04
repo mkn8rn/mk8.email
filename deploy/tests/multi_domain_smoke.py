@@ -101,6 +101,8 @@ def require_sender_mismatch_rejected(account: str, password: str) -> None:
         client.ehlo("probe.debian.org")
         client.login(account, password)
         code, _ = client.mail("admin@mk8n.com")
+        if code < 400:
+            code, _ = client.rcpt(account)
         require(code in (550, 553), "Postfix accepted a sender from another hosted domain.")
 
 
