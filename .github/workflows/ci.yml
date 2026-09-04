@@ -61,6 +61,7 @@ jobs:
             deploy/tests/aide_alert_smoke \
             deploy/tests/apt_sources_smoke \
             deploy/tests/backup_restore_smoke \
+            deploy/tests/certificate_deploy_smoke \
             deploy/tests/disruption_smoke \
             deploy/tests/host_hardening_smoke \
             deploy/tests/management_cli_smoke \

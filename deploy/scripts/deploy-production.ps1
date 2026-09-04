@@ -245,6 +245,7 @@ fi
 if [ "`$activate_requested" = true ] || [ "`$was_active" = true ]; then
     /usr/local/sbin/activate-mail-stack
     /usr/local/lib/mk8email/tests/management_cli_smoke
+    /usr/local/lib/mk8email/tests/certificate_deploy_smoke
 fi
 apt_sources_changing=false
 "@
