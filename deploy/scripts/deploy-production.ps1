@@ -122,6 +122,7 @@ apt_sources_changing=false
 backup_path=
 previous_release=
 apt_source_backup=
+configuration_restore=
 
 restore_apt_sources() {
     restore_status=0
@@ -135,6 +136,65 @@ restore_apt_sources() {
         cp --archive "`$apt_source_backup/debian.sources" \
             /etc/apt/sources.list.d/debian.sources || restore_status=1
     fi
+    return "`$restore_status"
+}
+
+restore_exact_directory() {
+    restore_relative=`$1
+    restore_optional=`$2
+    restore_source="`$configuration_restore/`$restore_relative"
+    restore_destination="/`$restore_relative"
+    case "`$restore_relative" in
+        etc/mk8email|etc/nginx|etc/rspamd|usr/local/lib/mk8email/tests|var/www/mk8email-domains|usr/local/share/mk8email/domain-templates) ;;
+        *) return 1 ;;
+    esac
+    if [ -L "`$restore_destination" ] \
+        || { [ -e "`$restore_destination" ] && [ ! -d "`$restore_destination" ]; }; then
+        return 1
+    fi
+    if [ ! -d "`$restore_source" ] || [ -L "`$restore_source" ]; then
+        if [ "`$restore_optional" = true ]; then
+            rm -rf -- "`$restore_destination"
+            return `$?
+        fi
+        return 1
+    fi
+    mkdir -p -- "`$restore_destination" || return 1
+    if [ "`$restore_relative" = etc/mk8email ]; then
+        rsync --archive --delete --numeric-ids --exclude=bootstrap-secrets \
+            "`$restore_source/" "`$restore_destination/"
+    else
+        rsync --archive --delete --numeric-ids \
+            "`$restore_source/" "`$restore_destination/"
+    fi
+}
+
+restore_configuration() {
+    restore_archive="`$backup_path/configuration.tar.gz"
+    configuration_restore="`$remote_root/configuration-restore"
+    rm -rf -- "`$configuration_restore"
+    install -d -o root -g root -m 0700 "`$configuration_restore" || return 1
+    tar --extract --gzip --file="`$restore_archive" \
+        --directory="`$configuration_restore" || return 1
+
+    restore_status=0
+    restore_exact_directory etc/mk8email false || restore_status=1
+    restore_exact_directory etc/nginx false || restore_status=1
+    restore_exact_directory etc/rspamd false || restore_status=1
+    restore_exact_directory usr/local/lib/mk8email/tests false || restore_status=1
+    restore_exact_directory var/www/mk8email-domains true || restore_status=1
+    restore_exact_directory usr/local/share/mk8email/domain-templates true \
+        || restore_status=1
+
+    for restore_file in \
+        usr/local/sbin/deploy-mk8-domain-certificate \
+        usr/local/sbin/mk8-domain; do
+        if [ ! -e "`$configuration_restore/`$restore_file" ]; then
+            rm -f -- "/`$restore_file" || restore_status=1
+        fi
+    done
+    tar --extract --gzip --file="`$restore_archive" --directory=/ \
+        || restore_status=1
     return "`$restore_status"
 }
 
@@ -154,15 +214,22 @@ finish() {
     if [ "`$deployment_status" -ne 0 ] && [ "`$changes_started" = true ] && [ "`$was_active" = true ]; then
         printf '%s\n' "The deployment failed. The prior release will be restored." >&2
         set +e
-        /usr/local/sbin/deactivate-mail-stack
-        tar --extract --gzip --file="`$backup_path/configuration.tar.gz" --directory=/
-        ln -sfnT "`$previous_release" /opt/mk8email/current
-        systemctl daemon-reload
-        nft -f /etc/nftables.conf
-        systemctl reload nginx.service
-        systemctl restart fail2ban.service
-        /usr/local/sbin/activate-mail-stack
-        rollback_status=`$?
+        rollback_status=0
+        /usr/local/sbin/deactivate-mail-stack || rollback_status=1
+        if [ "`$rollback_status" -eq 0 ]; then
+            restore_configuration || rollback_status=1
+        fi
+        if [ "`$rollback_status" -eq 0 ]; then
+            ln -sfnT "`$previous_release" /opt/mk8email/current \
+                || rollback_status=1
+            systemctl daemon-reload || rollback_status=1
+            nft -f /etc/nftables.conf || rollback_status=1
+            systemctl reload nginx.service || rollback_status=1
+            systemctl restart fail2ban.service || rollback_status=1
+        fi
+        if [ "`$rollback_status" -eq 0 ]; then
+            /usr/local/sbin/activate-mail-stack || rollback_status=1
+        fi
         if [ "`$rollback_status" -ne 0 ]; then
             printf '%s\n' "Automatic rollback failed. Immediate operator action is required." >&2
         fi
@@ -205,6 +272,8 @@ if [ -f /etc/mk8email/mail-stack-ready ]; then
         /var/backups/mk8/20??????T??????Z) ;;
         *) printf '%s\n' "The deployment backup path is not valid." >&2; exit 1 ;;
     esac
+    (cd "`$backup_path" && sha256sum --check --status SHA256SUMS) \
+        || { printf '%s\n' "The deployment backup checksum is not valid." >&2; exit 1; }
 elif [ -x /usr/local/sbin/verify-host-prerequisites ] \
     && [ -d /usr/local/share/mk8email/prerequisites ]; then
     timeout 180s apt-get update

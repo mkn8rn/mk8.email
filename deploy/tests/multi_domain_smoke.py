@@ -12,7 +12,8 @@ from email.policy import default
 from pathlib import Path
 
 
-HOST = "127.0.0.1"
+LOCAL_HOST = "127.0.0.1"
+INBOUND_HOST = "@@MK8_SERVER_IPV4@@"
 
 
 def require(condition: bool, message: str) -> None:
@@ -38,7 +39,7 @@ def new_message(sender: str, recipient: str, marker: str) -> EmailMessage:
 
 
 def require_recipient_rejected(recipient: str) -> None:
-    with smtplib.SMTP(HOST, 25, timeout=20) as client:
+    with smtplib.SMTP(INBOUND_HOST, 25, timeout=20) as client:
         client.ehlo("probe.debian.org")
         require(client.mail("probe@debian.org")[0] == 250, "The test sender was rejected.")
         code, _ = client.rcpt(recipient)
@@ -47,7 +48,7 @@ def require_recipient_rejected(recipient: str) -> None:
 
 def require_login_rejected(account: str, password: str) -> None:
     try:
-        with imaplib.IMAP4_SSL(HOST, 993, ssl_context=tls_context(), timeout=20) as client:
+        with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
             client.login(account, password)
     except imaplib.IMAP4.error:
         return
@@ -55,13 +56,13 @@ def require_login_rejected(account: str, password: str) -> None:
 
 
 def send_inbound(value: EmailMessage) -> None:
-    with smtplib.SMTP(HOST, 25, timeout=30) as client:
+    with smtplib.SMTP(INBOUND_HOST, 25, timeout=30) as client:
         client.ehlo("probe.debian.org")
         client.send_message(value)
 
 
 def send_submission(value: EmailMessage, account: str, password: str) -> None:
-    with smtplib.SMTP(HOST, 587, timeout=30) as client:
+    with smtplib.SMTP(LOCAL_HOST, 587, timeout=30) as client:
         client.ehlo("probe.debian.org")
         client.starttls(context=tls_context())
         client.ehlo("probe.debian.org")
@@ -72,7 +73,7 @@ def send_submission(value: EmailMessage, account: str, password: str) -> None:
 def wait_for_message(account: str, password: str, marker: str) -> bytes:
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
-        with imaplib.IMAP4_SSL(HOST, 993, ssl_context=tls_context(), timeout=20) as client:
+        with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
             client.login(account, password)
             status, _ = client.select("INBOX")
             require(status == "OK", "IMAP could not select the test inbox.")
@@ -94,7 +95,7 @@ def wait_for_message(account: str, password: str, marker: str) -> bytes:
 
 
 def require_sender_mismatch_rejected(account: str, password: str) -> None:
-    with smtplib.SMTP(HOST, 587, timeout=30) as client:
+    with smtplib.SMTP(LOCAL_HOST, 587, timeout=30) as client:
         client.ehlo("probe.debian.org")
         client.starttls(context=tls_context())
         client.ehlo("probe.debian.org")

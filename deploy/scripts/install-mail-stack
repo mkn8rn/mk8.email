@@ -137,6 +137,7 @@ esac
     exit 1
 }
 primary_key=/etc/mk8email/dkim/mk8n.com/$primary_selector.private.pem
+legacy_key=/etc/mk8email/dkim/s202609.private.pem
 legacy_key_migrated=false
 if [ -e "$primary_key" ] || [ -L "$primary_key" ]; then
     if [ ! -f "$primary_key" ] || [ -L "$primary_key" ] \
@@ -147,7 +148,6 @@ if [ -e "$primary_key" ] || [ -L "$primary_key" ]; then
     fi
 else
     test "$primary_selector" = s202609
-    legacy_key=/etc/mk8email/dkim/s202609.private.pem
     if [ ! -f "$legacy_key" ] || [ -L "$legacy_key" ] \
         || [ "$(stat -c '%U %h' "$legacy_key")" != "root 1" ] \
         || [ ! -s "$legacy_key" ]; then
@@ -155,6 +155,25 @@ else
         exit 1
     fi
     install -o root -g dkimkeys -m 0640 "$legacy_key" "$primary_key"
+    legacy_key_migrated=true
+fi
+if [ -e "$legacy_key" ] || [ -L "$legacy_key" ]; then
+    if [ ! -f "$legacy_key" ] || [ -L "$legacy_key" ] \
+        || [ "$(stat -c '%U %h' "$legacy_key")" != "root 1" ] \
+        || [ ! -s "$legacy_key" ]; then
+        printf '%s\n' "The legacy DKIM key is not safe." >&2
+        exit 1
+    fi
+    openssl pkey -in "$primary_key" -noout -check </dev/null >/dev/null
+    openssl pkey -in "$legacy_key" -noout -check </dev/null >/dev/null
+    primary_public_key=$(openssl pkey -in "$primary_key" -pubout -outform DER 2>/dev/null \
+        | sha256sum | cut -d ' ' -f 1)
+    legacy_public_key=$(openssl pkey -in "$legacy_key" -pubout -outform DER 2>/dev/null \
+        | sha256sum | cut -d ' ' -f 1)
+    [ "$primary_public_key" = "$legacy_public_key" ] || {
+        printf '%s\n' "The legacy and primary DKIM keys do not match." >&2
+        exit 1
+    }
     legacy_key_migrated=true
 fi
 chown root:dkimkeys "$primary_key"
