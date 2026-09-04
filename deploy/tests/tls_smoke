@@ -7,7 +7,7 @@ if [ "$#" -gt 2 ]; then
 fi
 
 ca_file=${1:-}
-hostname=${2:-mail.mk8n.com}
+hostname=${2:-email.mk8n.com}
 
 reject_protocol() {
     label=$1

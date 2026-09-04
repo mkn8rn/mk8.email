@@ -7,7 +7,7 @@
     "PasswordFile": "/etc/mk8email/secrets/database_password"
   },
   "Smtp": {
-    "Hostname": "mail.mk8n.com",
+    "Hostname": "email.mk8n.com",
     "Port": 25,
     "SubmissionPort": 587,
     "ImplicitTlsPort": 465,

@@ -27,7 +27,7 @@ case "$1" in
         directory_mode=0751
         certificate_mode=0444
         private_mode=0440
-        required_names="mail.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com"
+        required_names="email.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com"
         getent group tlskeys >/dev/null || groupadd --system tlskeys
         ;;
     *)
@@ -360,10 +360,10 @@ for required_name in $required_names; do
         -connect 127.0.0.1:443
 done
 if [ "$1" = mail ]; then
-    probe_certificate smtp mail.mk8n.com -starttls smtp -connect 127.0.0.1:25
-    probe_certificate submissions mail.mk8n.com -connect 127.0.0.1:465
-    probe_certificate submission mail.mk8n.com -starttls smtp -connect 127.0.0.1:587
-    probe_certificate imaps mail.mk8n.com -connect 127.0.0.1:993
+    probe_certificate smtp email.mk8n.com -starttls smtp -connect 127.0.0.1:25
+    probe_certificate submissions email.mk8n.com -connect 127.0.0.1:465
+    probe_certificate submission email.mk8n.com -starttls smtp -connect 127.0.0.1:587
+    probe_certificate imaps email.mk8n.com -connect 127.0.0.1:993
 fi
 
 systemctl is-active --quiet nginx.service

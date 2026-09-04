@@ -5,7 +5,7 @@ namespace mk8.email.Application.Tests;
 
 internal static class TestCertificateFactory
 {
-    public static string Create(string directory, string hostName = "mail.mk8n.com")
+    public static string Create(string directory, string hostName = "email.mk8n.com")
     {
         using var key = RSA.Create(2048);
         var request = new CertificateRequest(

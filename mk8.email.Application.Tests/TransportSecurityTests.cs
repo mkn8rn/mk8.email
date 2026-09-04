@@ -82,7 +82,7 @@ public sealed class TransportSecurityTests
 
         await connection.WriteLineAsync("STARTTLS");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("220 ", StringComparison.Ordinal));
-        await connection.UpgradeToTlsAsync("mail.mk8n.com");
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
 
         await connection.WriteLineAsync("EHLO client.example");
         var capability = await connection.ReadSmtpResponseAsync();
@@ -359,7 +359,7 @@ public sealed class TransportSecurityTests
         await connection.ReadLineAsync();
         await connection.WriteLineAsync("a1 STARTTLS");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
-        await connection.UpgradeToTlsAsync("mail.mk8n.com");
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
 
         await connection.WriteLineAsync("a2 CAPABILITY");
         var capability = await connection.ReadLineAsync();
@@ -379,7 +379,7 @@ public sealed class TransportSecurityTests
         {
             Smtp = new SmtpConfig
             {
-                Hostname = "mail.mk8n.com",
+                Hostname = "email.mk8n.com",
                 Port = smtpPort ?? ReservePort(),
                 SubmissionPort = submissionPort ?? ReservePort(),
                 ImplicitTlsPort = ReservePort(),
@@ -441,7 +441,7 @@ public sealed class TransportSecurityTests
         await connection.ReadSmtpResponseAsync();
         await connection.WriteLineAsync("STARTTLS");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("220 ", StringComparison.Ordinal));
-        await connection.UpgradeToTlsAsync("mail.mk8n.com");
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
         await connection.WriteLineAsync("EHLO client.example");
         await connection.ReadSmtpResponseAsync();
     }

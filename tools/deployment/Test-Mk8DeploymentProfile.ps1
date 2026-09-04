@@ -109,6 +109,28 @@ try {
         'The rendered nginx configuration does not contain the server address.'
     Assert-True ($renderedNginx.Contains($validProfile.LanCidr, [StringComparison]::Ordinal)) `
         'The rendered nginx configuration does not contain the LAN CIDR.'
+    $oldHostname = $renderedFiles `
+        | Select-String -Pattern '(?<![A-Za-z0-9.-])mail\.mk8n\.com' `
+        | Select-Object -First 1
+    Assert-True ($null -eq $oldHostname) 'The rendered assets contain the old mail hostname.'
+    $renderedPostfix = Get-Content `
+        -LiteralPath (Join-Path $renderedRoot 'deploy/postfix/main.cf') -Raw
+    Assert-True ($renderedPostfix.Contains(
+        'myhostname = email.mk8n.com',
+        [StringComparison]::Ordinal)) `
+        'The rendered Postfix configuration has the wrong mail hostname.'
+    $renderedDns = Get-Content `
+        -LiteralPath (Join-Path $renderedRoot 'deploy/dns/mk8n.com.zone') -Raw
+    Assert-True ($renderedDns.Contains(
+        'IN MX 10 email.mk8n.com.',
+        [StringComparison]::Ordinal)) `
+        'The rendered MX record has the wrong mail hostname.'
+    $renderedAutoconfig = Get-Content `
+        -LiteralPath (Join-Path $renderedRoot 'deploy/nginx/www/autoconfig/mail/config-v1.1.xml') -Raw
+    Assert-True ($renderedAutoconfig.Contains(
+        '<hostname>email.mk8n.com</hostname>',
+        [StringComparison]::Ordinal)) `
+        'The rendered client configuration has the wrong mail hostname.'
     $sourceNginx = Get-Content -LiteralPath (Join-Path $testDeploy 'nginx/mk8-admin.conf') -Raw
     Assert-True ($sourceNginx.Contains('@@MK8_SERVER_IPV4@@', [StringComparison]::Ordinal)) `
         'Rendering changed the deployment source.'

@@ -104,7 +104,7 @@ public sealed class EnvironmentConfigTests
             },
             Smtp = new SmtpConfig
             {
-                Hostname = "mail.mk8n.com",
+                Hostname = "email.mk8n.com",
                 Port = 2525,
                 SubmissionPort = 2587,
                 ImplicitTlsPort = 2465,

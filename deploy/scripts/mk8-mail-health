@@ -148,7 +148,7 @@ case "$used_percent" in
 esac
 openssl x509 -in /etc/mk8email/tls/fullchain.pem -noout -checkend 1209600 >/dev/null 2>&1 \
     || record_error "The mail certificate expires within 14 days."
-for certificate_name in mail.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com; do
+for certificate_name in email.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com; do
     openssl x509 -in /etc/mk8email/tls/fullchain.pem -noout \
         -checkhost "$certificate_name" >/dev/null 2>&1 \
         || record_error "The mail certificate does not cover $certificate_name."

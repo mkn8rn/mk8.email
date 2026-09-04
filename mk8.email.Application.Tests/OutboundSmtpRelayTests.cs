@@ -203,7 +203,7 @@ public sealed class OutboundSmtpRelayTests
             {
                 Smtp = new SmtpConfig
                 {
-                    Hostname = "mail.mk8n.com",
+                    Hostname = "email.mk8n.com",
                 },
                 Limits = new LimitsConfig
                 {

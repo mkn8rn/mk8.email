@@ -52,9 +52,9 @@ generate_certificate() {
     chmod 0600 "$output_directory/privkey.pem"
 }
 
-valid_names="DNS:mail.mk8n.com,DNS:mta-sts.mk8n.com,DNS:autoconfig.mk8n.com"
-generate_certificate "$test_root/old" mail.mk8n.com "$valid_names"
-generate_certificate "$test_root/alternate" mail.mk8n.com "$valid_names"
+valid_names="DNS:email.mk8n.com,DNS:mta-sts.mk8n.com,DNS:autoconfig.mk8n.com"
+generate_certificate "$test_root/old" email.mk8n.com "$valid_names"
+generate_certificate "$test_root/alternate" email.mk8n.com "$valid_names"
 generate_certificate "$test_root/invalid" invalid.example "DNS:invalid.example"
 test_destination="$test_root/destination"
 test_spool="$test_root/spool"
@@ -131,7 +131,7 @@ if ! unshare --mount sh -eu -c '
         printf "%s\n" "Certificate deployment accepted an invalid service name." >&2
         exit 1
     fi
-    grep -F "The certificate does not cover mail.mk8n.com." \
+    grep -F "The certificate does not cover email.mk8n.com." \
         "$8/invalid-name.log" >/dev/null
     cmp --silent "$8/old/fullchain.pem" /etc/mk8email/tls/fullchain.pem
     cmp --silent "$8/old/privkey.pem" /etc/mk8email/tls/privkey.pem

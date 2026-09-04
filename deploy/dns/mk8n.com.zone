@@ -1,10 +1,10 @@
 $ORIGIN mk8n.com.
 $TTL 300
 
-@                               IN MX 10 mail.mk8n.com.
-_imaps._tcp                     IN SRV 0 1 993 mail.mk8n.com.
-_submission._tcp                IN SRV 0 1 587 mail.mk8n.com.
-_submissions._tcp               IN SRV 0 1 465 mail.mk8n.com.
+@                               IN MX 10 email.mk8n.com.
+_imaps._tcp                     IN SRV 0 1 993 email.mk8n.com.
+_submission._tcp                IN SRV 0 1 587 email.mk8n.com.
+_submissions._tcp               IN SRV 0 1 465 email.mk8n.com.
 @                               IN CAA 0 issue "letsencrypt.org"
 @                               IN CAA 0 issuewild ";"
 @                               IN TXT "v=spf1 mx -all"

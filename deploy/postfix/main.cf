@@ -1,6 +1,6 @@
 compatibility_level = 3.10
 
-myhostname = mail.mk8n.com
+myhostname = email.mk8n.com
 mydomain = mk8n.com
 myorigin = $mydomain
 inet_interfaces = all
