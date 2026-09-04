@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: initialize-postgresql MK8_PASSWORD_FILE" >&2
+    exit 2
+fi
+
+if [ ! -r "$1" ]; then
+    printf '%s\n' "The database password file must be readable." >&2
+    exit 1
+fi
+
+checksum_version=$(/usr/lib/postgresql/17/bin/pg_controldata /var/lib/postgresql/17/main \
+    | awk -F: '/Data page checksum version/ { gsub(/[[:space:]]/, "", $2); print $2 }')
+case "$checksum_version" in
+    0)
+        pg_ctlcluster 17 main stop
+        runuser -u postgres -- /usr/lib/postgresql/17/bin/pg_checksums --enable -D /var/lib/postgresql/17/main
+        pg_ctlcluster 17 main start
+        ;;
+    1)
+        ;;
+    *)
+        printf '%s\n' "The PostgreSQL checksum state is not recognized." >&2
+        exit 1
+        ;;
+esac
+
+MK8_ROLE_PASSWORD=$(tr -d '\r\n' < "$1")
+export MK8_ROLE_PASSWORD
+if [ "${#MK8_ROLE_PASSWORD}" -lt 16 ]; then
+    printf '%s\n' "The database password must contain at least 16 characters." >&2
+    exit 1
+fi
+
+runuser --preserve-environment -u postgres -- psql --set ON_ERROR_STOP=1 <<'SQL'
+SELECT 'CREATE ROLE mk8email LOGIN' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mk8email') \gexec
+\getenv mk8_password MK8_ROLE_PASSWORD
+ALTER ROLE mk8email PASSWORD :'mk8_password';
+ALTER ROLE mk8email NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+SQL
+unset MK8_ROLE_PASSWORD
+
+if ! runuser -u postgres -- psql --tuples-only --no-align --command "SELECT 1 FROM pg_database WHERE datname = 'mk8email'" | grep -qx 1; then
+    runuser -u postgres -- createdb --owner=mk8email --encoding=UTF8 --locale=C --template=template0 mk8email
+fi
+runuser -u postgres -- psql --set ON_ERROR_STOP=1 --command 'REVOKE ALL ON DATABASE mk8email FROM PUBLIC'
+pg_isready -h 127.0.0.1 -p 5432
+
+printf '%s\n' "The mk8.email PostgreSQL role and database are initialized."
