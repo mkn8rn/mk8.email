@@ -25,7 +25,7 @@ public sealed class IndexModel(
         var accounts = await administration.GetAccountsAsync(cancellationToken);
         SystemStatus = await systemStatus.GetStatusAsync(cancellationToken);
         DomainCount = domains.Count(domain => domain.IsActive);
-        ActiveAccountCount = accounts.Count(account => account.IsActive);
+        ActiveAccountCount = accounts.Count(account => account.IsActive && account.IsDomainActive);
         CatchAllCount = domains.Count(domain => domain.CatchAllTarget is not null);
 
         var current = SystemStatus.CheckedAt is not null

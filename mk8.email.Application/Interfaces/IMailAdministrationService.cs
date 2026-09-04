@@ -21,6 +21,11 @@ public interface IMailAdministrationService
         string targetAddress,
         CancellationToken cancellationToken = default);
 
+    Task<AdministrationResult> SetDomainActiveAsync(
+        string domain,
+        bool isActive,
+        CancellationToken cancellationToken = default);
+
     Task<AdministrationResult> SetAccountActiveAsync(
         Guid userId,
         bool isActive,

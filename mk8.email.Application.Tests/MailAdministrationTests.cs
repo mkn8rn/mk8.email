@@ -27,6 +27,7 @@ public sealed class MailAdministrationTests
         Assert.IsTrue((await administration.SetCatchAllAsync(
             "mk8n.com",
             "mk8n@mk8n.com")).Succeeded);
+        Assert.IsTrue((await administration.SetDomainActiveAsync("mk8n.com", true)).Succeeded);
 
         var mail = new EmailService(database, new UnusedRelay());
         Assert.IsTrue(await mail.CanReceiveAsync("undefined@mk8n.com"));
@@ -55,6 +56,7 @@ public sealed class MailAdministrationTests
             "mailbox-password-value",
             UserRole.User);
         await administration.SetCatchAllAsync("mk8n.com", "mk8n@mk8n.com");
+        await administration.SetDomainActiveAsync("mk8n.com", true);
 
         var mail = new EmailService(database, new UnusedRelay());
         Assert.IsTrue(await mail.DeliverAsync(
@@ -81,6 +83,55 @@ public sealed class MailAdministrationTests
 
         Assert.IsFalse(result.Succeeded);
         Assert.AreEqual(0, await database.Users.CountAsync());
+    }
+
+    [TestMethod]
+    public async Task NewDomainCanBeConfiguredButCannotReceiveBeforeActivation()
+    {
+        await using var database = CreateDatabase();
+        var administration = new MailAdministrationService(database);
+        var mail = new EmailService(database, new UnusedRelay());
+
+        Assert.IsTrue((await administration.EnsureDomainAsync("Example", "example.com")).Succeeded);
+        Assert.IsTrue((await administration.CreateAccountAsync(
+            "postmaster@example.com",
+            "postmaster-password-value",
+            UserRole.User)).Succeeded);
+        Assert.IsTrue((await administration.SetCatchAllAsync(
+            "example.com",
+            "postmaster@example.com")).Succeeded);
+        Assert.IsFalse(await mail.CanReceiveAsync("unknown@example.com"));
+
+        Assert.IsTrue((await administration.SetDomainActiveAsync("example.com", true)).Succeeded);
+        Assert.IsTrue(await mail.CanReceiveAsync("unknown@example.com"));
+    }
+
+    [TestMethod]
+    public async Task DomainActivationDoesNotChangeAnotherDomain()
+    {
+        await using var database = CreateDatabase();
+        var administration = new MailAdministrationService(database);
+        var mail = new EmailService(database, new UnusedRelay());
+
+        await administration.EnsureDomainAsync("Example", "example.com");
+        await administration.CreateAccountAsync(
+            "postmaster@example.com",
+            "postmaster-password-value",
+            UserRole.User);
+        await administration.EnsureDomainAsync("Example", "example.net");
+        await administration.CreateAccountAsync(
+            "postmaster@example.net",
+            "postmaster-password-value",
+            UserRole.User);
+
+        Assert.IsTrue((await administration.SetDomainActiveAsync("example.com", true)).Succeeded);
+        Assert.IsTrue(await mail.CanReceiveAsync("postmaster@example.com"));
+        Assert.IsFalse(await mail.CanReceiveAsync("postmaster@example.net"));
+
+        Assert.IsTrue((await administration.SetDomainActiveAsync("example.net", true)).Succeeded);
+        Assert.IsTrue((await administration.SetDomainActiveAsync("example.com", false)).Succeeded);
+        Assert.IsFalse(await mail.CanReceiveAsync("postmaster@example.com"));
+        Assert.IsTrue(await mail.CanReceiveAsync("postmaster@example.net"));
     }
 
     private static EmailDbContext CreateDatabase()

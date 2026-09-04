@@ -47,6 +47,7 @@ jobs:
             deploy/scripts/configure-mail-database-access \
             deploy/scripts/deactivate-mail-stack \
             deploy/scripts/deploy-admin-certificate \
+            deploy/scripts/deploy-mk8-domain-certificate \
             deploy/scripts/deploy-mk8-certificate \
             deploy/scripts/initialize-postgresql \
             deploy/scripts/install-build-environment \
@@ -54,6 +55,7 @@ jobs:
             deploy/scripts/install-mail-stack \
             deploy/scripts/install-native-release \
             deploy/scripts/mk8-build \
+            deploy/scripts/mk8-domain \
             deploy/scripts/mk8email \
             deploy/scripts/mk8-backup \
             deploy/scripts/mk8-export-backup \
@@ -68,11 +70,12 @@ jobs:
             deploy/tests/disruption_smoke \
             deploy/tests/host_hardening_smoke \
             deploy/tests/management_cli_smoke \
+            deploy/tests/multi_domain_smoke \
             deploy/tests/prerequisites_smoke \
             deploy/tests/release_retention_smoke \
             deploy/tests/tls_smoke
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \
-            python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py
+            python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py deploy/tests/multi_domain_smoke.py
 
       - name: Validate deployment profile tooling
         shell: pwsh

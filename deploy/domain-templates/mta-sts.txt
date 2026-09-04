@@ -1,0 +1,4 @@
+version: STSv1
+mode: enforce
+mx: @@CANONICAL_MAIL_HOST@@
+max_age: 604800

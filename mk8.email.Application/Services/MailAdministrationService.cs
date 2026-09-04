@@ -61,6 +61,7 @@ public sealed partial class MailAdministrationService(EmailDbContext db) : IMail
             Domain = normalizedDomain,
             Company = company,
             CompanyId = company.Id,
+            IsActive = false,
         };
 
         db.Addresses.Add(mailDomain);
@@ -88,10 +89,10 @@ public sealed partial class MailAdministrationService(EmailDbContext db) : IMail
         var mailDomain = await db.Addresses
             .Include(item => item.Company)
             .FirstOrDefaultAsync(
-                item => item.Domain == domain && item.IsActive && item.Company.IsActive,
+                item => item.Domain == domain && item.Company.IsActive,
                 cancellationToken);
         if (mailDomain is null)
-            return Failure("The active domain does not exist.");
+            return Failure("The domain does not exist or its company is not active.");
 
         if (await db.Users.AnyAsync(item => item.Username == normalizedAddress, cancellationToken)
             || await db.Inboxes.AnyAsync(
@@ -150,7 +151,7 @@ public sealed partial class MailAdministrationService(EmailDbContext db) : IMail
                 item => item.Address.Domain == normalizedDomain
                     && item.Name == parsedTarget.Value.LocalPart
                     && item.AliasForInboxId == null
-                    && item.Address.IsActive
+                    && item.Address.Company.IsActive
                     && item.Owner.IsActive,
                 cancellationToken);
         if (target is null)
@@ -181,6 +182,31 @@ public sealed partial class MailAdministrationService(EmailDbContext db) : IMail
         await db.SaveChangesAsync(cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         return Success("The catch-all target was set.", catchAll.Id);
+    }
+
+    public async Task<AdministrationResult> SetDomainActiveAsync(
+        string domain,
+        bool isActive,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedDomain = NormalizeDomain(domain);
+        if (normalizedDomain is null)
+            return Failure("The domain name is not valid.");
+
+        var mailDomain = await db.Addresses
+            .Include(item => item.Company)
+            .FirstOrDefaultAsync(item => item.Domain == normalizedDomain, cancellationToken);
+        if (mailDomain is null)
+            return Failure("The domain does not exist.");
+        if (isActive && !mailDomain.Company.IsActive)
+            return Failure("The company is not active.");
+        if (mailDomain.IsActive == isActive)
+            return Success(isActive ? "The domain is already active." : "The domain is already inactive.", mailDomain.Id);
+
+        mailDomain.IsActive = isActive;
+        mailDomain.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync(cancellationToken);
+        return Success(isActive ? "The domain was activated." : "The domain was deactivated.", mailDomain.Id);
     }
 
     public async Task<AdministrationResult> SetAccountActiveAsync(
@@ -267,7 +293,8 @@ public sealed partial class MailAdministrationService(EmailDbContext db) : IMail
             item.OwnerId,
             $"{item.Name}@{item.Address.Domain}",
             Enum.Parse<UserRole>(item.Owner.Role),
-            item.Owner.IsActive && item.Address.IsActive,
+            item.Owner.IsActive,
+            item.Address.IsActive,
             targetIds.Contains(item.Id),
             item.Owner.CreatedAt)).ToList();
     }

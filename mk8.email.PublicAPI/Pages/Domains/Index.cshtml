@@ -21,7 +21,7 @@
                 <td>@domain.Company</td>
                 <td>@domain.AccountCount</td>
                 <td>@(domain.CatchAllTarget ?? "Not set")</td>
-                <td>@(domain.IsActive ? "Active" : "Disabled")</td>
+                <td>@(domain.IsActive ? "Active" : "Pending")</td>
             </tr>
         }
         </tbody>
@@ -29,13 +29,13 @@
 </section>
 <div class="split">
     <section class="panel">
-        <h2>Add a domain</h2>
+        <h2>Add a pending domain</h2>
         <form method="post" asp-page-handler="Create">
             <label asp-for="CreateInput.CompanyName"></label>
             <input asp-for="CreateInput.CompanyName" />
             <label asp-for="CreateInput.Domain"></label>
             <input asp-for="CreateInput.Domain" />
-            <button type="submit">Add domain</button>
+            <button type="submit">Add pending domain</button>
         </form>
     </section>
     <section class="panel">

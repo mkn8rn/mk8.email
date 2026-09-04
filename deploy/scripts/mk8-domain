@@ -1,0 +1,724 @@
+#!/bin/sh
+set -eu
+
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+canonical_mail_host=email.mk8n.com
+primary_mail_domain=mk8n.com
+domain_root=/etc/mk8email/domains
+key_root=/etc/mk8email/dkim
+web_root=/var/www/mk8email-domains
+selector_map=/etc/rspamd/dkim_selectors.map
+path_map=/etc/rspamd/dkim_paths.map
+public_ipv4_file=/etc/mk8email/public-ipv4
+cli_dll=/opt/mk8email/current/cli/mk8.email.Application.CLI.dll
+work=
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+usage() {
+    printf '%s\n' "Usage: mk8-domain prepare COMPANY DOMAIN" >&2
+    printf '%s\n' "       mk8-domain request-certificate DOMAIN CONTACT_EMAIL" >&2
+    printf '%s\n' "       mk8-domain activate DOMAIN" >&2
+    printf '%s\n' "       mk8-domain deactivate DOMAIN" >&2
+    printf '%s\n' "       mk8-domain status DOMAIN" >&2
+    printf '%s\n' "       mk8-domain dns DOMAIN" >&2
+    printf '%s\n' "       mk8-domain rebuild-signing-maps" >&2
+    exit 2
+}
+
+cleanup() {
+    if [ -n "$work" ]; then
+        case "$work" in
+            /run/mk8-domain.*) rm -rf -- "$work" ;;
+        esac
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+[ "$(id -u)" -eq 0 ] || fail "Run this command as root."
+
+validate_domain() {
+    python3 - "$1" <<'PY'
+import re
+import sys
+
+domain = sys.argv[1]
+labels = domain.split(".")
+valid = (
+    3 <= len(domain) <= 253
+    and domain == domain.lower()
+    and len(labels) >= 2
+    and all(
+        1 <= len(label) <= 63
+        and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    )
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
+validate_contact_email() {
+    case "$1" in
+        *@*.*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        *[!A-Za-z0-9@._+-]*) return 1 ;;
+    esac
+    return 0
+}
+
+ensure_directory() {
+    checked_path=$1
+    checked_owner=$2
+    checked_group=$3
+    checked_mode=${4#0}
+    if [ -L "$checked_path" ] \
+        || { [ -e "$checked_path" ] && [ ! -d "$checked_path" ]; }; then
+        fail "A managed domain directory is not safe."
+    fi
+    if [ ! -d "$checked_path" ]; then
+        install -d -o "$checked_owner" -g "$checked_group" -m "$4" "$checked_path"
+    fi
+    [ "$(stat -c '%U:%G %a' "$checked_path")" \
+        = "$checked_owner:$checked_group $checked_mode" ] \
+        || fail "A managed domain directory has unsafe metadata."
+}
+
+check_regular_file() {
+    checked_path=$1
+    checked_owner=$2
+    checked_group=$3
+    checked_mode=${4#0}
+    if [ ! -f "$checked_path" ] || [ -L "$checked_path" ]; then
+        fail "A managed domain file is not safe."
+    fi
+    [ "$(stat -c '%U:%G %a %h' "$checked_path")" \
+        = "$checked_owner:$checked_group $checked_mode 1" ] \
+        || fail "A managed domain file has unsafe metadata."
+}
+
+check_replaceable_file() {
+    checked_path=$1
+    if [ -L "$checked_path" ] \
+        || { [ -e "$checked_path" ] && [ ! -f "$checked_path" ]; }; then
+        fail "A managed domain file path is not safe."
+    fi
+    if [ -f "$checked_path" ] && [ "$(stat -c '%h' "$checked_path")" -ne 1 ]; then
+        fail "A managed domain file has another hard link."
+    fi
+}
+
+configured_public_ipv4() {
+    check_regular_file "$public_ipv4_file" root root 0644
+    configured_address=$(cat "$public_ipv4_file")
+    if ! python3 - "$configured_address" <<'PY'
+import ipaddress
+import sys
+
+value = sys.argv[1]
+try:
+    address = ipaddress.ip_address(value)
+except ValueError:
+    raise SystemExit(1) from None
+raise SystemExit(0 if address.version == 4 and str(address) == value else 1)
+PY
+    then
+        fail "The configured public IPv4 address is not valid."
+    fi
+    printf '%s\n' "$configured_address"
+}
+
+domain_directory() {
+    printf '%s/%s\n' "$domain_root" "$1"
+}
+
+selector_for_domain() {
+    selector_file="$(domain_directory "$1")/dkim-selector"
+    check_regular_file "$selector_file" root root 0644
+    selector=$(sed -n '1p' "$selector_file")
+    [ "$(wc -l < "$selector_file" | tr -d ' ')" -eq 1 ] \
+        || fail "The DKIM selector file is not valid."
+    case "$selector" in
+        ''|*[!a-z0-9]*) fail "The DKIM selector is not valid." ;;
+    esac
+    [ "${#selector}" -le 63 ] || fail "The DKIM selector is too long."
+    printf '%s\n' "$selector"
+}
+
+key_for_domain() {
+    key_domain=$1
+    key_selector=$2
+    printf '%s/%s/%s.private.pem\n' "$key_root" "$key_domain" "$key_selector"
+}
+
+run_internal_cli() {
+    export DOTNET_ENVIRONMENT=Production
+    export DOTNET_EnableDiagnostics=0
+    export MK8EMAIL_CONFIG_FILE=/etc/mk8email/mk8email.config.json
+    /usr/bin/dotnet "$cli_dll" "$@"
+}
+
+database_domain_state() {
+    state_domain=$1
+    runuser -u postgres -- psql --dbname=mk8email --no-psqlrc \
+        --tuples-only --no-align \
+        --command="SELECT CASE WHEN is_active THEN 'active' ELSE 'pending' END FROM addresses WHERE domain = '$state_domain'"
+}
+
+rebuild_signing_maps() (
+    map_work=$(mktemp -d /run/mk8-domain.maps.XXXXXX)
+    map_completed=false
+    map_changed=false
+    map_pending_created=false
+
+    # shellcheck disable=SC2317
+    restore_maps() {
+        restore_status=0
+        for map_name in selectors paths; do
+            case "$map_name" in
+                selectors) map_target=$selector_map ;;
+                paths) map_target=$path_map ;;
+            esac
+            if [ -f "$map_work/$map_name.present" ]; then
+                install -o root -g root -m 0644 "$map_work/$map_name.old" \
+                    "$map_target.rollback" || restore_status=1
+                mv -f -- "$map_target.rollback" "$map_target" || restore_status=1
+            else
+                rm -f -- "$map_target" || restore_status=1
+            fi
+        done
+        return "$restore_status"
+    }
+
+    # shellcheck disable=SC2317
+    finish_maps() {
+        map_status=$?
+        trap - EXIT HUP INT TERM
+        if [ "$map_completed" != true ] && [ "$map_changed" = true ]; then
+            set +e
+            restore_maps
+            restore_status=$?
+            if systemctl is-active --quiet rspamd.service; then
+                systemctl reload rspamd.service || restore_status=1
+            fi
+            set -e
+            [ "$restore_status" -eq 0 ] \
+                || printf '%s\n' "The DKIM map rollback failed." >&2
+            map_status=1
+        fi
+        if [ "$map_pending_created" = true ]; then
+            set +e
+            rm -f -- "$selector_map.new" "$path_map.new" || map_status=1
+            set -e
+        fi
+        rm -rf -- "$map_work"
+        exit "$map_status"
+    }
+    trap finish_maps EXIT
+    trap 'exit 1' HUP INT TERM
+
+    : > "$map_work/selectors.new"
+    : > "$map_work/paths.new"
+    for prepared_path in "$domain_root"/*; do
+        [ -d "$prepared_path" ] || continue
+        prepared_domain=${prepared_path##*/}
+        validate_domain "$prepared_domain" \
+            || fail "A prepared domain directory has an invalid name."
+        [ -f "$prepared_path/prepared" ] || continue
+        prepared_selector=$(selector_for_domain "$prepared_domain")
+        prepared_key=$(key_for_domain "$prepared_domain" "$prepared_selector")
+        check_regular_file "$prepared_key" root dkimkeys 0640
+        runuser -u _rspamd -- test -r "$prepared_key" \
+            || fail "Rspamd cannot read a domain signing key."
+        printf '%s %s\n' "$prepared_domain" "$prepared_selector" \
+            >> "$map_work/selectors.new"
+        printf '%s %s\n' "$prepared_domain" "$prepared_key" \
+            >> "$map_work/paths.new"
+    done
+
+    sort -u -o "$map_work/selectors.new" "$map_work/selectors.new"
+    sort -u -o "$map_work/paths.new" "$map_work/paths.new"
+    [ -s "$map_work/selectors.new" ] || fail "No prepared DKIM domains are available."
+    [ "$(wc -l < "$map_work/selectors.new")" \
+        -eq "$(wc -l < "$map_work/paths.new")" ] \
+        || fail "The DKIM maps do not contain the same domains."
+
+    for map_name in selectors paths; do
+        case "$map_name" in
+            selectors) map_target=$selector_map ;;
+            paths) map_target=$path_map ;;
+        esac
+        if [ -L "$map_target" ] \
+            || { [ -e "$map_target" ] && [ ! -f "$map_target" ]; }; then
+            fail "A DKIM map path is not safe."
+        fi
+        for pending_map in "$map_target.new" "$map_target.rollback"; do
+            if [ -e "$pending_map" ] || [ -L "$pending_map" ]; then
+                fail "A stale DKIM map transaction file exists."
+            fi
+        done
+        if [ -f "$map_target" ]; then
+            check_regular_file "$map_target" root root 0644
+            cp -p -- "$map_target" "$map_work/$map_name.old"
+            : > "$map_work/$map_name.present"
+        fi
+    done
+    map_pending_created=true
+    install -o root -g root -m 0644 "$map_work/selectors.new" \
+        "$selector_map.new"
+    install -o root -g root -m 0644 "$map_work/paths.new" \
+        "$path_map.new"
+    map_changed=true
+    for map_name in selectors paths; do
+        case "$map_name" in
+            selectors) map_target=$selector_map ;;
+            paths) map_target=$path_map ;;
+        esac
+        mv -f -- "$map_target.new" "$map_target"
+    done
+
+    rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet
+    if systemctl is-active --quiet rspamd.service; then
+        systemctl reload rspamd.service
+        systemctl is-active --quiet rspamd.service
+    fi
+
+    map_completed=true
+)
+
+write_public_key_record() {
+    record_selector=$1
+    record_key=$2
+    record_target=$3
+    public_key=$(openssl pkey -in "$record_key" -pubout -outform DER 2>/dev/null \
+        | openssl base64 -A)
+    [ -n "$public_key" ] || fail "The DKIM public key could not be generated."
+    {
+        printf '%s._domainkey IN TXT ( "v=DKIM1; h=sha256; k=rsa; "\n' \
+            "$record_selector"
+        printf '%s' "$public_key" | fold -w 200 | sed 's/^/    "p=/; 2,$s/"p=/"/; s/$/"/'
+        printf ')\n'
+    } > "$record_target"
+}
+
+write_domain_assets() {
+    asset_domain=$1
+    asset_selector=$2
+    asset_key=$3
+    asset_directory=$(domain_directory "$asset_domain")
+    asset_web_root="$web_root/$asset_domain"
+    asset_mta_id_file="$asset_directory/mta-sts-id"
+    asset_autoconfig_file="$asset_web_root/autoconfig/mail/config-v1.1.xml"
+    asset_policy_file="$asset_web_root/mta-sts/.well-known/mta-sts.txt"
+    asset_public_ipv4=
+    if [ "$asset_domain" = "$primary_mail_domain" ]; then
+        asset_public_ipv4=$(configured_public_ipv4)
+    fi
+
+    ensure_directory "$web_root" root root 0755
+    ensure_directory "$asset_web_root" root root 0755
+    ensure_directory "$asset_web_root/autoconfig" root root 0755
+    ensure_directory "$asset_web_root/autoconfig/mail" root root 0755
+    ensure_directory "$asset_web_root/mta-sts" root root 0755
+    ensure_directory "$asset_web_root/mta-sts/.well-known" root root 0755
+
+    sed \
+        -e "s/@@DOMAIN@@/$asset_domain/g" \
+        -e "s/@@CANONICAL_MAIL_HOST@@/$canonical_mail_host/g" \
+        /usr/local/share/mk8email/domain-templates/autoconfig.xml \
+        > "$work/autoconfig.xml"
+    sed -e "s/@@CANONICAL_MAIL_HOST@@/$canonical_mail_host/g" \
+        /usr/local/share/mk8email/domain-templates/mta-sts.txt \
+        > "$work/mta-sts.txt"
+
+    asset_policy_changed=true
+    if [ -e "$asset_policy_file" ] || [ -L "$asset_policy_file" ]; then
+        check_regular_file "$asset_policy_file" root root 0644
+        if cmp --silent "$asset_policy_file" "$work/mta-sts.txt"; then
+            asset_policy_changed=false
+        fi
+    fi
+    asset_mta_id=
+    if [ -e "$asset_mta_id_file" ] || [ -L "$asset_mta_id_file" ]; then
+        check_regular_file "$asset_mta_id_file" root root 0644
+        asset_mta_id=$(sed -n '1p' "$asset_mta_id_file")
+        [ "$(wc -l < "$asset_mta_id_file" | tr -d ' ')" -eq 1 ] \
+            || fail "The MTA-STS policy identifier file is not valid."
+        case "$asset_mta_id" in
+            ''|*[!0-9TZ]*) fail "The MTA-STS policy identifier is not valid." ;;
+        esac
+        [ "${#asset_mta_id}" -le 32 ] \
+            || fail "The MTA-STS policy identifier is too long."
+    fi
+    if [ -z "$asset_mta_id" ] || [ "$asset_policy_changed" = true ]; then
+        previous_mta_id=$asset_mta_id
+        asset_mta_id=$(date --utc +%Y%m%dT%H%M%S%NZ)
+        [ "$asset_mta_id" != "$previous_mta_id" ] \
+            || fail "The MTA-STS policy identifier did not change."
+        printf '%s\n' "$asset_mta_id" > "$work/mta-sts-id"
+        check_replaceable_file "$asset_mta_id_file"
+        install -o root -g root -m 0644 "$work/mta-sts-id" "$asset_mta_id_file"
+    fi
+
+    write_public_key_record "$asset_selector" "$asset_key" \
+        "$work/dkim-record"
+    check_replaceable_file "$asset_directory/dkim-record.zone"
+    install -o root -g root -m 0644 "$work/dkim-record" \
+        "$asset_directory/dkim-record.zone"
+
+    check_replaceable_file "$asset_autoconfig_file"
+    install -o root -g root -m 0644 "$work/autoconfig.xml" \
+        "$asset_autoconfig_file"
+    check_replaceable_file "$asset_policy_file"
+    install -o root -g root -m 0644 "$work/mta-sts.txt" \
+        "$asset_policy_file"
+
+    {
+        printf '%s %s.\n' "\$ORIGIN" "$asset_domain"
+        printf '%s\n\n' "\$TTL 300"
+        if [ "$asset_domain" = "$primary_mail_domain" ]; then
+            printf 'email IN A %s ; cf_tags=cf-proxied:false\n' \
+                "$asset_public_ipv4"
+        fi
+        printf '@ IN MX 10 %s.\n' "$canonical_mail_host"
+        printf '_imaps._tcp IN SRV 0 1 993 %s.\n' "$canonical_mail_host"
+        printf '_submission._tcp IN SRV 0 1 587 %s.\n' "$canonical_mail_host"
+        printf '_submissions._tcp IN SRV 0 1 465 %s.\n' "$canonical_mail_host"
+        printf 'autoconfig IN CNAME %s. ; cf_tags=cf-proxied:false\n' "$canonical_mail_host"
+        printf 'mta-sts IN CNAME %s. ; cf_tags=cf-proxied:false\n' "$canonical_mail_host"
+        printf '@ IN CAA 0 issue "letsencrypt.org"\n'
+        printf '@ IN CAA 0 issuewild ";"\n'
+        printf '@ IN TXT "v=spf1 mx -all"\n'
+        cat "$work/dkim-record"
+        printf '_dmarc IN TXT "v=DMARC1; p=none; rua=mailto:postmaster@%s; fo=1; adkim=s; aspf=s; pct=100"\n' "$asset_domain"
+        printf '_mta-sts IN TXT "v=STSv1; id=%s"\n' "$asset_mta_id"
+        printf '_smtp._tls IN TXT "v=TLSRPTv1; rua=mailto:postmaster@%s"\n' "$asset_domain"
+    } > "$work/cloudflare-import.zone"
+    check_replaceable_file "$asset_directory/cloudflare-import.zone"
+    install -o root -g root -m 0644 "$work/cloudflare-import.zone" \
+        "$asset_directory/cloudflare-import.zone"
+}
+
+prepare_domain() {
+    company=$1
+    domain=$2
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    [ -f /etc/mk8email/schema-ready ] || fail "The mail database schema is not ready."
+    [ -f "$cli_dll" ] || fail "The management command is not installed."
+
+    ensure_directory /etc/mk8email root mk8email 0751
+    ensure_directory "$domain_root" root root 0750
+    ensure_directory "$key_root" root dkimkeys 0751
+    current_domain_directory=$(domain_directory "$domain")
+    current_key_directory="$key_root/$domain"
+    ensure_directory "$current_domain_directory" root root 0750
+    ensure_directory "$current_key_directory" root dkimkeys 0750
+
+    run_internal_cli --ensure-domain "$company" "$domain"
+
+    selector_file="$current_domain_directory/dkim-selector"
+    if [ -e "$selector_file" ] || [ -L "$selector_file" ]; then
+        current_selector=$(selector_for_domain "$domain")
+    else
+        current_selector="s$(date --utc +%Y%m%d)"
+        printf '%s\n' "$current_selector" > "$work/dkim-selector"
+        install -o root -g root -m 0644 "$work/dkim-selector" "$selector_file"
+    fi
+    current_key=$(key_for_domain "$domain" "$current_selector")
+    if [ -e "$current_key" ] || [ -L "$current_key" ]; then
+        check_regular_file "$current_key" root dkimkeys 0640
+    else
+        rspamadm dkim_keygen -b 2048 -s "$current_selector" -d "$domain" \
+            -k "$work/private.pem" > "$work/generated-record"
+        openssl pkey -in "$work/private.pem" -noout -check </dev/null >/dev/null
+        install -o root -g dkimkeys -m 0640 "$work/private.pem" "$current_key"
+    fi
+    openssl pkey -in "$current_key" -noout -check </dev/null >/dev/null
+
+    write_domain_assets "$domain" "$current_selector" "$current_key"
+    printf 'prepared %s\n' "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$work/prepared"
+    install -o root -g root -m 0644 "$work/prepared" \
+        "$current_domain_directory/prepared"
+    rebuild_signing_maps
+    printf '%s\n' "The domain is prepared and remains in its current database state."
+    printf '%s\n' "Use mk8-domain dns $domain to read its Cloudflare import file."
+}
+
+dns_routes_to_public_address() {
+    dns_name=$1
+    expected_public_address=$(configured_public_ipv4)
+    resolved_addresses=$(dig +time=5 +tries=2 +short A "$dns_name" \
+        | tr -d '\r' | awk '/^[0-9]+([.][0-9]+){3}$/ { print }' | sort -u)
+    resolved_ipv6_addresses=$(dig +time=5 +tries=2 +short AAAA "$dns_name" \
+        | tr -d '\r' | awk 'index($0, ":") { print }' | sort -u)
+    [ "$resolved_addresses" = "$expected_public_address" ] \
+        && [ -z "$resolved_ipv6_addresses" ]
+}
+
+request_certificate() {
+    domain=$1
+    contact_email=$2
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    validate_contact_email "$contact_email" || fail "The certificate contact email is not valid."
+    prepared_directory=$(domain_directory "$domain")
+    check_regular_file "$prepared_directory/prepared" root root 0644
+    configured_public_ipv4 >/dev/null
+
+    for service_name in "autoconfig.$domain" "mta-sts.$domain"; do
+        dns_routes_to_public_address "$service_name" \
+            || fail "Public DNS does not route $service_name to the configured address."
+    done
+    systemctl is-active --quiet nginx.service || fail "nginx is not active."
+
+    flock --unlock 9
+    certbot certonly --noninteractive --agree-tos --no-eff-email \
+        --webroot --webroot-path /var/www/letsencrypt \
+        --cert-name "mk8-domain-$domain" \
+        --deploy-hook "/usr/local/sbin/deploy-mk8-domain-certificate $domain" \
+        --domain "autoconfig.$domain" --domain "mta-sts.$domain" \
+        --email "$contact_email"
+    RENEWED_LINEAGE="/etc/letsencrypt/live/mk8-domain-$domain" \
+        /usr/local/sbin/deploy-mk8-domain-certificate "$domain"
+    check_regular_file "$prepared_directory/tls/fullchain.pem" root tlskeys 0444
+    check_regular_file "$prepared_directory/tls/privkey.pem" root tlskeys 0440
+    printf '%s\n' "The domain discovery certificate is installed."
+}
+
+dns_txt_value() {
+    txt_prefix=$1
+    txt_name=$2
+    txt_records=$(dig +time=5 +tries=2 +short TXT "$txt_name" | tr -d '\r')
+    txt_matches=$(printf '%s\n' "$txt_records" | grep -F "$txt_prefix" || true)
+    [ -n "$txt_matches" ] || return 1
+    [ "$(printf '%s\n' "$txt_matches" | wc -l | tr -d ' ')" -eq 1 ] \
+        || return 1
+    printf '%s' "$txt_matches" | tr -d '" \t\r\n'
+}
+
+verify_public_dns() {
+    domain=$1
+    selector=$2
+    key=$3
+    mx=$(dig +time=5 +tries=2 +short MX "$domain" \
+        | tr '\t' ' ' | sed 's/  */ /g' | tr -d '\r')
+    [ "$mx" = "10 $canonical_mail_host." ] \
+        || fail "The domain MX record is not ready."
+    for service_name in "autoconfig.$domain" "mta-sts.$domain"; do
+        dns_routes_to_public_address "$service_name" \
+            || fail "Public DNS is not ready for $service_name."
+    done
+
+    expected_key=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
+        | openssl base64 -A)
+    dkim_value=$(dns_txt_value "v=DKIM1" "$selector._domainkey.$domain") \
+        || fail "The domain must publish one DKIM record."
+    case "$dkim_value" in
+        *"v=DKIM1"*"p=$expected_key"*) ;;
+        *) fail "The published DKIM key does not match the private key." ;;
+    esac
+    spf_value=$(dns_txt_value "v=spf1" "$domain") \
+        || fail "The domain must publish one SPF record."
+    case "$spf_value" in
+        *"v=spf1mx-all"*) ;;
+        *) fail "The SPF record is not ready." ;;
+    esac
+    dmarc_value=$(dns_txt_value "v=DMARC1" "_dmarc.$domain") \
+        || fail "The domain must publish one DMARC record."
+    case "$dmarc_value" in
+        *"v=DMARC1"*"p="*) ;;
+        *) fail "The DMARC record is not ready." ;;
+    esac
+    mta_sts_value=$(dns_txt_value "v=STSv1" "_mta-sts.$domain") \
+        || fail "The domain must publish one MTA-STS record."
+    case "$mta_sts_value" in
+        *"v=STSv1"*"id="*) ;;
+        *) fail "The MTA-STS record is not ready." ;;
+    esac
+    tls_report_value=$(dns_txt_value "v=TLSRPTv1" "_smtp._tls.$domain") \
+        || fail "The domain must publish one TLS reporting record."
+    case "$tls_report_value" in
+        *"v=TLSRPTv1"*"rua=mailto:"*) ;;
+        *) fail "The TLS reporting record is not ready." ;;
+    esac
+}
+
+verify_domain_web_services() {
+    domain=$1
+    certificate_directory="$(domain_directory "$domain")/tls"
+    check_regular_file "$certificate_directory/fullchain.pem" root tlskeys 0444
+    check_regular_file "$certificate_directory/privkey.pem" root tlskeys 0440
+    openssl x509 -in "$certificate_directory/fullchain.pem" -noout \
+        -checkend 1209600 >/dev/null
+    for service_name in "autoconfig.$domain" "mta-sts.$domain"; do
+        openssl x509 -in "$certificate_directory/fullchain.pem" -noout \
+            -checkhost "$service_name" >/dev/null 2>&1 \
+            || fail "The discovery certificate does not cover $service_name."
+    done
+    curl --silent --show-error --fail --max-time 15 --noproxy '*' \
+        --resolve "autoconfig.$domain:443:127.0.0.1" \
+        "https://autoconfig.$domain/mail/config-v1.1.xml" \
+        > "$work/autoconfig-check.xml" \
+        || fail "The local autoconfiguration endpoint is not ready."
+    grep -F "<domain>$domain</domain>" "$work/autoconfig-check.xml" >/dev/null \
+        || fail "The autoconfiguration domain is not correct."
+    grep -F "<hostname>$canonical_mail_host</hostname>" \
+        "$work/autoconfig-check.xml" >/dev/null \
+        || fail "The autoconfiguration service name is not correct."
+    curl --silent --show-error --fail --max-time 15 --noproxy '*' \
+        --resolve "mta-sts.$domain:443:127.0.0.1" \
+        "https://mta-sts.$domain/.well-known/mta-sts.txt" \
+        | grep -Fx "mx: $canonical_mail_host" >/dev/null \
+        || fail "The local MTA-STS endpoint is not ready."
+}
+
+verify_prepared_mailboxes() {
+    domain=$1
+    account_count=$(runuser -u postgres -- psql --dbname=mk8email --no-psqlrc \
+        --tuples-only --no-align --command="SELECT count(*) FROM inboxes i JOIN addresses a ON a.id = i.address_id JOIN companies c ON c.id = a.company_id JOIN users u ON u.id = i.owner_id WHERE a.domain = '$domain' AND i.name <> '*' AND i.alias_for_inbox_id IS NULL AND c.is_active AND u.is_active")
+    [ "$account_count" -gt 0 ] || fail "The domain does not contain an active account."
+    postmaster_ready=$(runuser -u postgres -- psql --dbname=mk8email --no-psqlrc \
+        --tuples-only --no-align --command="SELECT EXISTS (SELECT 1 FROM inboxes i JOIN addresses a ON a.id = i.address_id JOIN companies c ON c.id = a.company_id JOIN users u ON u.id = i.owner_id LEFT JOIN inboxes target ON target.id = i.alias_for_inbox_id LEFT JOIN users target_user ON target_user.id = target.owner_id WHERE a.domain = '$domain' AND c.is_active AND u.is_active AND ((i.name = 'postmaster' AND i.alias_for_inbox_id IS NULL) OR (i.name = '*' AND i.alias_for_inbox_id IS NOT NULL AND target.address_id = a.id AND target.alias_for_inbox_id IS NULL AND target_user.is_active)))")
+    [ "$postmaster_ready" = t ] \
+        || fail "The domain must route postmaster mail to an active account."
+}
+
+activate_domain() {
+    domain=$1
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    prepared_directory=$(domain_directory "$domain")
+    check_regular_file "$prepared_directory/prepared" root root 0644
+    selector=$(selector_for_domain "$domain")
+    key=$(key_for_domain "$domain" "$selector")
+    check_regular_file "$key" root dkimkeys 0640
+    grep -Fx "$domain $selector" "$selector_map" >/dev/null \
+        || fail "The domain selector map is not ready."
+    grep -Fx "$domain $key" "$path_map" >/dev/null \
+        || fail "The domain key map is not ready."
+    verify_prepared_mailboxes "$domain"
+    verify_public_dns "$domain" "$selector" "$key"
+    verify_domain_web_services "$domain"
+    rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet
+    nginx -t >/dev/null
+    postfix check >/dev/null
+    prior_state=$(database_domain_state "$domain")
+    case "$prior_state" in
+        active|pending) ;;
+        *) fail "The database domain state is not valid." ;;
+    esac
+
+    activation_completed=false
+    activation_changed=false
+    finish_activation() {
+        activation_status=$?
+        trap - EXIT HUP INT TERM
+        if [ "$activation_completed" != true ] && [ "$activation_changed" = true ]; then
+            set +e
+            run_internal_cli --set-domain-active "$domain" false >/dev/null
+            postfix reload >/dev/null
+            if systemctl is-active --quiet dovecot.service; then
+                doveadm auth cache flush "*@$domain" >/dev/null
+                doveadm kick "*@$domain" >/dev/null
+            fi
+            set -e
+            printf '%s\n' "Domain activation failed. The domain was returned to pending state." >&2
+            activation_status=1
+        fi
+        cleanup
+        exit "$activation_status"
+    }
+    trap finish_activation EXIT HUP INT TERM
+
+    run_internal_cli --set-domain-active "$domain" true
+    if [ "$prior_state" = pending ]; then
+        activation_changed=true
+    fi
+    postfix reload >/dev/null
+    [ "$(postmap -q "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" = 1 ] \
+        || fail "Postfix did not activate the domain."
+    mailbox_route=$(postmap -q "postmaster@$domain" \
+        pgsql:/etc/postfix/pgsql-virtual-mailboxes.cf)
+    alias_route=$(postmap -q "postmaster@$domain" \
+        pgsql:/etc/postfix/pgsql-virtual-aliases.cf)
+    [ -n "$mailbox_route$alias_route" ] \
+        || fail "Postfix did not activate the postmaster route."
+    /usr/local/sbin/mk8-mail-health --deep --strict >/dev/null
+
+    activation_completed=true
+    trap cleanup EXIT HUP INT TERM
+    printf '%s\n' "The domain is active."
+}
+
+deactivate_domain() {
+    domain=$1
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    run_internal_cli --set-domain-active "$domain" false
+    postfix reload >/dev/null
+    if systemctl is-active --quiet dovecot.service; then
+        doveadm auth cache flush "*@$domain" >/dev/null
+        doveadm kick "*@$domain" >/dev/null
+    fi
+    [ -z "$(postmap -q "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" ] \
+        || fail "Postfix still accepts the deactivated domain."
+    printf '%s\n' "The domain is inactive."
+}
+
+show_status() {
+    domain=$1
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    state=$(database_domain_state "$domain")
+    [ -n "$state" ] || state=missing
+    printf 'Database state: %s\n' "$state"
+    prepared_directory=$(domain_directory "$domain")
+    if [ -f "$prepared_directory/prepared" ]; then
+        printf '%s\n' "Provisioning state: prepared"
+    else
+        printf '%s\n' "Provisioning state: not prepared"
+    fi
+    if [ -f "$prepared_directory/tls/fullchain.pem" ] \
+        && [ -f "$prepared_directory/tls/privkey.pem" ]; then
+        printf '%s\n' "Discovery certificate: installed"
+    else
+        printf '%s\n' "Discovery certificate: not installed"
+    fi
+}
+
+show_dns() {
+    domain=$1
+    validate_domain "$domain" || fail "Use a normalized ASCII domain name."
+    dns_file="$(domain_directory "$domain")/cloudflare-import.zone"
+    check_regular_file "$dns_file" root root 0644
+    cat "$dns_file"
+}
+
+command_name=${1:-}
+case "$command_name:$#" in
+    prepare:3|request-certificate:3|activate:2|deactivate:2|status:2|dns:2|rebuild-signing-maps:1) ;;
+    *) usage ;;
+esac
+
+work=$(mktemp -d /run/mk8-domain.XXXXXX)
+if [ ! -d /run/lock ] || [ -L /run/lock ]; then
+    fail "The system lock directory is not safe."
+fi
+exec 9>/run/lock/mk8-domain.lock
+flock --exclusive --wait 30 9 || fail "Another domain operation is active."
+
+case "$command_name" in
+    prepare) prepare_domain "$2" "$3" ;;
+    request-certificate) request_certificate "$2" "$3" ;;
+    activate) activate_domain "$2" ;;
+    deactivate) deactivate_domain "$2" ;;
+    status) show_status "$2" ;;
+    dns) show_dns "$2" ;;
+    rebuild-signing-maps) rebuild_signing_maps ;;
+esac

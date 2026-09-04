@@ -26,6 +26,14 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
         return 2;
     }
 
+    if (arguments.Length == 3
+        && arguments[0] == "--set-domain-active"
+        && !bool.TryParse(arguments[2], out _))
+    {
+        Console.Error.WriteLine("The domain state must be true or false.");
+        return 2;
+    }
+
     try
     {
         var isDevelopment = arguments.Contains("--dev", StringComparer.Ordinal)
@@ -92,6 +100,18 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
             return result.Succeeded ? 0 : 1;
         }
 
+        if (arguments.Length == 3 && arguments[0] == "--set-domain-active")
+        {
+            _ = bool.TryParse(arguments[2], out var isActive);
+            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var scope = host.Services.CreateScope();
+            var result = await scope.ServiceProvider
+                .GetRequiredService<IMailAdministrationService>()
+                .SetDomainActiveAsync(arguments[1], isActive);
+            Console.WriteLine(result.Message);
+            return result.Succeeded ? 0 : 1;
+        }
+
         using var protocolHost = BuildHost(arguments, environmentConfig, includeExperimentalServers: true);
         using (var scope = protocolHost.Services.CreateScope())
             await scope.ServiceProvider.GetRequiredService<ISeederService>().SeedAsync();
@@ -111,6 +131,7 @@ static bool IsSupportedCommand(string[] arguments) =>
     || arguments.Length == 3 && arguments[0] == "--ensure-domain"
     || arguments.Length == 4 && arguments[0] == "--create-account"
     || arguments.Length == 3 && arguments[0] == "--set-catchall"
+    || arguments.Length == 3 && arguments[0] == "--set-domain-active"
     || arguments.SequenceEqual(["--serve-experimental-protocols"]);
 
 static void WriteUsage()

@@ -42,6 +42,9 @@ grep -F "Run this command as root." "$output" >/dev/null
 run_failure 2 /usr/local/sbin/mk8email --serve-experimental-protocols
 grep -F "Use a supported production management command." "$output" >/dev/null
 
+run_failure 2 /usr/local/sbin/mk8email --set-domain-active mk8n.com false
+grep -F "Use a supported production management command." "$output" >/dev/null
+
 timeout 30s /usr/local/sbin/mk8email --healthcheck
 
 printf '%s\n' "Management command validation and production configuration tests passed."

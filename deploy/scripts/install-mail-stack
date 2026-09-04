@@ -7,6 +7,16 @@ if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
 fi
 
 asset_root=$1
+primary_lineage=
+cleanup() {
+    if [ -n "$primary_lineage" ]; then
+        case "$primary_lineage" in
+            /run/mk8-primary-lineage.*) rm -rf -- "$primary_lineage" ;;
+        esac
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
 if [ ! -d "$asset_root/deploy" ]; then
     printf '%s\n' "The deployment asset root is not valid." >&2
     exit 1
@@ -66,6 +76,7 @@ usermod --append --groups dkimkeys,clamav _rspamd
 install -d -o root -g mk8email -m 0751 /etc/mk8email
 install -d -o root -g mk8email -m 0750 /etc/mk8email/secrets
 install -o root -g mk8email -m 0640 "$asset_root/deploy/native/mk8email.config.json" /etc/mk8email/mk8email.config.json
+install -o root -g root -m 0644 "$asset_root/deploy/mk8email-public-ipv4" /etc/mk8email/public-ipv4
 
 install -d -o root -g root -m 0755 /etc/nftables.d
 if [ -L /etc/nftables.d/90-local-services.nft ] \
@@ -98,10 +109,56 @@ chown root:root /etc/mk8email/admin-tls/fullchain.pem /etc/mk8email/admin-tls/pr
 chmod 0444 /etc/mk8email/admin-tls/fullchain.pem
 chmod 0440 /etc/mk8email/admin-tls/privkey.pem
 
+install -d -o root -g root -m 0750 /etc/mk8email/domains
 install -d -o root -g dkimkeys -m 0751 /etc/mk8email/dkim
-test -s /etc/mk8email/dkim/s202609.private.pem
-chown root:dkimkeys /etc/mk8email/dkim/s202609.private.pem
-chmod 0640 /etc/mk8email/dkim/s202609.private.pem
+install -d -o root -g root -m 0750 /etc/mk8email/domains/mk8n.com
+install -d -o root -g dkimkeys -m 0750 /etc/mk8email/dkim/mk8n.com
+if [ ! -e /etc/mk8email/domains/mk8n.com/dkim-selector ]; then
+    printf '%s\n' s202609 > /etc/mk8email/domains/mk8n.com/dkim-selector
+    chown root:root /etc/mk8email/domains/mk8n.com/dkim-selector
+    chmod 0644 /etc/mk8email/domains/mk8n.com/dkim-selector
+fi
+if [ ! -f /etc/mk8email/domains/mk8n.com/dkim-selector ] \
+    || [ -L /etc/mk8email/domains/mk8n.com/dkim-selector ] \
+    || [ "$(stat -c '%U:%G %a %h' /etc/mk8email/domains/mk8n.com/dkim-selector)" \
+        != "root:root 644 1" ]; then
+    printf '%s\n' "The primary DKIM selector file is not safe." >&2
+    exit 1
+fi
+primary_selector=$(sed -n '1p' /etc/mk8email/domains/mk8n.com/dkim-selector)
+case "$primary_selector" in
+    ''|*[!a-z0-9]*)
+        printf '%s\n' "The primary DKIM selector is not valid." >&2
+        exit 1
+        ;;
+esac
+[ "${#primary_selector}" -le 63 ] || {
+    printf '%s\n' "The primary DKIM selector is too long." >&2
+    exit 1
+}
+primary_key=/etc/mk8email/dkim/mk8n.com/$primary_selector.private.pem
+legacy_key_migrated=false
+if [ -e "$primary_key" ] || [ -L "$primary_key" ]; then
+    if [ ! -f "$primary_key" ] || [ -L "$primary_key" ] \
+        || [ "$(stat -c '%h' "$primary_key")" -ne 1 ] \
+        || [ ! -s "$primary_key" ]; then
+        printf '%s\n' "The primary DKIM key is not safe." >&2
+        exit 1
+    fi
+else
+    test "$primary_selector" = s202609
+    legacy_key=/etc/mk8email/dkim/s202609.private.pem
+    if [ ! -f "$legacy_key" ] || [ -L "$legacy_key" ] \
+        || [ "$(stat -c '%U %h' "$legacy_key")" != "root 1" ] \
+        || [ ! -s "$legacy_key" ]; then
+        printf '%s\n' "The legacy DKIM key is not safe." >&2
+        exit 1
+    fi
+    install -o root -g dkimkeys -m 0640 "$legacy_key" "$primary_key"
+    legacy_key_migrated=true
+fi
+chown root:dkimkeys "$primary_key"
+chmod 0640 "$primary_key"
 
 install -d -o root -g root -m 0755 /etc/postfix
 install -o root -g root -m 0644 "$asset_root/deploy/postfix/main.cf" /etc/postfix/main.cf
@@ -124,6 +181,12 @@ install -d -o root -g root -m 0755 /etc/rspamd/local.d
 for rspamd_file in "$asset_root"/deploy/rspamd/local.d/*; do
     install -o root -g root -m 0644 "$rspamd_file" "/etc/rspamd/local.d/$(basename "$rspamd_file")"
 done
+if [ ! -e /etc/rspamd/dkim_selectors.map ]; then
+    install -o root -g root -m 0644 "$asset_root/deploy/rspamd/dkim_selectors.map" /etc/rspamd/dkim_selectors.map
+fi
+if [ ! -e /etc/rspamd/dkim_paths.map ]; then
+    install -o root -g root -m 0644 "$asset_root/deploy/rspamd/dkim_paths.map" /etc/rspamd/dkim_paths.map
+fi
 
 install -d -o clamav -g clamav -m 0750 /var/lib/clamav /var/log/clamav
 install -o root -g root -m 0644 "$asset_root/deploy/clamav/clamd.conf" /etc/clamav/clamd.conf
@@ -172,6 +235,8 @@ install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-build-enviro
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-mail-stack" /usr/local/sbin/install-mail-stack
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-native-release" /usr/local/sbin/install-native-release
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-build" /usr/local/sbin/mk8-build
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-domain" /usr/local/sbin/mk8-domain
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-mk8-domain-certificate" /usr/local/sbin/deploy-mk8-domain-certificate
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8email" /usr/local/sbin/mk8email
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/verify-host-prerequisites" /usr/local/sbin/verify-host-prerequisites
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/prune-native-releases" /usr/local/sbin/prune-native-releases
@@ -182,6 +247,11 @@ install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian-13-sour
     /usr/local/share/mk8email/prerequisites/debian-13-sources.list
 install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian.sources" \
     /usr/local/share/mk8email/prerequisites/debian.sources
+install -d -o root -g root -m 0755 /usr/local/share/mk8email/domain-templates
+install -o root -g root -m 0644 "$asset_root/deploy/domain-templates/autoconfig.xml" \
+    /usr/local/share/mk8email/domain-templates/autoconfig.xml
+install -o root -g root -m 0644 "$asset_root/deploy/domain-templates/mta-sts.txt" \
+    /usr/local/share/mk8email/domain-templates/mta-sts.txt
 
 install -d -o root -g root -m 0755 /usr/local/lib/mk8email/tests
 install -o root -g root -m 0755 "$asset_root/deploy/tests/backup_restore_smoke" /usr/local/lib/mk8email/tests/backup_restore_smoke
@@ -193,6 +263,8 @@ install -o root -g root -m 0755 "$asset_root/deploy/tests/certificate_deploy_smo
 install -o root -g root -m 0755 "$asset_root/deploy/tests/disruption_smoke" /usr/local/lib/mk8email/tests/disruption_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/host_hardening_smoke" /usr/local/lib/mk8email/tests/host_hardening_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/management_cli_smoke" /usr/local/lib/mk8email/tests/management_cli_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/multi_domain_smoke" /usr/local/lib/mk8email/tests/multi_domain_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/multi_domain_smoke.py" /usr/local/lib/mk8email/tests/multi_domain_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/mail_smoke.py" /usr/local/lib/mk8email/tests/mail_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/prerequisites_smoke" /usr/local/lib/mk8email/tests/prerequisites_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/release_retention_smoke" /usr/local/lib/mk8email/tests/release_retention_smoke
@@ -209,9 +281,26 @@ install -o root -g root -m 0644 "$asset_root/deploy/nginx/mk8-admin.conf" /etc/n
 install -o root -g root -m 0644 "$asset_root/deploy/nginx/mk8-services.conf" /etc/nginx/sites-available/mk8-services.conf
 ln -sfn /etc/nginx/sites-available/mk8-admin.conf /etc/nginx/sites-enabled/mk8-admin.conf
 ln -sfn /etc/nginx/sites-available/mk8-services.conf /etc/nginx/sites-enabled/mk8-services.conf
-install -d -o root -g root -m 0755 /var/www/autoconfig/mail /var/www/mta-sts/.well-known
-install -o root -g root -m 0644 "$asset_root/deploy/nginx/www/autoconfig/mail/config-v1.1.xml" /var/www/autoconfig/mail/config-v1.1.xml
-install -o root -g root -m 0644 "$asset_root/deploy/nginx/www/mta-sts/.well-known/mta-sts.txt" /var/www/mta-sts/.well-known/mta-sts.txt
+install -d -o root -g root -m 0755 /etc/nginx/mk8email-domains.d /var/www/mk8email-domains
+/usr/local/sbin/mk8-domain prepare mk8n mk8n.com
+primary_domain_certificate=/etc/mk8email/domains/mk8n.com/tls/fullchain.pem
+primary_domain_private_key=/etc/mk8email/domains/mk8n.com/tls/privkey.pem
+primary_domain_nginx=/etc/nginx/mk8email-domains.d/mk8n.com.conf
+if [ ! -e "$primary_domain_certificate" ] \
+    && [ ! -e "$primary_domain_private_key" ] \
+    && [ ! -e "$primary_domain_nginx" ]; then
+    primary_lineage=$(mktemp -d /run/mk8-primary-lineage.XXXXXX)
+    install -o root -g root -m 0644 /etc/mk8email/tls/fullchain.pem "$primary_lineage/fullchain.pem"
+    install -o root -g root -m 0600 /etc/mk8email/tls/privkey.pem "$primary_lineage/privkey.pem"
+    RENEWED_LINEAGE=$primary_lineage /usr/local/sbin/deploy-mk8-domain-certificate mk8n.com
+    rm -rf -- "$primary_lineage"
+    primary_lineage=
+elif [ ! -s "$primary_domain_certificate" ] \
+    || [ ! -s "$primary_domain_private_key" ] \
+    || [ ! -s "$primary_domain_nginx" ]; then
+    printf '%s\n' "The primary domain discovery state is incomplete." >&2
+    exit 1
+fi
 install -o root -g root -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
 install -o root -g root -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
 
@@ -223,6 +312,10 @@ nginx -t
 nft -c -f /etc/nftables.conf
 fail2ban-client -t
 aide --config=/etc/aide/aide.conf --config-check
+
+if [ "$legacy_key_migrated" = true ]; then
+    rm -f -- /etc/mk8email/dkim/s202609.private.pem
+fi
 
 systemctl unmask postfix.service dovecot.service rspamd.service clamav-daemon.service \
     clamav-daemon.socket clamav-freshclam.service valkey-server.service

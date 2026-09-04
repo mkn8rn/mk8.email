@@ -15,6 +15,7 @@ public sealed record MailAccountSummaryDTO(
     string Address,
     UserRole Role,
     bool IsActive,
+    bool IsDomainActive,
     bool IsCatchAllTarget,
     DateTime CreatedAt);
 

@@ -52,7 +52,7 @@ generate_certificate() {
     chmod 0600 "$output_directory/privkey.pem"
 }
 
-valid_names="DNS:email.mk8n.com,DNS:mta-sts.mk8n.com,DNS:autoconfig.mk8n.com"
+valid_names="DNS:email.mk8n.com"
 generate_certificate "$test_root/old" email.mk8n.com "$valid_names"
 generate_certificate "$test_root/alternate" email.mk8n.com "$valid_names"
 generate_certificate "$test_root/invalid" invalid.example "DNS:invalid.example"

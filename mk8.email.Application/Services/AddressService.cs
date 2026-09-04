@@ -47,6 +47,7 @@ public class AddressService(EmailDbContext db) : IAddressService
             Id = Guid.CreateVersion7(),
             Domain = request.Domain,
             CompanyId = request.CompanyId,
+            IsActive = false,
         };
 
         db.Addresses.Add(address);

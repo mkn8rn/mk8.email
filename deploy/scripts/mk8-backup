@@ -102,6 +102,7 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/default/sysstat \
     etc/dovecot \
     etc/fail2ban \
+    etc/letsencrypt \
     etc/logrotate.d/mk8-mail \
     etc/mk8email \
     etc/modprobe.d/90-mk8-server.conf \
@@ -154,16 +155,19 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     var/log/mk8email-admin \
     var/www/autoconfig \
     var/www/mta-sts \
+    var/www/mk8email-domains \
     usr/local/sbin/activate-mail-stack \
     usr/local/sbin/configure-apt-sources \
     usr/local/sbin/configure-mail-database-access \
     usr/local/sbin/deactivate-mail-stack \
     usr/local/sbin/deploy-admin-certificate \
+    usr/local/sbin/deploy-mk8-domain-certificate \
     usr/local/sbin/deploy-mk8-certificate \
     usr/local/sbin/install-build-environment \
     usr/local/sbin/install-mail-stack \
     usr/local/sbin/install-native-release \
     usr/local/sbin/mk8-build \
+    usr/local/sbin/mk8-domain \
     usr/local/sbin/mk8email \
     usr/local/sbin/mk8-backup \
     usr/local/sbin/mk8-export-backup \
@@ -171,6 +175,7 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     usr/local/sbin/prune-native-releases \
     usr/local/sbin/verify-host-prerequisites \
     usr/local/lib/mk8email/tests \
+    usr/local/share/mk8email/domain-templates \
     usr/local/share/mk8email/prerequisites
 
 (cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "$stage/SHA256SUMS"

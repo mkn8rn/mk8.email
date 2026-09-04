@@ -27,7 +27,7 @@ case "$1" in
         directory_mode=0751
         certificate_mode=0444
         private_mode=0440
-        required_names="email.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com"
+        required_names="email.mk8n.com"
         getent group tlskeys >/dev/null || groupadd --system tlskeys
         ;;
     *)

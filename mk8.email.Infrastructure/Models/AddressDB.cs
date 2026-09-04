@@ -16,7 +16,7 @@ public class AddressDB
     public string Domain { get; set; } = string.Empty;
 
     [Column("is_active")]
-    public bool IsActive { get; set; } = true;
+    public bool IsActive { get; set; }
 
     [Column("created_at")]
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;

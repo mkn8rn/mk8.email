@@ -13,7 +13,9 @@ test -s /etc/mk8email/tls/fullchain.pem
 test -s /etc/mk8email/tls/privkey.pem
 test -s /etc/mk8email/admin-tls/fullchain.pem
 test -s /etc/mk8email/admin-tls/privkey.pem
-test -s /etc/mk8email/dkim/s202609.private.pem
+test -s /etc/rspamd/dkim_selectors.map
+test -s /etc/rspamd/dkim_paths.map
+/usr/local/sbin/mk8-domain rebuild-signing-maps
 
 /usr/local/sbin/configure-mail-database-access
 postfix check

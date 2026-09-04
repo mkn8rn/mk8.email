@@ -1,0 +1,334 @@
+#!/bin/sh
+set -eu
+
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 077
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: deploy-mk8-domain-certificate DOMAIN" >&2
+    exit 2
+fi
+
+domain=$1
+python3 - "$domain" <<'PY' || fail "Use a normalized ASCII domain name."
+import re
+import sys
+
+domain = sys.argv[1]
+labels = domain.split(".")
+valid = (
+    3 <= len(domain) <= 253
+    and domain == domain.lower()
+    and len(labels) >= 2
+    and all(
+        1 <= len(label) <= 63
+        and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    )
+)
+raise SystemExit(0 if valid else 1)
+PY
+
+lineage=${RENEWED_LINEAGE:-/etc/letsencrypt/live/mk8-domain-$domain}
+domain_directory=/etc/mk8email/domains/$domain
+destination=$domain_directory/tls
+nginx_directory=/etc/nginx/mk8email-domains.d
+nginx_configuration=$nginx_directory/$domain.conf
+web_root=/var/www/mk8email-domains/$domain
+work=$(mktemp -d /run/mk8-domain-certificate.XXXXXX)
+completed=false
+changed=false
+reload_attempted=false
+
+case "$lineage" in
+    /*) ;;
+    *) fail "The certificate lineage path must be absolute." ;;
+esac
+
+for required_command in flock nginx openssl systemctl timeout; do
+    command -v "$required_command" >/dev/null \
+        || fail "A required certificate command is missing: $required_command"
+done
+
+exec 8>/run/lock/mk8-domain.lock
+flock --exclusive --wait 30 8 \
+    || fail "Another domain operation is active."
+exec 9>/run/lock/mk8-certificate.lock
+flock --exclusive --nonblock 9 \
+    || fail "Another certificate deployment is active."
+
+check_lineage_file() {
+    checked_file=$1
+    private_file=$2
+    resolved_file=$(readlink -f -- "$checked_file") \
+        || fail "A certificate lineage file cannot be resolved."
+    if [ ! -f "$resolved_file" ] || [ -L "$resolved_file" ]; then
+        fail "The certificate lineage is incomplete."
+    fi
+    [ "$(stat -c '%U:%G' "$resolved_file")" = root:root ] \
+        || fail "Root must own each certificate lineage file."
+    if find "$resolved_file" -prune -perm /022 -print -quit | grep -q .; then
+        fail "Another identity can write a certificate lineage file."
+    fi
+    if [ "$private_file" = true ] \
+        && find "$resolved_file" -prune -perm /077 -print -quit | grep -q .; then
+        fail "Another identity can read the certificate private key."
+    fi
+}
+
+check_directory() {
+    checked_directory=$1
+    expected_group=$2
+    expected_mode=${3#0}
+    if [ -L "$checked_directory" ] \
+        || { [ -e "$checked_directory" ] && [ ! -d "$checked_directory" ]; }; then
+        fail "A certificate directory is not safe."
+    fi
+    if [ ! -d "$checked_directory" ]; then
+        install -d -o root -g "$expected_group" -m "$3" "$checked_directory"
+    fi
+    [ "$(stat -c '%U:%G %a' "$checked_directory")" \
+        = "root:$expected_group $expected_mode" ] \
+        || fail "A certificate directory has unsafe metadata."
+}
+
+snapshot_file() {
+    source_path=$1
+    snapshot_name=$2
+    if [ -L "$source_path" ] \
+        || { [ -e "$source_path" ] && [ ! -f "$source_path" ]; }; then
+        fail "A managed certificate path is not safe."
+    fi
+    if [ -f "$source_path" ]; then
+        [ "$(stat -c '%h' "$source_path")" -eq 1 ] \
+            || fail "A managed certificate file has another hard link."
+        cp -p -- "$source_path" "$work/$snapshot_name"
+        : > "$work/$snapshot_name.present"
+    fi
+    : > "$work/$snapshot_name.checked"
+}
+
+restore_file() {
+    restored_path=$1
+    snapshot_name=$2
+    rollback_path=$restored_path.mk8-rollback
+    [ -f "$work/$snapshot_name.checked" ] || return 0
+    rm -f -- "$rollback_path"
+    if [ -f "$work/$snapshot_name.present" ]; then
+        cp -p -- "$work/$snapshot_name" "$rollback_path"
+        mv -f -- "$rollback_path" "$restored_path"
+    else
+        rm -f -- "$restored_path"
+    fi
+}
+
+restore_previous_state() {
+    restore_status=0
+    restore_file "$destination/fullchain.pem" fullchain || restore_status=1
+    restore_file "$destination/privkey.pem" privkey || restore_status=1
+    restore_file "$nginx_configuration" nginx || restore_status=1
+    rm -f -- "$destination/fullchain.pem.mk8-new" \
+        "$destination/privkey.pem.mk8-new" "$nginx_configuration.mk8-new"
+    if [ "$reload_attempted" = true ]; then
+        if nginx -t; then
+            systemctl reload nginx.service || restore_status=1
+        else
+            restore_status=1
+        fi
+    fi
+    return "$restore_status"
+}
+
+finish() {
+    deployment_status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$completed" != true ] && [ "$changed" = true ]; then
+        set +e
+        restore_previous_state
+        rollback_status=$?
+        set -e
+        if [ "$rollback_status" -eq 0 ]; then
+            printf '%s\n' "Certificate deployment failed. The prior domain state was restored." >&2
+        else
+            printf '%s\n' "Certificate rollback failed. Immediate operator action is required." >&2
+        fi
+        deployment_status=1
+    fi
+    case "$work" in
+        /run/mk8-domain-certificate.*) rm -rf -- "$work" ;;
+    esac
+    exit "$deployment_status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+
+check_lineage_file "$lineage/fullchain.pem" false
+check_lineage_file "$lineage/privkey.pem" true
+[ -f "$domain_directory/prepared" ] \
+    || fail "Prepare the domain before certificate deployment."
+[ -f "$web_root/autoconfig/mail/config-v1.1.xml" ] \
+    || fail "The domain autoconfiguration file is missing."
+[ -f "$web_root/mta-sts/.well-known/mta-sts.txt" ] \
+    || fail "The domain MTA-STS policy is missing."
+
+openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 1209600
+openssl pkey -in "$lineage/privkey.pem" -noout -check </dev/null >/dev/null
+for required_name in "autoconfig.$domain" "mta-sts.$domain"; do
+    openssl x509 -in "$lineage/fullchain.pem" -noout \
+        -checkhost "$required_name" >/dev/null 2>&1 \
+        || fail "The certificate does not cover $required_name."
+done
+openssl x509 -in "$lineage/fullchain.pem" -pubkey -noout \
+    | openssl pkey -pubin -outform DER > "$work/certificate-public-key.der"
+openssl pkey -in "$lineage/privkey.pem" -pubout -outform DER \
+    > "$work/private-public-key.der"
+cmp --silent "$work/certificate-public-key.der" "$work/private-public-key.der" \
+    || fail "The certificate and private key do not match."
+expected_fingerprint=$(openssl x509 -in "$lineage/fullchain.pem" \
+    -noout -fingerprint -sha256)
+
+check_directory /etc/mk8email/domains root 0750
+check_directory "$domain_directory" root 0750
+check_directory "$destination" tlskeys 0751
+check_directory "$nginx_directory" root 0755
+
+cat > "$work/nginx.conf" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name autoconfig.$domain mta-sts.$domain;
+    access_log /var/log/nginx/access.log mk8_safe;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 308 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name autoconfig.$domain;
+    access_log /var/log/nginx/access.log mk8_safe;
+    ssl_certificate $destination/fullchain.pem;
+    ssl_certificate_key $destination/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+
+    location = /mail/config-v1.1.xml {
+        root $web_root/autoconfig;
+        default_type application/xml;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name mta-sts.$domain;
+    access_log /var/log/nginx/access.log mk8_safe;
+    ssl_certificate $destination/fullchain.pem;
+    ssl_certificate_key $destination/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+
+    location = /.well-known/mta-sts.txt {
+        root $web_root/mta-sts;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+
+systemctl is-active --quiet nginx.service \
+    || fail "nginx must be active before certificate deployment."
+nginx -t
+
+snapshot_file "$destination/fullchain.pem" fullchain
+snapshot_file "$destination/privkey.pem" privkey
+snapshot_file "$nginx_configuration" nginx
+for pending_path in \
+    "$destination/fullchain.pem.mk8-new" \
+    "$destination/privkey.pem.mk8-new" \
+    "$nginx_configuration.mk8-new"; do
+    if [ -e "$pending_path" ] || [ -L "$pending_path" ]; then
+        fail "A stale certificate transaction file exists."
+    fi
+done
+
+changed=true
+install -o root -g tlskeys -m 0444 "$lineage/fullchain.pem" \
+    "$destination/fullchain.pem.mk8-new"
+install -o root -g tlskeys -m 0440 "$lineage/privkey.pem" \
+    "$destination/privkey.pem.mk8-new"
+install -o root -g root -m 0644 "$work/nginx.conf" \
+    "$nginx_configuration.mk8-new"
+mv -f -- "$destination/fullchain.pem.mk8-new" "$destination/fullchain.pem"
+mv -f -- "$destination/privkey.pem.mk8-new" "$destination/privkey.pem"
+mv -f -- "$nginx_configuration.mk8-new" "$nginx_configuration"
+sync -f "$destination"
+sync -f "$nginx_directory"
+
+nginx -t
+reload_attempted=true
+systemctl reload nginx.service
+
+probe_certificate() {
+    probe_name=$1
+    probe_output="$work/presented-$probe_name.pem"
+    probe_attempt=0
+    while [ "$probe_attempt" -lt 5 ]; do
+        : > "$probe_output"
+        timeout 10 openssl s_client -showcerts -servername "$probe_name" \
+            -connect 127.0.0.1:443 </dev/null > "$probe_output" 2>/dev/null || true
+        presented_fingerprint=$(openssl x509 -in "$probe_output" \
+            -noout -fingerprint -sha256 2>/dev/null || true)
+        if [ "$presented_fingerprint" = "$expected_fingerprint" ]; then
+            return 0
+        fi
+        probe_attempt=$((probe_attempt + 1))
+        [ "$probe_attempt" -eq 5 ] || sleep 1
+    done
+    fail "A local domain endpoint did not present the new certificate."
+}
+
+probe_certificate "autoconfig.$domain"
+probe_certificate "mta-sts.$domain"
+curl --silent --fail --insecure --max-time 10 --noproxy '*' \
+    --resolve "autoconfig.$domain:443:127.0.0.1" \
+    "https://autoconfig.$domain/mail/config-v1.1.xml" >/dev/null \
+    || fail "The autoconfiguration endpoint is not ready."
+curl --silent --fail --insecure --max-time 10 --noproxy '*' \
+    --resolve "mta-sts.$domain:443:127.0.0.1" \
+    "https://mta-sts.$domain/.well-known/mta-sts.txt" >/dev/null \
+    || fail "The MTA-STS endpoint is not ready."
+systemctl is-active --quiet nginx.service
+
+completed=true
+printf '%s\n' "The domain discovery certificate is installed and active."
