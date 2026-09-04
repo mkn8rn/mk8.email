@@ -323,6 +323,21 @@ fi
 install -o root -g root -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
 install -o root -g root -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
 
+if ! python3 - /etc/mk8email/mk8email.config.json <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    configuration = json.load(stream)
+dkim = configuration.get("Dkim", {})
+valid = dkim.get("EnableSigning") is False and dkim.get("PrivateKeyPath") is None
+raise SystemExit(0 if valid else 1)
+PY
+then
+    printf '%s\n' "The production application must not use its single-domain DKIM signer." >&2
+    exit 1
+fi
+
 postfix check
 doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
 rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict >/dev/null

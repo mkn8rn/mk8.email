@@ -30,9 +30,9 @@
     "CertificateKeyPath": "/etc/mk8email/tls/privkey.pem"
   },
   "Dkim": {
-    "PrivateKeyPath": "/etc/mk8email/dkim/s202609.private.pem",
+    "PrivateKeyPath": null,
     "Selector": "s202609",
-    "EnableSigning": true
+    "EnableSigning": false
   },
   "Security": {
     "EnableSpfCheck": false,

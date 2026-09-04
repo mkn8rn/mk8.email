@@ -329,8 +329,11 @@ fi
 /usr/local/lib/mk8email/tests/release_retention_smoke
 if [ "`$activate_requested" = true ] || [ "`$was_active" = true ]; then
     /usr/local/sbin/activate-mail-stack
+    printf '%s\n' "Running the management command smoke test." >&2
     /usr/local/lib/mk8email/tests/management_cli_smoke
+    printf '%s\n' "Running the certificate deployment smoke test." >&2
     /usr/local/lib/mk8email/tests/certificate_deploy_smoke
+    printf '%s\n' "Running the multi-domain smoke test." >&2
     /usr/local/lib/mk8email/tests/multi_domain_smoke
 fi
 apt_sources_changing=false
