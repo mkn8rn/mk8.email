@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 LOCAL_HOST = "127.0.0.1"
-INBOUND_HOST = "192.0.2.251"
+INBOUND_HOST = "@@MK8_SERVER_IPV4@@"
 DOMAIN = "mk8n.com"
 ADMIN = f"admin@{DOMAIN}"
 PRIMARY = f"mk8n@{DOMAIN}"

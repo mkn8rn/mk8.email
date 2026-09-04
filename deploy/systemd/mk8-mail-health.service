@@ -28,4 +28,4 @@ SystemCallArchitectures=native
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 IPAddressDeny=any
 IPAddressAllow=localhost
-IPAddressAllow=192.0.2.251/32
+IPAddressAllow=@@MK8_SERVER_IPV4@@/32

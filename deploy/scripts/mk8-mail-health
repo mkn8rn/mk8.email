@@ -162,7 +162,7 @@ mail_certificate_remaining=$(certificate_remaining /etc/mk8email/tls/fullchain.p
 admin_certificate_remaining=$(certificate_remaining /etc/mk8email/admin-tls/fullchain.pem)
 curl --silent --fail --insecure --max-time 10 \
     --noproxy '*' \
-    --resolve admin.mk8n.com:8443:192.0.2.251 \
+    --resolve admin.mk8n.com:8443:@@MK8_SERVER_IPV4@@ \
     https://admin.mk8n.com:8443/health/ready >/dev/null \
     || record_error "The administrator dashboard is not ready."
 

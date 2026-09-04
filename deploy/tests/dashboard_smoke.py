@@ -39,7 +39,7 @@ def main() -> None:
         urllib.request.HTTPCookieProcessor(cookies),
         urllib.request.HTTPSHandler(context=context),
     )
-    base = "https://192.0.2.251:8443"
+    base = "https://@@MK8_SERVER_IPV4@@:8443"
 
     with opener.open(f"{base}/Login", timeout=15) as response:
         login_page = response.read().decode("utf-8")

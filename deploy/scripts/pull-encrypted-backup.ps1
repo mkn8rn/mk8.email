@@ -2,13 +2,25 @@
 
 [CmdletBinding()]
 param(
-    [string]$Target = 'root@192.0.2.251',
-    [string]$KeyPath = '<private-key-root>\ssh\mk8email_ed25519',
-    [string]$KnownHostsPath = '<private-key-root>\known_hosts',
-    [string]$Destination = '<private-backup-root>'
+    [string]$ProfilePath
 )
 
 $ErrorActionPreference = 'Stop'
+
+$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$profileModulePath = Join-Path $repositoryRoot 'tools/deployment/Mk8DeploymentProfile.psm1'
+Import-Module $profileModulePath -Force
+if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+    $ProfilePath = Join-Path $repositoryRoot 'deploy/secrets/production-profile.json'
+}
+$profile = Import-Mk8DeploymentProfile `
+    -Path $ProfilePath `
+    -RepositoryRoot $repositoryRoot `
+    -RequireConnectionFiles
+$Target = "root@$($profile.ServerIPv4)"
+$KeyPath = $profile.SshKeyPath
+$KnownHostsPath = $profile.KnownHostsPath
+$Destination = $profile.BackupDestination
 
 function Invoke-BoundedProcess {
     param(

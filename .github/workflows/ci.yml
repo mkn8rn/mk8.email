@@ -71,6 +71,30 @@ jobs:
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \
             python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py
 
+      - name: Validate deployment profile tooling
+        shell: pwsh
+        run: |
+          $files = @(
+            'deploy/scripts/deploy-production.ps1'
+            'deploy/scripts/pull-encrypted-backup.ps1'
+            'tools/deployment/Mk8DeploymentProfile.psm1'
+            'tools/deployment/Test-Mk8DeploymentProfile.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$tokens,
+              [ref]$errors)
+            if ($errors.Count -ne 0) {
+              $errors | Format-Table -AutoSize
+              throw "PowerShell parsing failed for $file."
+            }
+          }
+          ./tools/deployment/Test-Mk8DeploymentProfile.ps1 `
+            -TaskRoot (Join-Path $env:RUNNER_TEMP 'mk8email-deployment-profile')
+
       - name: Test application
         run: dotnet test mk8.email.Application.Tests/mk8.email.Application.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=application.trx" --results-directory artifacts/test-results
 

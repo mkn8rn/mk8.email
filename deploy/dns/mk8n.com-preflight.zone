@@ -1,6 +1,6 @@
 $ORIGIN mk8n.com.
 $TTL 300
 
-mail                            IN A 203.0.113.171 ; cf_tags=cf-proxied:false
-mta-sts                         IN A 203.0.113.171 ; cf_tags=cf-proxied:false
-autoconfig                      IN A 203.0.113.171 ; cf_tags=cf-proxied:false
+mail                            IN A @@MK8_PUBLIC_IPV4@@ ; cf_tags=cf-proxied:false
+mta-sts                         IN A @@MK8_PUBLIC_IPV4@@ ; cf_tags=cf-proxied:false
+autoconfig                      IN A @@MK8_PUBLIC_IPV4@@ ; cf_tags=cf-proxied:false

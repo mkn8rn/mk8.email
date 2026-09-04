@@ -4,7 +4,7 @@ banaction = nftables-multiport
 bantime = 1h
 findtime = 10m
 maxretry = 5
-ignoreip = 127.0.0.0/8 ::1 192.0.2.254
+ignoreip = 127.0.0.0/8 ::1 @@MK8_TRUSTED_ADMIN_IPV4@@
 
 [sshd]
 enabled = true

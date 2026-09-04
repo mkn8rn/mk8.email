@@ -51,7 +51,6 @@
   "Admin": {
     "AllowedNetworks": [
       "127.0.0.0/8",
-      "192.0.2.0/24",
       "172.30.8.0/24"
     ],
     "DataProtectionKeyPath": "/var/lib/mk8email-admin/data-protection",

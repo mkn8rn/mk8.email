@@ -53,7 +53,7 @@ clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1
 dashboard_ready=false
 for _ in $(seq 1 30); do
     if curl --silent --fail --insecure --max-time 3 --noproxy '*' \
-        --resolve admin.mk8n.com:8443:192.0.2.251 \
+        --resolve admin.mk8n.com:8443:@@MK8_SERVER_IPV4@@ \
         https://admin.mk8n.com:8443/health/ready >/dev/null; then
         dashboard_ready=true
         break

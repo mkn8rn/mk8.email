@@ -51,7 +51,7 @@
   "Admin": {
     "AllowedNetworks": [
       "127.0.0.0/8",
-      "192.0.2.0/24"
+      "@@MK8_LAN_CIDR@@"
     ],
     "DataProtectionKeyPath": "/var/lib/mk8email-admin/data-protection",
     "AuditLogPath": "/var/log/mk8email-admin/audit.jsonl",

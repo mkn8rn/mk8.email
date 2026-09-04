@@ -22,7 +22,7 @@ trap cleanup EXIT HUP INT TERM
 openssl x509 -in "$certificate" -noout -checkend 1209600 >/dev/null
 subject_names=$(openssl x509 -in "$certificate" -noout -ext subjectAltName)
 printf '%s\n' "$subject_names" | grep -Fq 'DNS:admin.mk8n.com'
-printf '%s\n' "$subject_names" | grep -Fq 'IP Address:192.0.2.251'
+printf '%s\n' "$subject_names" | grep -Fq 'IP Address:@@MK8_SERVER_IPV4@@'
 
 openssl x509 -in "$certificate" -pubkey -noout \
     | openssl pkey -pubin -outform DER > "$work/certificate-public-key.der"

@@ -2,9 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Target = 'root@192.0.2.251',
-    [string]$KeyPath = '<private-key-root>\ssh\mk8email_ed25519',
-    [string]$KnownHostsPath = '<private-key-root>\known_hosts',
+    [string]$ProfilePath,
     [switch]$Activate
 )
 
@@ -53,6 +51,19 @@ function Invoke-BoundedProcess {
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$profileModulePath = Join-Path $repositoryRoot 'tools/deployment/Mk8DeploymentProfile.psm1'
+Import-Module $profileModulePath -Force
+if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+    $ProfilePath = Join-Path $repositoryRoot 'deploy/secrets/production-profile.json'
+}
+$profile = Import-Mk8DeploymentProfile `
+    -Path $ProfilePath `
+    -RepositoryRoot $repositoryRoot `
+    -RequireConnectionFiles
+$Target = "root@$($profile.ServerIPv4)"
+$KeyPath = $profile.SshKeyPath
+$KnownHostsPath = $profile.KnownHostsPath
+
 $taskRoot = 'D:\temp\mk8.email\deploy-production'
 $runRoot = Join-Path $taskRoot ([Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($runRoot) | Out-Null
@@ -85,7 +96,12 @@ try {
     Invoke-BoundedProcess tar.exe @('--create', '--gzip', "--file=$releaseArchive", "--directory=$(Join-Path $runRoot 'release')", 'cli', 'admin') 120 $repositoryRoot
 
     $assetArchive = Join-Path $runRoot 'mk8email-assets.tar.gz'
-    Invoke-BoundedProcess tar.exe @('--create', '--gzip', "--file=$assetArchive", '--directory', $repositoryRoot, 'deploy') 120 $repositoryRoot
+    $renderedAssetsRoot = Join-Path $runRoot 'rendered-assets'
+    New-Mk8RenderedDeployAssets `
+        -ProfilePath $ProfilePath `
+        -RepositoryRoot $repositoryRoot `
+        -Destination $renderedAssetsRoot | Out-Null
+    Invoke-BoundedProcess tar.exe @('--create', '--gzip', "--file=$assetArchive", '--directory', $renderedAssetsRoot, 'deploy') 120 $repositoryRoot
     $releaseDigest = (Get-FileHash -LiteralPath $releaseArchive -Algorithm SHA256).Hash
     $assetDigest = (Get-FileHash -LiteralPath $assetArchive -Algorithm SHA256).Hash
     $releaseMaterial = [Text.Encoding]::ASCII.GetBytes("$releaseDigest`n$assetDigest`n")
