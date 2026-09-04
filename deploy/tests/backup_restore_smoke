@@ -36,6 +36,14 @@ pg_restore --list "$backup_directory/mk8email.dump" >/dev/null
 pg_restore --list "$backup_directory/synapse.dump" >/dev/null
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -F 'etc/NetworkManager/system-connections/' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -F 'etc/apt/' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'var/lib/aide/aide.db' >/dev/null
+test -s "$backup_directory/debian-packages.tsv"
+test -s "$backup_directory/debian-manual-packages.txt"
+test -s "$backup_directory/os-release"
+test -s "$backup_directory/kernel.txt"
 
 runuser -u postgres -- createdb --template=template0 "$test_database"
 database_created=true

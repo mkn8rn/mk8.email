@@ -19,3 +19,28 @@ public sealed record MailAccountSummaryDTO(
     DateTime CreatedAt);
 
 public sealed record AdministrationResult(bool Succeeded, string Message, Guid? EntityId = null);
+
+public sealed record MailSystemStatusDTO(
+    string State,
+    DateTimeOffset? CheckedAt,
+    int? QueueCount,
+    long? OldestQueuedMessageSeconds,
+    int? MailStorageUsedPercent,
+    long? BackupExportAgeSeconds,
+    long? ClamSignatureAgeSeconds,
+    long? MailCertificateRemainingSeconds,
+    long? AdminCertificateRemainingSeconds,
+    int ErrorCount)
+{
+    public static MailSystemStatusDTO Unavailable { get; } = new(
+        "unavailable",
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0);
+}

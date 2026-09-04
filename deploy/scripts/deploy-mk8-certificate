@@ -16,6 +16,7 @@ case "$1" in
         directory_mode=0751
         certificate_mode=0444
         private_mode=0440
+        required_names="mail.mk8n.com mta-sts.mk8n.com autoconfig.mk8n.com"
         getent group tlskeys >/dev/null || groupadd --system tlskeys
         ;;
     matrix)
@@ -27,6 +28,7 @@ case "$1" in
         directory_mode=0700
         certificate_mode=0400
         private_mode=0400
+        required_names="matrix.mkn8rn.com"
         ;;
     *)
         printf '%s\n' "The certificate target is not valid." >&2
@@ -49,6 +51,13 @@ trap cleanup EXIT INT TERM
 
 openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 604800
 openssl pkey -in "$lineage/privkey.pem" -noout -check
+for required_name in $required_names; do
+    if ! openssl x509 -in "$lineage/fullchain.pem" -noout \
+        -checkhost "$required_name" >/dev/null 2>&1; then
+        printf '%s\n' "The certificate does not cover $required_name." >&2
+        exit 1
+    fi
+done
 openssl x509 -in "$lineage/fullchain.pem" -pubkey -noout \
     | openssl pkey -pubin -outform DER > "$work/certificate-public-key.der"
 openssl pkey -in "$lineage/privkey.pem" -pubout -outform DER > "$work/private-public-key.der"

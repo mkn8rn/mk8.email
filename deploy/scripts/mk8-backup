@@ -66,6 +66,10 @@ runuser -u postgres -- pg_dump --format=custom --compress=9 mk8email > "$stage/m
 runuser -u postgres -- pg_dump --format=custom --compress=9 --exclude-table-data=e2e_one_time_keys_json synapse > "$stage/synapse.dump"
 runuser -u postgres -- pg_dumpall --globals-only > "$stage/postgresql-globals.sql"
 readlink -f /opt/mk8email/current > "$stage/mk8email-release.txt"
+dpkg-query --show --showformat='${binary:Package}\t${Version}\n' | sort > "$stage/debian-packages.tsv"
+apt-mark showmanual | sort > "$stage/debian-manual-packages.txt"
+cp -p /etc/os-release "$stage/os-release"
+uname -a > "$stage/kernel.txt"
 
 previous=$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%f\n' | sort | tail -n 1)
 
@@ -89,8 +93,8 @@ resume_services
 tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     --exclude=etc/mk8email/bootstrap-secrets \
     etc/aide \
-    etc/apt/apt.conf.d/20auto-upgrades \
-    etc/apt/apt.conf.d/52mk8-unattended-upgrades \
+    var/lib/aide/aide.db \
+    etc/apt \
     etc/audit \
     etc/clamav \
     etc/default/aide \
@@ -119,6 +123,8 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/systemd/system/clamav-daemon.socket.d \
     etc/systemd/system/clamav-freshclam.service.d \
     etc/systemd/system/coturn.service.d \
+    etc/systemd/system/dailyaidecheck.service.d \
+    etc/systemd/system/dailyaidecheck.timer.d \
     etc/systemd/system/dovecot.service.d \
     etc/systemd/system/matrix-synapse.service.d \
     etc/systemd/system/mk8-backup.service \

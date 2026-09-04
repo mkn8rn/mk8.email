@@ -1,0 +1,9 @@
+CONFIG=/etc/aide/aide.conf
+MAILTO=admin@mk8n.com
+FQDN=mk8n.com
+QUIETREPORTS=yes
+SILENTREPORTS=no
+COPYNEWDB=no
+COMMAND=update
+AIDEARGS=""
+FIGLET=no

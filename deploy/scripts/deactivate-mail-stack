@@ -6,6 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 2
 fi
 
+systemctl stop mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer 2>/dev/null || true
 systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service
 rm -f -- /etc/mk8email/mail-stack-ready
 printf '%s\n' "The public mail services are inactive."

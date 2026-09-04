@@ -1,0 +1,6 @@
+-/var/vmail
+-/var/backups/mk8
+-/var/backups/mk8-export
+-/var/lib/matrix-synapse/media
+-/var/lib/mk8-mail-health
+-/var/log/mk8email-admin

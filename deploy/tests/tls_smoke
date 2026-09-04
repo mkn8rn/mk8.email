@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+if [ "$#" -gt 2 ]; then
+    printf '%s\n' "Usage: tls_smoke [CA_FILE [HOSTNAME]]" >&2
+    exit 2
+fi
+
+ca_file=${1:-}
+hostname=${2:-mail.mk8n.com}
+
 reject_protocol() {
     label=$1
     shift
@@ -14,9 +22,14 @@ accept_protocol() {
     label=$1
     protocol=$2
     shift 2
-    output=$(timeout 15 openssl s_client -brief "$@" </dev/null 2>&1)
+    if [ -n "$ca_file" ]; then
+        output=$(timeout 15 openssl s_client -brief -verify_return_error \
+            -CAfile "$ca_file" -verify_hostname "$hostname" "$@" </dev/null 2>&1)
+        printf '%s\n' "$output" | grep -F "Verification: OK" >/dev/null
+    else
+        output=$(timeout 15 openssl s_client -brief "$@" </dev/null 2>&1)
+    fi
     printf '%s\n' "$output" | grep -F "Protocol version: $protocol" >/dev/null
-    printf '%s\n' "$output" | grep -F "Verification error: self-signed certificate" >/dev/null
     echo "$label accepted $protocol."
 }
 

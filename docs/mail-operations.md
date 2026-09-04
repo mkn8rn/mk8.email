@@ -42,6 +42,10 @@ The audit record includes time, account identity, source address, action, target
 
 The audit log rotates each day and keeps 90 rotations. Nginx removes query strings from access logs to reduce accidental data capture.
 
+The status page reads `/var/lib/mk8-mail-health/status.json`. The root health process writes this sanitized snapshot atomically.
+
+The snapshot contains only health, queue, storage, backup, signature, and certificate metrics. The dashboard cannot control services or read mail.
+
 ## Service health
 
 Run the strict deep check after each deployment, restart, update, or network change.
@@ -54,6 +58,8 @@ The check validates required services, databases, Valkey, ClamAV, signatures, qu
 
 The timer runs the normal check regularly. It writes a journal event only when health changes or the error set changes.
 
+The check also verifies the backup, health, and AIDE timers. It reports a failed backup or failed integrity service.
+
 The health check skips a run while a backup holds its exclusive lock. This behavior prevents false service failures during the snapshot interval.
 
 ```sh
@@ -61,6 +67,8 @@ systemctl status mk8-mail-health.timer
 cat /var/lib/mk8-mail-health/status
 journalctl -t mk8-mail-health --since today
 ```
+
+The health directory must use owner `root`, group `mk8email`, and mode 2750. The snapshot must use the same owner and group with mode 0640.
 
 Inspect all failed units after an unexpected restart.
 
@@ -70,6 +78,40 @@ systemctl status postfix dovecot rspamd clamav-daemon valkey-server postgresql m
 ```
 
 Do not start Matrix as part of a mail recovery. Matrix has a separate migration lock and data requirement.
+
+## Integrity monitoring
+
+AIDE checks filesystem integrity near 01:30 each day. A random delay spreads the start across 15 minutes.
+
+The schedule finishes before the daily backup window. Its service uses low CPU and input-output weights during the scan.
+
+The service uses an eight-gigabyte memory threshold and a ten-gigabyte hard limit. Its runtime cannot exceed 20 minutes.
+
+The `s-nail` command sends changed-file reports through local Postfix to `admin@mk8n.com`. Reports stay quiet when no change occurs.
+
+AIDE does not scan mutable mail, backup, Matrix media, health snapshot, or dashboard audit-log data. Service-specific rules handle other mutable system data.
+
+Test the complete local alert path after a Postfix or AIDE change. The test removes its message after successful delivery.
+
+```sh
+/usr/local/lib/mk8email/tests/aide_alert_smoke
+```
+
+Review every report before accepting a new baseline. Verify packaged files and explain every custom-file change first.
+
+```sh
+debsums --silent
+less /var/log/aide/aide.log
+stat /var/lib/aide/aide.db /var/lib/aide/aide.db.new
+```
+
+Accept a reviewed baseline with explicit ownership and permissions. Never accept a baseline after unexplained changes.
+
+```sh
+install -o root -g root -m 0600 /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+```
+
+The weekly debsums job separately checks installed package files. An empty `debsums --silent` result means that package checksums match.
 
 ## Queue work
 
@@ -133,6 +175,10 @@ The backup briefly stops submission, delivery, the administrator application, an
 The measured small-system interruption is approximately five seconds. The script restarts each service that was active before the snapshot.
 
 Each snapshot contains both PostgreSQL databases, PostgreSQL roles, Maildir data, the Postfix spool, Valkey data, configuration, and Matrix media.
+
+Each snapshot also records installed packages, manual packages, the Debian release, the kernel, APT sources, and repository keys.
+
+The configuration archive includes the reviewed AIDE baseline. This file supports integrity checks after a complete host restore.
 
 The configuration archive excludes `/etc/mk8email/bootstrap-secrets`. Remove temporary password files immediately after each account command.
 

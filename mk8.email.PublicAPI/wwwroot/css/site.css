@@ -66,6 +66,31 @@ main {
     font-weight: 700;
 }
 
+.metric.small {
+    font-size: 1.4rem;
+}
+
+.card.compact {
+    margin-bottom: 0;
+    padding: 1rem;
+}
+
+.health-state {
+    border-radius: 999px;
+    font-weight: 700;
+    padding: 0.35rem 0.8rem;
+}
+
+.status-good {
+    background: #183926;
+    border: 1px solid #2f7d4a;
+}
+
+.status-bad {
+    background: #4a1d25;
+    border: 1px solid #a44352;
+}
+
 label {
     display: block;
     font-weight: 600;

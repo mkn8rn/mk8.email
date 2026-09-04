@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' "Run this command as root." >&2
+    exit 2
+fi
+
+# shellcheck disable=SC1091
+. /etc/default/aide
+: "${FQDN:?AIDE FQDN is not configured}"
+: "${MAILTO:?AIDE recipient is not configured}"
+
+subject="mk8-aide-alert-smoke-$(date --utc +%Y%m%dT%H%M%SZ)-$$"
+cleanup_required=true
+cleanup() {
+    if [ "$cleanup_required" = true ]; then
+        doveadm expunge -u "$MAILTO" mailbox INBOX HEADER Subject "$subject" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+printf '%s\n' "This local message verifies AIDE alert delivery." \
+    | runuser -u _aide -- env -u TMPDIR s-nail \
+        -Smta=smtp://_aide@localhost \
+        -Ssmtp-auth=none \
+        -Sv15-compat \
+        -Snosave \
+        -Sfrom="AIDE on $FQDN <root@$FQDN>" \
+        -s "$subject" "$MAILTO"
+
+found=false
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+    if doveadm search -u "$MAILTO" mailbox INBOX HEADER Subject "$subject" | grep -q .; then
+        found=true
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+if [ "$found" != true ]; then
+    printf '%s\n' "The AIDE test alert did not reach $MAILTO." >&2
+    exit 1
+fi
+
+doveadm expunge -u "$MAILTO" mailbox INBOX HEADER Subject "$subject"
+if doveadm search -u "$MAILTO" mailbox INBOX HEADER Subject "$subject" | grep -q .; then
+    printf '%s\n' "The AIDE test alert could not be removed." >&2
+    exit 1
+fi
+cleanup_required=false
+trap - EXIT HUP INT TERM
+printf '%s\n' "AIDE alert delivery and cleanup passed."

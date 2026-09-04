@@ -14,6 +14,8 @@ Authenticated submission uses TCP port 587 with STARTTLS or port 465 with implic
 
 PostgreSQL stores domains, accounts, password hashes, quotas, and alias routes. The Razor Pages application is the supported account management path.
 
+The dashboard reads a root-generated health snapshot. It never receives service control, queue access, or message access.
+
 The custom .NET SMTP and IMAP services are experimental. Production systemd units do not start those services.
 
 ## Durable message handling
@@ -56,6 +58,8 @@ The target uses Debian 13 at `192.168.89.251`. Its measured public IPv4 address 
 
 The host runs .NET runtime 10.0.11 and PostgreSQL 17. The production host does not contain a .NET SDK.
 
+The host also requires `s-nail` for local AIDE alert delivery. A deployment stops before changes when this command is absent.
+
 The host has no global IPv6 address. Do not publish an AAAA record before a complete IPv6 path passes tests.
 
 The database contains active `admin@mk8n.com` and `mk8n@mk8n.com` accounts. The `admin` account has the `SuperAdmin` role.
@@ -86,7 +90,13 @@ The release identifier covers both application files and deployment assets. The 
 
 An active deployment first creates a local snapshot and encrypted export. It installs and validates the new files before service activation.
 
-The activation gate checks configurations, services, PostgreSQL access, ClamAV, Valkey, the dashboard, and deep health status.
+The activation gate checks configurations, services, PostgreSQL access, ClamAV, Valkey, the dashboard, timers, and deep health status.
+
+The gate also runs the restricted systemd health unit. This check detects errors hidden by a direct root command.
+
+Deployment resets an AIDE result only when deployment interrupts an active scan. It preserves an unrelated integrity-service failure.
+
+Any failed deep health check fails activation. The deployment then restores the prior release and configuration.
 
 If installation fails, the deployment restores the prior configuration and release link. It then starts the prior mail stack.
 
@@ -122,6 +132,8 @@ certbot certonly --webroot --webroot-path /var/www/letsencrypt --cert-name mk8-m
 ```
 
 Run the deployment hook after the first issue. Check the certificate names and expiration before full activation.
+
+The hook rejects a certificate that lacks any required service name. It also rejects an expired, mismatched, or incomplete certificate.
 
 ```sh
 /usr/local/sbin/deploy-mk8-certificate mail

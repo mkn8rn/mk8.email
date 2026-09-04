@@ -6,6 +6,13 @@ if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
     exit 2
 fi
 
+for command_name in aide auditctl debsums s-nail; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf '%s\n' "A required host security command is missing: $command_name" >&2
+        exit 1
+    fi
+done
+
 asset_root=$1
 if [ ! -d "$asset_root/deploy" ]; then
     printf '%s\n' "The deployment asset root is not valid." >&2
@@ -15,7 +22,9 @@ fi
 install -m 0644 "$asset_root/deploy/apt/20auto-upgrades" /etc/apt/apt.conf.d/20auto-upgrades
 install -m 0644 "$asset_root/deploy/apt/52mk8-unattended-upgrades" /etc/apt/apt.conf.d/52mk8-unattended-upgrades
 install -m 0640 "$asset_root/deploy/audit/50-mk8-server.rules" /etc/audit/rules.d/50-mk8-server.rules
+install -m 0644 "$asset_root/deploy/aide/90_mk8_dynamic_data" /etc/aide/aide.conf.d/90_mk8_dynamic_data
 install -m 0644 "$asset_root/deploy/default/debsums" /etc/default/debsums
+install -m 0644 "$asset_root/deploy/default/aide" /etc/default/aide
 install -m 0644 "$asset_root/deploy/default/sysstat" /etc/default/sysstat
 install -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
 install -m 0644 "$asset_root/deploy/journald/90-mk8-server.conf" /etc/systemd/journald.conf.d/90-mk8-server.conf
@@ -30,6 +39,12 @@ install -m 0600 "$asset_root/deploy/ssh/90-mk8-hardening.conf" /etc/ssh/sshd_con
 install -m 0644 "$asset_root/deploy/sysctl/90-mk8-server.conf" /etc/sysctl.d/90-mk8-server.conf
 install -m 0644 "$asset_root/deploy/tmpfiles/mk8-postgresql.conf" /etc/tmpfiles.d/mk8-postgresql.conf
 install -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
+install -d -o root -g root -m 0755 /etc/systemd/system/dailyaidecheck.service.d
+install -m 0644 "$asset_root/deploy/systemd/dailyaidecheck.service.d/90-mk8-hardening.conf" \
+    /etc/systemd/system/dailyaidecheck.service.d/90-mk8-hardening.conf
+install -d -o root -g root -m 0755 /etc/systemd/system/dailyaidecheck.timer.d
+install -m 0644 "$asset_root/deploy/systemd/dailyaidecheck.timer.d/90-mk8-schedule.conf" \
+    /etc/systemd/system/dailyaidecheck.timer.d/90-mk8-schedule.conf
 
 if grep -Eq '^[[:space:]]*UMASK[[:space:]]+' /etc/login.defs; then
     sed -i -E 's/^[[:space:]]*UMASK[[:space:]]+.*/UMASK 027/' /etc/login.defs
@@ -44,7 +59,9 @@ sysctl --system >/dev/null
 systemd-tmpfiles --create /etc/tmpfiles.d/mk8-postgresql.conf
 pg_ctlcluster 17 main reload
 augenrules --load
+aide --config=/etc/aide/aide.conf --config-check
 systemctl daemon-reload
+systemd-analyze verify dailyaidecheck.service dailyaidecheck.timer
 systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
 systemctl enable --now nftables.service auditd.service fail2ban.service acct.service sysstat.service
 systemctl enable --now dailyaidecheck.timer sysstat-collect.timer sysstat-summary.timer

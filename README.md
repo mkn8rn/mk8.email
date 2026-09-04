@@ -10,6 +10,8 @@ The original custom .NET SMTP and IMAP servers remain available only through an 
 
 The prepared target is Debian 13 at `192.168.89.251`. The administrator dashboard listens only at `https://192.168.89.251:8443` on the local network.
 
+The dashboard shows sanitized health, queue, storage, backup, signature, and certificate metrics. It cannot control services or read message content.
+
 Read [the production deployment guide](docs/production-deployment.md) before a release. Read [the mail operations guide](docs/mail-operations.md) for routine work and recovery.
 
 Read [the RouterOS and DNS guide](docs/routeros-and-dns.md) before public cutover. Read [the Matrix migration guide](docs/matrix-migration.md) before moving Synapse.
