@@ -164,6 +164,7 @@ install -o root -g root -m 0755 "$asset_root/deploy/tests/backup_restore_smoke" 
 install -o root -g root -m 0755 "$asset_root/deploy/tests/aide_alert_smoke" /usr/local/lib/mk8email/tests/aide_alert_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/dashboard_smoke.py" /usr/local/lib/mk8email/tests/dashboard_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/disruption_smoke" /usr/local/lib/mk8email/tests/disruption_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/host_hardening_smoke" /usr/local/lib/mk8email/tests/host_hardening_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/mail_smoke.py" /usr/local/lib/mk8email/tests/mail_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/prerequisites_smoke" /usr/local/lib/mk8email/tests/prerequisites_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/tls_smoke" /usr/local/lib/mk8email/tests/tls_smoke

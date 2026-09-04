@@ -27,6 +27,8 @@ install -m 0644 "$asset_root/deploy/default/debsums" /etc/default/debsums
 install -m 0644 "$asset_root/deploy/default/aide" /etc/default/aide
 install -m 0644 "$asset_root/deploy/default/sysstat" /etc/default/sysstat
 install -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
+install -d -o root -g root -m 0755 /etc/systemd/coredump.conf.d
+install -m 0644 "$asset_root/deploy/coredump/90-mk8-server.conf" /etc/systemd/coredump.conf.d/90-mk8-server.conf
 install -m 0644 "$asset_root/deploy/journald/90-mk8-server.conf" /etc/systemd/journald.conf.d/90-mk8-server.conf
 install -m 0644 "$asset_root/deploy/logind/90-mk8-server.conf" /etc/systemd/logind.conf.d/90-mk8-server.conf
 install -m 0644 "$asset_root/deploy/modprobe/90-mk8-server.conf" /etc/modprobe.d/90-mk8-server.conf
@@ -62,10 +64,16 @@ augenrules --load
 aide --config=/etc/aide/aide.conf --config-check
 systemctl daemon-reload
 systemd-analyze verify dailyaidecheck.service dailyaidecheck.timer
+systemctl set-default multi-user.target
+systemctl disable --now sddm.service
 systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+systemctl mask --now avahi-daemon.service avahi-daemon.socket bluetooth.service \
+    cups-browsed.service cups.path cups.service cups.socket
+systemctl mask drkonqi-coredump-processor@.service
 systemctl enable --now nftables.service auditd.service fail2ban.service acct.service sysstat.service
 systemctl enable --now dailyaidecheck.timer sysstat-collect.timer sysstat-summary.timer
 systemctl reload ssh.service
 systemctl restart fail2ban.service
+sh "$asset_root/deploy/tests/host_hardening_smoke"
 
 printf '%s\n' "Host hardening assets installed. Reboot the host to apply all controls."

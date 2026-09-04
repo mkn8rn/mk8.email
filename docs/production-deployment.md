@@ -52,11 +52,19 @@ PostgreSQL, Valkey, Rspamd, ClamAV, and the .NET backend listen only on loopback
 
 Fail2ban protects SSH, Postfix, Dovecot, and nginx. Unattended security updates install automatically, with a controlled reboot window.
 
+The host boots to `multi-user.target`. SDDM stays disabled, so the installed KDE packages do not start a graphical login.
+
+Avahi, Bluetooth, CUPS, and KDE crash processing are masked. Persistent core images and automated crash stack processing are disabled.
+
+AIDE ignores boot-generated device links and private temporary directories. It continues to monitor configuration, code, units, keys, and packages.
+
 ## Prepared target
 
 The target uses Debian 13 at `192.168.89.251`. Its measured public IPv4 address is `176.61.153.171`.
 
 The host runs .NET runtime 10.0.11 and PostgreSQL 17. The production host does not contain a .NET SDK.
+
+KDE dependencies retain Git and GNU compiler binaries. The host has no source checkout or build job.
 
 The host also requires `s-nail` for local AIDE alert delivery. A deployment stops before changes when this command is absent.
 
@@ -192,6 +200,8 @@ A forced Dovecot outage kept the accepted message in the Postfix queue. Delivery
 The dashboard passed authentication, authorization, antiforgery, secure-cookie, account, and network tests. The backend port was not reachable from the LAN.
 
 A cold reboot returned all required units without failed services. Deep health checks and all live mail tests passed after that reboot.
+
+The reboot check also confirmed the headless boot target, disabled SDDM, masked unused services, and disabled persistent core dumps.
 
 The encrypted backup passed checksum, decryption, database restore, account, catch-all, configuration, and ownership tests on a separate path.
 

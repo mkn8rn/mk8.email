@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 0 ]; then
+    printf '%s\n' "Usage: host_hardening_smoke" >&2
+    exit 2
+fi
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+[ "$(systemctl get-default)" = multi-user.target ] \
+    || fail "The default boot target is not multi-user.target."
+if [ "$(systemctl is-enabled sddm.service 2>/dev/null || true)" != disabled ]; then
+    fail "The graphical login service is not disabled."
+fi
+if systemctl is-active --quiet sddm.service; then
+    fail "The graphical login service is active."
+fi
+
+for unit_name in \
+    avahi-daemon.service \
+    avahi-daemon.socket \
+    bluetooth.service \
+    cups-browsed.service \
+    cups.path \
+    cups.service \
+    cups.socket \
+    drkonqi-coredump-processor@.service; do
+    [ "$(systemctl is-enabled "$unit_name" 2>/dev/null || true)" = masked ] \
+        || fail "$unit_name is not masked."
+    if systemctl is-active --quiet "$unit_name" 2>/dev/null; then
+        fail "$unit_name is active."
+    fi
+done
+
+coredump_configuration=$(systemd-analyze cat-config systemd/coredump.conf)
+coredump_storage=$(printf '%s\n' "$coredump_configuration" \
+    | sed -n 's/^[[:space:]]*Storage=//p' | tail -n 1)
+coredump_process_size=$(printf '%s\n' "$coredump_configuration" \
+    | sed -n 's/^[[:space:]]*ProcessSizeMax=//p' | tail -n 1)
+[ "$coredump_storage" = none ] \
+    || fail "Persistent systemd core dumps are not disabled."
+[ "$coredump_process_size" = 0 ] \
+    || fail "Systemd core dump processing is not disabled."
+
+[ "$(stat -c '%U:%G %a' /etc/systemd/coredump.conf.d/90-mk8-server.conf)" = "root:root 644" ] \
+    || fail "The core dump policy has unsafe ownership or permissions."
+
+printf '%s\n' "The host attack-surface checks passed."

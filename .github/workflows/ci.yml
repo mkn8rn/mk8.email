@@ -58,6 +58,7 @@ jobs:
             deploy/tests/aide_alert_smoke \
             deploy/tests/backup_restore_smoke \
             deploy/tests/disruption_smoke \
+            deploy/tests/host_hardening_smoke \
             deploy/tests/prerequisites_smoke \
             deploy/tests/tls_smoke
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \

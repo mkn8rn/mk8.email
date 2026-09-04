@@ -97,6 +97,7 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/apt \
     etc/audit \
     etc/clamav \
+    etc/systemd/coredump.conf.d/90-mk8-server.conf \
     etc/default/aide \
     etc/default/debsums \
     etc/default/sysstat \
@@ -122,6 +123,15 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/systemd/system/clamav-daemon.service.d \
     etc/systemd/system/clamav-daemon.socket.d \
     etc/systemd/system/clamav-freshclam.service.d \
+    etc/systemd/system/avahi-daemon.service \
+    etc/systemd/system/avahi-daemon.socket \
+    etc/systemd/system/bluetooth.service \
+    etc/systemd/system/cups-browsed.service \
+    etc/systemd/system/cups.path \
+    etc/systemd/system/cups.service \
+    etc/systemd/system/cups.socket \
+    etc/systemd/system/default.target \
+    etc/systemd/system/drkonqi-coredump-processor@.service \
     etc/systemd/system/coturn.service.d \
     etc/systemd/system/dailyaidecheck.service.d \
     etc/systemd/system/dailyaidecheck.timer.d \

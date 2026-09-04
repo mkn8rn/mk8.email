@@ -43,6 +43,14 @@ tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'usr/local/sbin/verify-host-prerequisites' >/dev/null
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'etc/systemd/coredump.conf.d/90-mk8-server.conf' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'etc/systemd/system/bluetooth.service' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'etc/systemd/system/default.target' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'usr/local/lib/mk8email/tests/host_hardening_smoke' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'usr/local/share/mk8email/prerequisites/debian-13-runtime.txt' >/dev/null
 test -s "$backup_directory/debian-packages.tsv"
 test -s "$backup_directory/debian-manual-packages.txt"

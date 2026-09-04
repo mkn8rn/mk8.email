@@ -72,7 +72,7 @@ try {
     [IO.Directory]::CreateDirectory($artifactsRoot) | Out-Null
 
     Invoke-BoundedProcess dotnet @('restore', 'mk8.email.slnx', '--locked-mode', '--artifacts-path', $artifactsRoot) 600 $repositoryRoot
-    Invoke-BoundedProcess dotnet @('build', 'mk8.email.slnx', '--configuration', 'Release', '--no-restore', '--artifacts-path', $artifactsRoot, '--property:TreatWarningsAsErrors=true', '--property:ContinuousIntegrationBuild=true') 600 $repositoryRoot
+    Invoke-BoundedProcess dotnet @('build', 'mk8.email.slnx', '--configuration', 'Release', '--no-restore', '--artifacts-path', $artifactsRoot, '--property:TreatWarningsAsErrors=true', '--property:ContinuousIntegrationBuild=true', '--property:UseSharedCompilation=false') 600 $repositoryRoot
     Invoke-BoundedProcess dotnet @('test', 'mk8.email.Application.Tests\mk8.email.Application.Tests.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--logger', 'trx;LogFileName=application.trx', '--results-directory', (Join-Path $runRoot 'test-results')) 600 $repositoryRoot
     Invoke-BoundedProcess dotnet @('test', 'mk8.email.Infrastructure.Tests\mk8.email.Infrastructure.Tests.csproj', '--configuration', 'Release', '--no-build', '--artifacts-path', $artifactsRoot, '--logger', 'trx;LogFileName=infrastructure.trx', '--results-directory', (Join-Path $runRoot 'test-results')) 600 $repositoryRoot
 

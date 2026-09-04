@@ -91,6 +91,8 @@ The `s-nail` command sends changed-file reports through local Postfix to `admin@
 
 AIDE does not scan mutable mail, backup, Matrix media, health snapshot, or dashboard audit-log data.
 
+The policy also excludes boot-generated device links, private service temporary directories, logs, and mutable hardware state.
+
 The policy also excludes runtime files, live database pages, mail queues, cache indexes, service state, antivirus signatures, and active logs.
 
 Separate service, database, package, log-retention, and backup controls apply to these mutable paths.
@@ -158,6 +160,8 @@ Nginx uses `/var/log/nginx/admin-access.log` and `/var/log/nginx/admin-error.log
 
 The journal has a one-gigabyte limit and a 30-day limit. Log rotation bounds the separate mail and dashboard files.
 
+The host does not keep process core images or process crash stacks. Journal records can still identify the failed executable and signal.
+
 ## Storage checks
 
 The health check reports mail storage at 90 percent use. Investigate growth before that limit.
@@ -183,6 +187,8 @@ Each snapshot contains both PostgreSQL databases, PostgreSQL roles, Maildir data
 Each snapshot also records installed packages, manual packages, the Debian release, the kernel, APT sources, and repository keys.
 
 The configuration archive contains the package manifest and its verifier. These files support a repeatable host rebuild.
+
+The archive also contains the headless boot link, core dump policy, and masks for unused host services.
 
 The configuration archive includes the reviewed AIDE baseline. This file supports integrity checks after a complete host restore.
 
@@ -267,7 +273,9 @@ verify-host-prerequisites
 /usr/local/lib/mk8email/tests/prerequisites_smoke
 ```
 
-Do not add a compiler or Git checkout to the production host. Build signed source on the workstation or in CI.
+Do not create a source checkout or run a build on the production host. Build signed source on the workstation or in CI.
+
+The KDE package set retains Git and GNU compiler binaries as dependencies. Do not use these binaries for production deployment.
 
 Deploy only a reviewed commit through `deploy-production.ps1`. The script builds, tests, backs up, installs, validates, and rolls back on failure.
 
