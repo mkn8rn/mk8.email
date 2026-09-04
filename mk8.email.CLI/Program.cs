@@ -8,94 +8,116 @@ using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure;
 using mk8.email.Infrastructure.Environment;
 
-var isDevelopment = args.Contains("--dev", StringComparer.Ordinal)
-    || args.Contains("--development", StringComparer.Ordinal)
-    || Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") == "Development";
-var environmentConfig = EnvironmentLoader.Load(isDevelopment);
+return await RunManagementCommandAsync(args);
 
-if (args.SequenceEqual(["--healthcheck"]))
+static async Task<int> RunManagementCommandAsync(string[] arguments)
 {
-    using var healthTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-    Environment.ExitCode = await ServerHealthCheck.IsHealthyAsync(environmentConfig, healthTimeout.Token) ? 0 : 1;
-    return;
-}
+    if (!IsSupportedCommand(arguments))
+    {
+        WriteUsage();
+        return 2;
+    }
 
-if (args.SequenceEqual(["--initialize-empty-database"]))
-{
-    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
-    using var scope = host.Services.CreateScope();
-    var result = await scope.ServiceProvider
-        .GetRequiredService<IDatabaseInitializationService>()
-        .InitializeEmptyDatabaseAsync();
-    Console.WriteLine(result.Message);
-    Environment.ExitCode = result.Succeeded ? 0 : 1;
-    return;
-}
-
-if (args.Length == 3 && args[0] == "--ensure-domain")
-{
-    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
-    using var scope = host.Services.CreateScope();
-    var result = await scope.ServiceProvider
-        .GetRequiredService<IMailAdministrationService>()
-        .EnsureDomainAsync(args[1], args[2]);
-    Console.WriteLine(result.Message);
-    Environment.ExitCode = result.Succeeded ? 0 : 1;
-    return;
-}
-
-if (args.Length == 4 && args[0] == "--create-account")
-{
-    if (!Enum.TryParse<UserRole>(args[2], ignoreCase: true, out var role))
+    if (arguments.Length == 4
+        && arguments[0] == "--create-account"
+        && !Enum.TryParse<UserRole>(arguments[2], ignoreCase: true, out _))
     {
         Console.Error.WriteLine("The account role is not valid.");
-        Environment.ExitCode = 2;
-        return;
+        return 2;
     }
 
-    var passwordPath = Path.GetFullPath(args[3]);
-    if (!File.Exists(passwordPath))
+    try
     {
-        Console.Error.WriteLine("The password file does not exist.");
-        Environment.ExitCode = 2;
-        return;
+        var isDevelopment = arguments.Contains("--dev", StringComparer.Ordinal)
+            || arguments.Contains("--development", StringComparer.Ordinal)
+            || Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") == "Development";
+        var environmentConfig = EnvironmentLoader.Load(isDevelopment);
+
+        if (arguments.SequenceEqual(["--healthcheck"]))
+        {
+            using var healthTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            return await ServerHealthCheck.IsHealthyAsync(environmentConfig, healthTimeout.Token) ? 0 : 1;
+        }
+
+        if (arguments.SequenceEqual(["--initialize-empty-database"]))
+        {
+            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var scope = host.Services.CreateScope();
+            var result = await scope.ServiceProvider
+                .GetRequiredService<IDatabaseInitializationService>()
+                .InitializeEmptyDatabaseAsync();
+            Console.WriteLine(result.Message);
+            return result.Succeeded ? 0 : 1;
+        }
+
+        if (arguments.Length == 3 && arguments[0] == "--ensure-domain")
+        {
+            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var scope = host.Services.CreateScope();
+            var result = await scope.ServiceProvider
+                .GetRequiredService<IMailAdministrationService>()
+                .EnsureDomainAsync(arguments[1], arguments[2]);
+            Console.WriteLine(result.Message);
+            return result.Succeeded ? 0 : 1;
+        }
+
+        if (arguments.Length == 4 && arguments[0] == "--create-account")
+        {
+            var passwordPath = Path.GetFullPath(arguments[3]);
+            if (!File.Exists(passwordPath))
+            {
+                Console.Error.WriteLine("The password file does not exist.");
+                return 2;
+            }
+
+            var password = File.ReadAllText(passwordPath).TrimEnd('\r', '\n');
+            _ = Enum.TryParse<UserRole>(arguments[2], ignoreCase: true, out var role);
+            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var scope = host.Services.CreateScope();
+            var result = await scope.ServiceProvider
+                .GetRequiredService<IMailAdministrationService>()
+                .CreateAccountAsync(arguments[1], password, role);
+            Console.WriteLine(result.Message);
+            return result.Succeeded ? 0 : 1;
+        }
+
+        if (arguments.Length == 3 && arguments[0] == "--set-catchall")
+        {
+            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var scope = host.Services.CreateScope();
+            var result = await scope.ServiceProvider
+                .GetRequiredService<IMailAdministrationService>()
+                .SetCatchAllAsync(arguments[1], arguments[2]);
+            Console.WriteLine(result.Message);
+            return result.Succeeded ? 0 : 1;
+        }
+
+        using var protocolHost = BuildHost(arguments, environmentConfig, includeExperimentalServers: true);
+        using (var scope = protocolHost.Services.CreateScope())
+            await scope.ServiceProvider.GetRequiredService<ISeederService>().SeedAsync();
+        await protocolHost.RunAsync();
+        return 0;
     }
-
-    var password = File.ReadAllText(passwordPath).TrimEnd('\r', '\n');
-    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
-    using var scope = host.Services.CreateScope();
-    var result = await scope.ServiceProvider
-        .GetRequiredService<IMailAdministrationService>()
-        .CreateAccountAsync(args[1], password, role);
-    Console.WriteLine(result.Message);
-    Environment.ExitCode = result.Succeeded ? 0 : 1;
-    return;
+    catch (Exception exception)
+    {
+        Console.Error.WriteLine($"The management command failed: {exception.GetBaseException().Message}");
+        return 1;
+    }
 }
 
-if (args.Length == 3 && args[0] == "--set-catchall")
+static bool IsSupportedCommand(string[] arguments) =>
+    arguments.SequenceEqual(["--healthcheck"])
+    || arguments.SequenceEqual(["--initialize-empty-database"])
+    || arguments.Length == 3 && arguments[0] == "--ensure-domain"
+    || arguments.Length == 4 && arguments[0] == "--create-account"
+    || arguments.Length == 3 && arguments[0] == "--set-catchall"
+    || arguments.SequenceEqual(["--serve-experimental-protocols"]);
+
+static void WriteUsage()
 {
-    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
-    using var scope = host.Services.CreateScope();
-    var result = await scope.ServiceProvider
-        .GetRequiredService<IMailAdministrationService>()
-        .SetCatchAllAsync(args[1], args[2]);
-    Console.WriteLine(result.Message);
-    Environment.ExitCode = result.Succeeded ? 0 : 1;
-    return;
+    Console.Error.WriteLine("Use one valid management command.");
+    Console.Error.WriteLine("The experimental protocol servers require an explicit command.");
 }
-
-if (args.SequenceEqual(["--serve-experimental-protocols"]))
-{
-    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: true);
-    using (var scope = host.Services.CreateScope())
-        await scope.ServiceProvider.GetRequiredService<ISeederService>().SeedAsync();
-    await host.RunAsync();
-    return;
-}
-
-Console.Error.WriteLine(
-    "Use one management command. The experimental protocol servers require an explicit command.");
-Environment.ExitCode = 2;
 
 static IHost BuildHost(
     string[] arguments,

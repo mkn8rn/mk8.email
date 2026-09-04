@@ -51,15 +51,19 @@ jobs:
             deploy/scripts/install-host-hardening \
             deploy/scripts/install-mail-stack \
             deploy/scripts/install-native-release \
+            deploy/scripts/mk8email \
             deploy/scripts/mk8-backup \
             deploy/scripts/mk8-export-backup \
             deploy/scripts/mk8-mail-health \
+            deploy/scripts/prune-native-releases \
             deploy/scripts/verify-host-prerequisites \
             deploy/tests/aide_alert_smoke \
             deploy/tests/backup_restore_smoke \
             deploy/tests/disruption_smoke \
             deploy/tests/host_hardening_smoke \
+            deploy/tests/management_cli_smoke \
             deploy/tests/prerequisites_smoke \
+            deploy/tests/release_retention_smoke \
             deploy/tests/tls_smoke
           PYTHONPYCACHEPREFIX="$RUNNER_TEMP/mk8email-pycache" \
             python3 -m py_compile deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py

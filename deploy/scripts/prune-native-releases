@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 1 ]; then
+    printf '%s\n' "Usage: prune-native-releases [--check | PROTECTED_RELEASE]" >&2
+    exit 2
+fi
+
+release_root=/opt/mk8email/releases
+current_link=/opt/mk8email/current
+retained_release_limit=3
+check_only=false
+protected_release=
+if [ "$#" -eq 1 ]; then
+    if [ "$1" = --check ]; then
+        check_only=true
+    else
+        protected_release=$1
+    fi
+fi
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+validate_release() {
+    release_path=$1
+    case "$release_path" in
+        "$release_root"/*) ;;
+        *) fail "A release path is outside the release directory." ;;
+    esac
+
+    release_name=${release_path#"$release_root"/}
+    case "$release_name" in
+        ''|*[!0-9a-f]*|*/*) fail "A release name is not valid." ;;
+    esac
+    if [ "${#release_name}" -lt 12 ] || [ "${#release_name}" -gt 64 ]; then
+        fail "A release name length is not valid."
+    fi
+    if [ ! -d "$release_path" ] || [ -L "$release_path" ]; then
+        fail "A release path is not a physical directory."
+    fi
+    [ "$(readlink -f -- "$release_path")" = "$release_path" ] \
+        || fail "A release path does not resolve to itself."
+}
+
+[ -d "$release_root" ] || fail "The release directory does not exist."
+current_release=$(readlink -f -- "$current_link") \
+    || fail "The current release link is not valid."
+validate_release "$current_release"
+
+if [ -n "$protected_release" ]; then
+    protected_release=$(readlink -f -- "$protected_release") \
+        || fail "The protected release path is not valid."
+    validate_release "$protected_release"
+fi
+
+unsorted_list=$(mktemp /run/mk8-release-prune-unsorted.XXXXXX)
+sorted_list=$(mktemp /run/mk8-release-prune-sorted.XXXXXX)
+cleanup() {
+    rm -f -- "$unsorted_list" "$sorted_list"
+}
+trap cleanup EXIT HUP INT TERM
+
+find "$release_root" -mindepth 1 -maxdepth 1 -printf '%T@ %f\n' > "$unsorted_list"
+sort --numeric-sort --reverse "$unsorted_list" > "$sorted_list"
+
+release_count=0
+while IFS=' ' read -r _ release_name; do
+    validate_release "$release_root/$release_name"
+    release_count=$((release_count + 1))
+done < "$sorted_list"
+
+if [ "$check_only" = true ]; then
+    [ "$release_count" -le "$retained_release_limit" ] \
+        || fail "Release retention has too many releases."
+    printf '%s\n' "Release retention has $release_count immutable releases."
+    exit 0
+fi
+
+protected_count=1
+if [ -n "$protected_release" ] && [ "$protected_release" != "$current_release" ]; then
+    protected_count=2
+fi
+other_limit=$((retained_release_limit - protected_count))
+other_count=0
+
+while IFS=' ' read -r _ release_name; do
+    release_path="$release_root/$release_name"
+    if [ "$release_path" = "$current_release" ] \
+        || { [ -n "$protected_release" ] && [ "$release_path" = "$protected_release" ]; }; then
+        continue
+    fi
+    if [ "$other_count" -lt "$other_limit" ]; then
+        other_count=$((other_count + 1))
+        continue
+    fi
+    rm -rf -- "$release_path"
+done < "$sorted_list"
+
+remaining_count=0
+while IFS=' ' read -r _ release_name; do
+    if [ -d "$release_root/$release_name" ]; then
+        remaining_count=$((remaining_count + 1))
+    fi
+done < "$sorted_list"
+[ "$remaining_count" -le "$retained_release_limit" ] \
+    || fail "Release retention left too many releases."
+
+printf '%s\n' "Release retention left $remaining_count immutable releases."

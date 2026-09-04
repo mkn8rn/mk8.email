@@ -281,6 +281,17 @@ Deploy only a reviewed commit through `deploy-production.ps1`. The script builds
 
 After a successful deployment, repeat the strict health check and live smoke tests. Pull the deployment backup off the host.
 
+Each deployment retains three immutable releases. The previous release remains protected until activation and deployment tests finish.
+
+Check the release link and retention state after maintenance.
+
+```sh
+readlink -f /opt/mk8email/current
+prune-native-releases --check
+```
+
+Do not delete a release directory manually. The deployment pruner validates all names and preserves the protected rollback release.
+
 ## Incident isolation
 
 Use `deactivate-mail-stack` if mail processing itself can damage data. This command removes the ready marker and stops the mail-facing components.

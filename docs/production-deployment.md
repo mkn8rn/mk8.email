@@ -115,6 +115,12 @@ The deployment uses locked restore, a warning-free build, all tests, and fresh p
 
 The release identifier covers both application files and deployment assets. The target stores immutable releases below `/opt/mk8email/releases`.
 
+Deployment protects the prior release during pruning. It keeps the active release, the protected release, and one additional rollback release.
+
+Pruning validates every release path before deletion. It stops without deletion when the directory contains an unknown name or unsafe path.
+
+An isolated mount-namespace test verifies protection, validation, pruning order, and the three-release limit during each active deployment.
+
 An active deployment first creates a local snapshot and encrypted export. It installs and validates the new files before service activation.
 
 The activation gate checks configurations, services, PostgreSQL access, ClamAV, Valkey, the dashboard, timers, and deep health status.
@@ -137,11 +143,15 @@ Create a new backup before each schema change. Apply the change during a mainten
 
 Use the local administrator dashboard for normal domains and accounts. Use the management command only for recovery or controlled automation.
 
+The root-only `mk8email` command supplies the production configuration. It exposes only health, domain, account, and catch-all operations.
+
+Invalid commands exit before configuration loading. Managed failures return a concise error without an unhandled stack trace or core image.
+
 ```sh
-dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --healthcheck
-dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --ensure-domain mk8n.com mk8n
-dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --create-account user@mk8n.com User /root/protected-password-file
-dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --set-catchall mk8n.com mk8n@mk8n.com
+mk8email --healthcheck
+mk8email --ensure-domain mk8n.com mk8n
+mk8email --create-account user@mk8n.com User /root/protected-password-file
+mk8email --set-catchall mk8n.com mk8n@mk8n.com
 ```
 
 Never pass a password as a command argument. Place it in a root-readable file and remove that file after the command succeeds.

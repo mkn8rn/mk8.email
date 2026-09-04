@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' "Run this command as root." >&2
+    exit 2
+fi
+
+case "${1:-}:$#" in
+    --healthcheck:1|--ensure-domain:3|--create-account:4|--set-catchall:3) ;;
+    *)
+        printf '%s\n' "Use a supported production management command." >&2
+        exit 2
+        ;;
+esac
+
+export DOTNET_ENVIRONMENT=Production
+export DOTNET_EnableDiagnostics=0
+export MK8EMAIL_CONFIG_FILE=/etc/mk8email/mk8email.config.json
+
+exec /usr/bin/dotnet \
+    /opt/mk8email/current/cli/mk8.email.Application.CLI.dll "$@"
