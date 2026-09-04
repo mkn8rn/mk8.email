@@ -1,0 +1,241 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 1 ]; then
+    printf '%s\n' "Usage: certificate_deploy_smoke [DEPLOY_SCRIPT]" >&2
+    exit 2
+fi
+
+deploy_script=${1:-/usr/local/sbin/deploy-mk8-certificate}
+[ -r "$deploy_script" ] || {
+    printf '%s\n' "The certificate deployment script is not readable." >&2
+    exit 1
+}
+
+test_root=$(mktemp -d /run/mk8-certificate-smoke.XXXXXX)
+cleanup() {
+    case "$test_root" in
+        /run/mk8-certificate-smoke.*) rm -rf -- "$test_root" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+host_state_before=$(sha256sum \
+    /etc/mk8email/tls/fullchain.pem \
+    /etc/mk8email/tls/privkey.pem \
+    /var/spool/postfix/etc/mk8email/tls/fullchain.pem \
+    /var/spool/postfix/etc/mk8email/tls/privkey.pem \
+    | sha256sum | cut -d ' ' -f 1)
+
+for lineage_name in current current-archive old alternate invalid; do
+    install -d -o root -g root -m 0700 "$test_root/$lineage_name"
+done
+install -o root -g root -m 0644 /etc/mk8email/tls/fullchain.pem \
+    "$test_root/current-archive/fullchain.pem"
+install -o root -g root -m 0600 /etc/mk8email/tls/privkey.pem \
+    "$test_root/current-archive/privkey.pem"
+ln -s ../current-archive/fullchain.pem "$test_root/current/fullchain.pem"
+ln -s ../current-archive/privkey.pem "$test_root/current/privkey.pem"
+generate_certificate() {
+    output_directory=$1
+    common_name=$2
+    subject_names=$3
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 30 \
+        -subj "/CN=$common_name" \
+        -addext "subjectAltName=$subject_names" \
+        -addext "extendedKeyUsage=serverAuth" \
+        -keyout "$output_directory/privkey.pem" \
+        -out "$output_directory/fullchain.pem" >/dev/null 2>&1
+    chown root:root "$output_directory/fullchain.pem" \
+        "$output_directory/privkey.pem"
+    chmod 0644 "$output_directory/fullchain.pem"
+    chmod 0600 "$output_directory/privkey.pem"
+}
+
+valid_names="DNS:mail.mk8n.com,DNS:mta-sts.mk8n.com,DNS:autoconfig.mk8n.com"
+generate_certificate "$test_root/old" mail.mk8n.com "$valid_names"
+generate_certificate "$test_root/alternate" mail.mk8n.com "$valid_names"
+generate_certificate "$test_root/invalid" invalid.example "DNS:invalid.example"
+test_destination="$test_root/destination"
+test_spool="$test_root/spool"
+install -d -o root -g tlskeys -m 0751 "$test_destination" "$test_spool"
+install -d -o root -g root -m 0750 "$test_root/partial-mk8email"
+install -d -o root -g tlskeys -m 0771 "$test_root/partial-spool"
+install -o root -g tlskeys -m 0444 "$test_root/old/fullchain.pem" \
+    "$test_destination/fullchain.pem"
+install -o root -g tlskeys -m 0440 "$test_root/old/privkey.pem" \
+    "$test_destination/privkey.pem"
+install -o root -g tlskeys -m 0444 "$test_root/old/fullchain.pem" \
+    "$test_spool/fullchain.pem"
+install -o root -g tlskeys -m 0440 "$test_root/old/privkey.pem" \
+    "$test_spool/privkey.pem"
+install -o root -g tlskeys -m 0444 "$test_root/current/fullchain.pem" \
+    "$test_root/partial-spool/fullchain.pem"
+install -o root -g tlskeys -m 0440 "$test_root/current/privkey.pem" \
+    "$test_root/partial-spool/privkey.pem"
+
+command_stub="$test_root/command-stub"
+cat > "$command_stub" <<'EOF'
+#!/bin/sh
+set -eu
+
+case "${0##*/}" in
+    nginx|postfix|doveconf)
+        exit 0
+        ;;
+    systemctl)
+        case "${1:-}" in
+            is-active)
+                exit 0
+                ;;
+            reload)
+                smoke_root=${MK8_CERTIFICATE_SMOKE_ROOT:?}
+                if [ -f "$smoke_root/fail-reload-once" ]; then
+                    rm -f -- "$smoke_root/fail-reload-once"
+                    exit 1
+                fi
+                printf '%s\n' "${2:-missing}" >> "$smoke_root/reload.log"
+                exit 0
+                ;;
+            *)
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+EOF
+chown root:root "$command_stub"
+chmod 0700 "$command_stub"
+
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+if ! unshare --mount sh -eu -c '
+    mount --make-rprivate /
+    mount --bind "$1" /etc/mk8email/tls
+    mount --bind "$2" /var/spool/postfix/etc/mk8email/tls
+    for command_path in \
+        /usr/sbin/nginx \
+        /usr/sbin/postfix \
+        /usr/bin/doveconf \
+        /usr/bin/systemctl; do
+        mount --bind "$3" "$command_path"
+        mount -o remount,bind,exec "$command_path"
+    done
+    export MK8_CERTIFICATE_SMOKE_ROOT="$8"
+
+    if RENEWED_LINEAGE="$7" sh "$4" mail \
+        > "$8/invalid-name.log" 2>&1; then
+        printf "%s\n" "Certificate deployment accepted an invalid service name." >&2
+        exit 1
+    fi
+    grep -F "The certificate does not cover mail.mk8n.com." \
+        "$8/invalid-name.log" >/dev/null
+    cmp --silent "$8/old/fullchain.pem" /etc/mk8email/tls/fullchain.pem
+    cmp --silent "$8/old/privkey.pem" /etc/mk8email/tls/privkey.pem
+
+    : > "$8/reload.log"
+    RENEWED_LINEAGE="$5" sh "$4" mail > "$8/success.log"
+    grep -F "The mail certificate is installed and active" \
+        "$8/success.log" >/dev/null
+    cmp --silent "$5/fullchain.pem" /etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" /etc/mk8email/tls/privkey.pem
+    cmp --silent "$5/fullchain.pem" \
+        /var/spool/postfix/etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" \
+        /var/spool/postfix/etc/mk8email/tls/privkey.pem
+    test "$(stat -c "%U:%G %a" /etc/mk8email/tls/fullchain.pem)" \
+        = "root:tlskeys 444"
+    test "$(stat -c "%U:%G %a" /etc/mk8email/tls/privkey.pem)" \
+        = "root:tlskeys 440"
+    test "$(wc -l < "$8/reload.log" | tr -d " ")" -eq 3
+    grep -Fx nginx.service "$8/reload.log" >/dev/null
+    grep -Fx postfix.service "$8/reload.log" >/dev/null
+    grep -Fx dovecot.service "$8/reload.log" >/dev/null
+
+    : > "$8/fail-reload-once"
+    if RENEWED_LINEAGE="$6" sh "$4" mail \
+        > "$8/reload-failure.log" 2>&1; then
+        printf "%s\n" "Certificate deployment ignored a reload failure." >&2
+        exit 1
+    fi
+    grep -F "The prior certificate was restored." \
+        "$8/reload-failure.log" >/dev/null
+    test ! -e "$8/fail-reload-once"
+    cmp --silent "$5/fullchain.pem" /etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" /etc/mk8email/tls/privkey.pem
+    cmp --silent "$5/fullchain.pem" \
+        /var/spool/postfix/etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" \
+        /var/spool/postfix/etc/mk8email/tls/privkey.pem
+
+    if RENEWED_LINEAGE="$6" sh "$4" mail \
+        > "$8/presentation-failure.log" 2>&1; then
+        printf "%s\n" "Certificate deployment ignored a presentation mismatch." >&2
+        exit 1
+    fi
+    grep -F "A local TLS endpoint did not present the new certificate" \
+        "$8/presentation-failure.log" >/dev/null
+    grep -F "The prior certificate was restored." \
+        "$8/presentation-failure.log" >/dev/null
+    cmp --silent "$5/fullchain.pem" /etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" /etc/mk8email/tls/privkey.pem
+    cmp --silent "$5/fullchain.pem" \
+        /var/spool/postfix/etc/mk8email/tls/fullchain.pem
+    cmp --silent "$5/privkey.pem" \
+        /var/spool/postfix/etc/mk8email/tls/privkey.pem
+
+    test -z "$(find /etc/mk8email/tls \
+        /var/spool/postfix/etc/mk8email/tls \
+        -maxdepth 1 -type f -name "*.mk8-*" -print -quit)"
+
+    umount /etc/mk8email/tls
+    umount /var/spool/postfix/etc/mk8email/tls
+    mount --bind "$8/partial-mk8email" /etc/mk8email
+    mount --bind "$8/partial-spool" \
+        /var/spool/postfix/etc/mk8email/tls
+    partial_spool_before=$(sha256sum \
+        /var/spool/postfix/etc/mk8email/tls/fullchain.pem \
+        /var/spool/postfix/etc/mk8email/tls/privkey.pem \
+        | sha256sum | cut -d " " -f 1)
+    if RENEWED_LINEAGE="$5" sh "$4" mail \
+        > "$8/partial-state-failure.log" 2>&1; then
+        printf "%s\n" "Certificate deployment accepted an unsafe spool directory." >&2
+        exit 1
+    fi
+    grep -F "A certificate directory has unexpected permissions." \
+        "$8/partial-state-failure.log" >/dev/null
+    grep -F "The prior certificate was restored." \
+        "$8/partial-state-failure.log" >/dev/null
+    test ! -e /etc/mk8email/tls
+    partial_spool_after=$(sha256sum \
+        /var/spool/postfix/etc/mk8email/tls/fullchain.pem \
+        /var/spool/postfix/etc/mk8email/tls/privkey.pem \
+        | sha256sum | cut -d " " -f 1)
+    test "$partial_spool_after" = "$partial_spool_before"
+' sh "$test_destination" "$test_spool" "$command_stub" "$deploy_script" \
+    "$test_root/current" "$test_root/alternate" "$test_root/invalid" \
+    "$test_root"; then
+    printf '%s\n' "The isolated certificate deployment test failed." >&2
+    for log_file in "$test_root"/*.log; do
+        [ -f "$log_file" ] || continue
+        printf 'Log %s:\n' "${log_file##*/}" >&2
+        sed -n '1,120p' "$log_file" >&2
+    done
+    exit 1
+fi
+
+host_state_after=$(sha256sum \
+    /etc/mk8email/tls/fullchain.pem \
+    /etc/mk8email/tls/privkey.pem \
+    /var/spool/postfix/etc/mk8email/tls/fullchain.pem \
+    /var/spool/postfix/etc/mk8email/tls/privkey.pem \
+    | sha256sum | cut -d ' ' -f 1)
+[ "$host_state_after" = "$host_state_before" ] || {
+    printf '%s\n' "The certificate smoke test changed a host certificate." >&2
+    exit 1
+}
+
+printf '%s\n' "Certificate validation, activation, isolation, and rollback tests passed."
