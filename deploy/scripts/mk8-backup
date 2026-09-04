@@ -1,0 +1,184 @@
+#!/bin/sh
+set -eu
+
+backup_root=/var/backups/mk8
+timestamp=$(date --utc +%Y%m%dT%H%M%SZ)
+stage="$backup_root/.incomplete-$timestamp"
+final="$backup_root/$timestamp"
+lock=/run/lock/mk8-backup.lock
+managed_services="mk8email-admin.service postfix.service dovecot.service valkey-server.service"
+active_services=
+
+resume_services() {
+    for service_name in valkey-server.service dovecot.service postfix.service mk8email-admin.service; do
+        case " $active_services " in
+            *" $service_name "*) systemctl start "$service_name" ;;
+        esac
+    done
+    active_services=
+}
+
+cleanup() {
+    resume_services 2>/dev/null || true
+    case "$stage" in
+        /var/backups/mk8/.incomplete-*)
+            if [ -d "$stage" ]; then
+                rm -rf -- "$stage"
+            fi
+            ;;
+    esac
+}
+trap cleanup EXIT INT TERM
+
+exec 9>"$lock"
+if ! flock --exclusive --wait 30 9; then
+    printf '%s\n' "Another backup or health check is active." >&2
+    exit 1
+fi
+
+if [ -e "$stage" ] || [ -e "$final" ]; then
+    printf '%s\n' "The backup target already exists." >&2
+    exit 1
+fi
+
+umask 077
+install -d -o root -g root -m 0700 "$backup_root" "$stage"
+
+for service_name in $managed_services; do
+    if systemctl is-active --quiet "$service_name"; then
+        active_services="$active_services $service_name"
+    fi
+done
+
+systemctl stop mk8email-admin.service postfix.service dovecot.service 2>/dev/null || true
+for service_name in mk8email-admin.service postfix.service dovecot.service; do
+    if systemctl is-active --quiet "$service_name"; then
+        printf '%s\n' "$service_name did not stop for the backup." >&2
+        exit 1
+    fi
+done
+if systemctl is-active --quiet valkey-server.service; then
+    valkey-cli -h 127.0.0.1 -p 6379 save >/dev/null
+    systemctl stop valkey-server.service
+fi
+
+runuser -u postgres -- pg_dump --format=custom --compress=9 mk8email > "$stage/mk8email.dump"
+runuser -u postgres -- pg_dumpall --globals-only > "$stage/postgresql-globals.sql"
+readlink -f /opt/mk8email/current > "$stage/mk8email-release.txt"
+dpkg-query --show --showformat='${binary:Package}\t${Version}\n' | sort > "$stage/debian-packages.tsv"
+apt-mark showmanual | sort > "$stage/debian-manual-packages.txt"
+cp -p /etc/os-release "$stage/os-release"
+uname -a > "$stage/kernel.txt"
+
+previous=$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%f\n' | sort | tail -n 1)
+
+install -d -m 0700 "$stage/mail"
+if [ -n "$previous" ] && [ -d "$backup_root/$previous/mail" ]; then
+    rsync --archive --delete --numeric-ids --link-dest="$backup_root/$previous/mail" /var/vmail/ "$stage/mail/"
+else
+    rsync --archive --delete --numeric-ids /var/vmail/ "$stage/mail/"
+fi
+
+install -d -m 0700 "$stage/postfix-spool"
+rsync --archive --delete --numeric-ids \
+    --exclude=pid/master.pid --exclude=private/ --exclude=public/ \
+    /var/spool/postfix/ "$stage/postfix-spool/"
+
+install -d -m 0700 "$stage/valkey"
+rsync --archive --delete --numeric-ids /var/lib/valkey/ "$stage/valkey/"
+
+resume_services
+
+tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
+    --exclude=etc/mk8email/bootstrap-secrets \
+    etc/aide \
+    var/lib/aide/aide.db \
+    etc/apt \
+    etc/audit \
+    etc/clamav \
+    etc/systemd/coredump.conf.d/90-mk8-server.conf \
+    etc/default/aide \
+    etc/default/debsums \
+    etc/default/sysstat \
+    etc/dovecot \
+    etc/fail2ban \
+    etc/logrotate.d/mk8-mail \
+    etc/mk8email \
+    etc/modprobe.d/90-mk8-server.conf \
+    etc/NetworkManager \
+    etc/nginx \
+    etc/nftables.conf \
+    etc/nftables.d \
+    etc/postfix \
+    etc/postgresql \
+    etc/profile.d/90-mk8-umask.sh \
+    etc/rspamd \
+    etc/security/pwquality.conf.d/90-mk8-server.conf \
+    etc/ssh/sshd_config \
+    etc/ssh/sshd_config.d \
+    etc/sysctl.d/90-mk8-server.conf \
+    etc/systemd/journald.conf.d/90-mk8-server.conf \
+    etc/systemd/logind.conf.d/90-mk8-server.conf \
+    etc/systemd/system/clamav-daemon.service.d \
+    etc/systemd/system/clamav-daemon.socket.d \
+    etc/systemd/system/clamav-freshclam.service.d \
+    etc/systemd/system/avahi-daemon.service \
+    etc/systemd/system/avahi-daemon.socket \
+    etc/systemd/system/bluetooth.service \
+    etc/systemd/system/cups-browsed.service \
+    etc/systemd/system/cups.path \
+    etc/systemd/system/cups.service \
+    etc/systemd/system/cups.socket \
+    etc/systemd/system/default.target \
+    etc/systemd/system/drkonqi-coredump-processor@.service \
+    etc/systemd/system/dailyaidecheck.service.d \
+    etc/systemd/system/dailyaidecheck.timer.d \
+    etc/systemd/system/dovecot.service.d \
+    etc/systemd/system/mk8-backup.service \
+    etc/systemd/system/mk8-backup.timer \
+    etc/systemd/system/mk8-mail-health.service \
+    etc/systemd/system/mk8-mail-health.timer \
+    etc/systemd/system/mk8email-admin.service \
+    etc/systemd/system/mk8email.service \
+    etc/systemd/system/nginx.service.d \
+    etc/systemd/system/postfix@.service.d \
+    etc/systemd/system/postgresql@.service.d \
+    etc/systemd/system/rspamd.service.d \
+    etc/systemd/system/valkey-server.service.d \
+    etc/systemd/system/var-vmail.mount \
+    etc/tmpfiles.d/mk8-mail.conf \
+    etc/tmpfiles.d/mk8-postgresql.conf \
+    etc/valkey \
+    var/lib/aide/aide.db \
+    var/lib/mk8email-admin \
+    var/log/mk8email-admin \
+    var/www/autoconfig \
+    var/www/mta-sts \
+    usr/local/sbin/activate-mail-stack \
+    usr/local/sbin/configure-apt-sources \
+    usr/local/sbin/configure-mail-database-access \
+    usr/local/sbin/deactivate-mail-stack \
+    usr/local/sbin/deploy-admin-certificate \
+    usr/local/sbin/deploy-mk8-certificate \
+    usr/local/sbin/install-mail-stack \
+    usr/local/sbin/install-native-release \
+    usr/local/sbin/mk8email \
+    usr/local/sbin/mk8-backup \
+    usr/local/sbin/mk8-export-backup \
+    usr/local/sbin/mk8-mail-health \
+    usr/local/sbin/prune-native-releases \
+    usr/local/sbin/verify-host-prerequisites \
+    usr/local/lib/mk8email/tests \
+    usr/local/share/mk8email/prerequisites
+
+(cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum) > "$stage/SHA256SUMS"
+mv "$stage" "$final"
+stage=
+
+if [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
+    /usr/local/sbin/mk8-export-backup "$timestamp" >/dev/null
+fi
+
+find /var/backups/mk8 -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -mtime +14 -exec rm -rf -- {} +
+
+printf '%s\n' "$final"
