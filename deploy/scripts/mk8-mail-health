@@ -177,6 +177,8 @@ if [ "$deep" = true ]; then
     nginx -t >/dev/null 2>&1 || record_error "The nginx configuration is not valid."
     nft -c -f /etc/nftables.conf >/dev/null 2>&1 \
         || record_error "The nftables configuration is not valid."
+    /usr/local/lib/mk8email/tests/host_hardening_smoke >/dev/null 2>&1 \
+        || record_error "The host attack-surface controls are not valid."
     runuser -u postfix -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM addresses LIMIT 1' >/dev/null 2>&1 \
         || record_error "Postfix cannot read its database maps."
     runuser -u dovecot -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM users LIMIT 1' >/dev/null 2>&1 \
