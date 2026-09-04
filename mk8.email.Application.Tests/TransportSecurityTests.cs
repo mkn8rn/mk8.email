@@ -369,6 +369,45 @@ public sealed class TransportSecurityTests
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
     }
 
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapPrimaryMailboxUsesStandardInboxName()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a3 LIST \"\" \"*\"");
+        var listLines = new List<string>();
+        string line;
+        do
+        {
+            line = await connection.ReadLineAsync();
+            listLines.Add(line);
+        }
+        while (!line.StartsWith("a3 ", StringComparison.Ordinal));
+
+        Assert.IsTrue(listLines.Any(value => value.Contains("\"INBOX\"", StringComparison.Ordinal)));
+
+        await connection.WriteLineAsync("a4 SELECT INBOX");
+        do
+        {
+            line = await connection.ReadLineAsync();
+        }
+        while (!line.StartsWith("a4 ", StringComparison.Ordinal));
+
+        Assert.IsTrue(line.StartsWith("a4 OK [READ-WRITE]", StringComparison.Ordinal));
+    }
+
     private EnvironmentConfig CreateEnvironment(
         int? smtpPort = null,
         int? submissionPort = null,
@@ -535,12 +574,19 @@ public sealed class TransportSecurityTests
                     IsActive = true,
                     Company = company,
                 };
-                database.Inboxes.Add(new InboxDB
+                var inbox = new InboxDB
                 {
                     Id = Guid.CreateVersion7(),
                     Name = "user",
                     Address = address,
                     Owner = user,
+                };
+                database.Inboxes.Add(inbox);
+                database.Folders.Add(new FolderDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Name = DefaultFolders.Inbox,
+                    Inbox = inbox,
                 });
                 database.SaveChanges();
             }

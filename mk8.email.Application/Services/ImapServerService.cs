@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
 using mk8.email.Infrastructure.Models;
@@ -724,9 +725,9 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = returnStatus ? scopeFactory.CreateScope() : null;
         var db = returnStatus ? scope!.ServiceProvider.GetRequiredService<EmailDbContext>() : null;
 
-        foreach (var (inboxName, domain, folderName) in folders)
+        foreach (var (inboxName, domain, folderName, isPrimary) in folders)
         {
-            var fullName = FormatMailboxName(inboxName, domain, folderName);
+            var fullName = FormatMailboxName(inboxName, domain, folderName, isPrimary);
             if (MatchesPattern(fullName, reference, pattern))
             {
                 var attrs = GetFolderAttributes(folderName);
@@ -753,9 +754,9 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         var folders = await GetUserFoldersAsync(session.UserId, ct, subscribedOnly: true);
 
-        foreach (var (inboxName, domain, folderName) in folders)
+        foreach (var (inboxName, domain, folderName, isPrimary) in folders)
         {
-            var fullName = FormatMailboxName(inboxName, domain, folderName);
+            var fullName = FormatMailboxName(inboxName, domain, folderName, isPrimary);
             if (MatchesPattern(fullName, reference, pattern))
             {
                 var attrs = GetFolderAttributes(folderName);
@@ -1717,7 +1718,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     // ?? Helpers ??
 
-    private async Task<List<(string InboxName, string Domain, string FolderName)>> GetUserFoldersAsync(
+    private async Task<List<(string InboxName, string Domain, string FolderName, bool IsPrimary)>> GetUserFoldersAsync(
         Guid userId, CancellationToken ct, bool subscribedOnly = false)
     {
         using var scope = scopeFactory.CreateScope();
@@ -1730,15 +1731,55 @@ ILogger<ImapServerService> logger) : BackgroundService
         if (subscribedOnly)
             query = query.Where(f => f.IsSubscribed);
 
-        return await query
-            .Select(f => new { f.Inbox.Name, f.Inbox.Address.Domain, FolderName = f.Name })
-            .OrderBy(f => f.Domain).ThenBy(f => f.Name).ThenBy(f => f.FolderName)
-            .Select(f => ValueTuple.Create(f.Name, f.Domain, f.FolderName))
+        var folders = await query
+            .Select(f => new
+            {
+                InboxName = f.Inbox.Name,
+                f.Inbox.Address.Domain,
+                FolderName = f.Name,
+                OwnerUsername = f.Inbox.Owner.Username,
+            })
+            .OrderBy(f => f.Domain).ThenBy(f => f.InboxName).ThenBy(f => f.FolderName)
             .ToListAsync(ct);
+
+        return folders
+            .Select(folder => ValueTuple.Create(
+                folder.InboxName,
+                folder.Domain,
+                folder.FolderName,
+                string.Equals(
+                    folder.OwnerUsername,
+                    $"{folder.InboxName}@{folder.Domain}",
+                    StringComparison.OrdinalIgnoreCase)))
+            .ToList();
     }
 
     private static async Task<FolderDB?> ResolveFolderAsync(EmailDbContext db, Guid userId, string mailboxName, CancellationToken ct)
     {
+        if (!mailboxName.Contains('/'))
+        {
+            var username = await db.Users
+                .AsNoTracking()
+                .Where(user => user.Id == userId)
+                .Select(user => user.Username)
+                .SingleOrDefaultAsync(ct);
+            if (username is null)
+                return null;
+
+            var separator = username.LastIndexOf('@');
+            if (separator <= 0 || separator == username.Length - 1)
+                return null;
+
+            var primaryLocalPart = username[..separator];
+            var primaryDomain = username[(separator + 1)..];
+            var primaryFolderName = NormalizePrimaryFolderName(mailboxName);
+            return await db.Folders
+                .FirstOrDefaultAsync(f => f.Inbox.Name == primaryLocalPart
+                                       && f.Inbox.Address.Domain == primaryDomain
+                                       && f.Inbox.OwnerId == userId
+                                       && f.Name == primaryFolderName, ct);
+        }
+
         var parts = mailboxName.Split('/', 3);
         if (parts.Length < 3)
             return null;
@@ -1791,8 +1832,28 @@ ILogger<ImapServerService> logger) : BackgroundService
         await db.SaveChangesAsync(ct);
     }
 
-    private static string FormatMailboxName(string inboxName, string domain, string folderName) =>
-        $"{inboxName}/{domain}/{folderName}";
+    private static string FormatMailboxName(
+        string inboxName,
+        string domain,
+        string folderName,
+        bool isPrimary)
+    {
+        if (!isPrimary)
+            return $"{inboxName}/{domain}/{folderName}";
+
+        return string.Equals(folderName, DefaultFolders.Inbox, StringComparison.OrdinalIgnoreCase)
+            ? "INBOX"
+            : folderName;
+    }
+
+    private static string NormalizePrimaryFolderName(string folderName)
+    {
+        if (string.Equals(folderName, "INBOX", StringComparison.OrdinalIgnoreCase))
+            return DefaultFolders.Inbox;
+
+        return DefaultFolders.All.FirstOrDefault(
+            name => string.Equals(name, folderName, StringComparison.OrdinalIgnoreCase)) ?? folderName;
+    }
 
     private static string FormatUidSet(List<int> uids) =>
         uids.Count > 0 ? string.Join(',', uids) : "0";
