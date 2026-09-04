@@ -4,27 +4,39 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0-noble AS build
 WORKDIR /src
 
 COPY . .
-RUN dotnet restore mk8.email.CLI/mk8.email.Application.CLI.csproj --locked-mode
+RUN dotnet restore mk8.email.slnx --locked-mode
 RUN dotnet publish mk8.email.CLI/mk8.email.Application.CLI.csproj \
     --configuration Release \
     --no-restore \
-    --output /app/publish \
+    --output /app/cli \
+    --property:ContinuousIntegrationBuild=true \
+    --property:UseAppHost=false
+RUN dotnet publish mk8.email.PublicAPI/mk8.email.PublicAPI.csproj \
+    --configuration Release \
+    --no-restore \
+    --output /app/admin \
     --property:ContinuousIntegrationBuild=true \
     --property:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/runtime:10.0.11-noble AS final
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.11-noble AS final
 WORKDIR /app
 
-ENV DOTNET_EnableDiagnostics=0 \
+ENV ASPNETCORE_URLS=http://0.0.0.0:8080 \
+    DOTNET_EnableDiagnostics=0 \
     MK8EMAIL_CONFIG_FILE=/run/secrets/mk8email_config
 
-COPY --from=build --chown=app:app /app/publish .
+RUN install -d -o app -g app -m 0700 \
+        /var/lib/mk8email-admin/data-protection \
+        /var/log/mk8email-admin
+
+COPY --from=build --chown=root:root /app/cli ./cli
+COPY --from=build --chown=root:root /app/admin ./admin
 
 USER app
 
-EXPOSE 2525 2587 2465 2993
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=12s --start-period=30s --retries=3 \
-    CMD ["dotnet", "mk8.email.Application.CLI.dll", "--healthcheck"]
+    CMD ["dotnet", "/app/cli/mk8.email.Application.CLI.dll", "--healthcheck"]
 
-ENTRYPOINT ["dotnet", "mk8.email.Application.CLI.dll"]
+ENTRYPOINT ["dotnet", "/app/admin/mk8.email.PublicAPI.dll"]

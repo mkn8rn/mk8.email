@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+test "$#" -ge 1
+
+test_root=/usr/local/lib/mk8email/tests
+
+case "$1" in
+    scanner-down)
+        test "$#" -eq 1
+        restore_scanner() {
+            systemctl start clamav-daemon.socket clamav-daemon.service
+        }
+
+        trap restore_scanner EXIT HUP INT TERM
+        systemctl stop clamav-daemon.service clamav-daemon.socket
+        ! systemctl is-active --quiet clamav-daemon.service
+        "$test_root/mail_smoke.py" scanner-down
+        ;;
+    queue-recovery)
+        test "$#" -eq 2
+        admin_password_file=$2
+        test -s "$admin_password_file"
+        restore_delivery() {
+            systemctl start dovecot.service
+            postqueue -f
+        }
+
+        trap restore_delivery EXIT HUP INT TERM
+        test "$(postqueue -j | wc -l)" -eq 0
+        systemctl stop dovecot.service
+        marker=$("$test_root/mail_smoke.py" queue-send)
+        test "$(postqueue -j | wc -l)" -eq 1
+        systemctl start dovecot.service
+        postqueue -f
+        "$test_root/mail_smoke.py" queue-receive \
+            --marker "$marker" --admin-password-file "$admin_password_file"
+        test "$(postqueue -j | wc -l)" -eq 0
+        ;;
+    *)
+        echo "Usage: disruption_smoke scanner-down | queue-recovery ADMIN_PASSWORD_FILE" >&2
+        exit 64
+        ;;
+esac

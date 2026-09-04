@@ -1,0 +1,26 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Status";
+}
+
+<h1>Mail service status</h1>
+<div class="cards">
+    <section class="card">
+        <span class="metric">@Model.DomainCount</span>
+        <span>Active domains</span>
+    </section>
+    <section class="card">
+        <span class="metric">@Model.ActiveAccountCount</span>
+        <span>Active accounts</span>
+    </section>
+    <section class="card">
+        <span class="metric">@Model.CatchAllCount</span>
+        <span>Catch-all routes</span>
+    </section>
+</div>
+<section class="panel">
+    <h2>Control boundary</h2>
+    <p>The public mail services use Postfix, Dovecot, Rspamd, and ClamAV.</p>
+    <p>This dashboard controls domains and accounts. It does not render message content.</p>
+</section>

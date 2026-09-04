@@ -1,160 +1,171 @@
 # Production deployment
 
-## Deployment boundary
+## Production design
 
-Do not change the `mk8n.com` MX record yet. Several conditions still block live mail delivery.
+The production mail path uses Postfix, Dovecot, Rspamd, ClamAV, Valkey, PostgreSQL, nginx, and the .NET 10 administrator application.
 
-The Internet path from the target blocks outbound TCP port 25. The public address has no usable PTR result. The application database has no schema.
+Postscreen rejects invalid SMTP clients before they reach Postfix. Postfix then applies address, relay, rate, TLS, and sender-ownership rules.
 
-The repository has no Entity Framework migration. Project rules require an explicit user instruction before migration generation.
+Rspamd checks accepted message content through the Postfix Milter interface. ClamAV scans MIME parts, archives, documents, programs, macros, and suspicious content.
 
-Inbound SPF, DKIM, and DMARC evaluation is not implemented. Durable outbound retry and bounce queues are not implemented.
+Postfix delivers local mail through Dovecot LMTP. Dovecot stores Maildir data below `/var/vmail` and provides encrypted IMAPS access.
 
-Spam classification and malware scanning are not implemented. Do not direct public MX traffic to this service until these controls exist.
+Authenticated submission uses TCP port 587 with STARTTLS or port 465 with implicit TLS. Both paths reject a sender that the account does not own.
 
-The API has no controllers or administrative endpoints. The service cannot provision a domain or inbox through a supported interface.
+PostgreSQL stores domains, accounts, password hashes, quotas, and alias routes. The Razor Pages application is the supported account management path.
 
-## Target host
+The custom .NET SMTP and IMAP services are experimental. Production systemd units do not start those services.
 
-The prepared host uses Debian 13 at `192.168.89.251`. Its current public IPv4 address is `176.61.153.171`.
+## Durable message handling
 
-Nftables drops unmatched input. SSH permits public-key access from `192.168.89.0/24` only. PostgreSQL listens on loopback addresses only.
+Postfix keeps each accepted raw message in its queue. An SMTP success reply means that Postfix has accepted queue responsibility.
 
-The public service rules permit IPv4 only. Do not publish an AAAA record before you add and test a complete IPv6 path.
+Postfix keeps a message when local delivery or remote delivery has a temporary failure. It retries with bounded backoff for five days.
 
-Nginx owns TCP ports 80 and 443. The mail service will own TCP ports 25, 465, 587, and 993.
+Postfix creates a delivery status notification when permanent delivery fails. It also sends a delay warning after four hours.
 
-The host has .NET 10.0.11 and PostgreSQL 17. PostgreSQL uses SCRAM authentication and page checksums.
+Rspamd and ClamAV inspect content before final acceptance. A scanner failure causes a temporary SMTP failure, so the sending server must retry.
 
-The mail service is installed from commit `caabd4e169a1`. A systemd condition keeps it stopped until the database schema is approved.
+Malware and prohibited encrypted content cause a permanent SMTP rejection. The server does not put rejected content in a user mailbox.
 
-## Host hardening assets
+## Security boundary
 
-The versioned hardening files reproduce the target security settings. Install their required Debian packages before you run the installer.
+No connected server can provide a mathematical guarantee against every future defect. This design reduces damage from unknown mail content through independent controls.
 
-```sh
-apt-get install apparmor apparmor-utils auditd fail2ban nftables unattended-upgrades needrestart debsums aide aide-common acct sysstat libpam-pwquality libpam-tmpdir
-deploy/scripts/install-host-hardening /path/to/mk8.email
-reboot
-```
+The server never runs message content or attachments. Mail files use the unprivileged `vmail` identity, which has no login shell.
 
-The installer permits SSH only from `192.168.89.0/24`. Keep a working console or tested key session during this operation.
+The `/var/vmail` mount uses `nosuid`, `nodev`, and `noexec`. These flags prevent direct execution and remove device and set-user-ID behavior.
 
-The nftables asset replaces the complete host ruleset. Review it before use on a host that runs another network service.
+ClamAV runs with AppArmor enforcement and a restricted systemd unit. Dovecot, Rspamd, Valkey, and the administrator application use separate sandboxes.
 
-Configure NetworkManager with the router and two independent public resolvers. The prepared host uses `192.168.89.1`, `1.1.1.1`, and `9.9.9.9`.
+The administrator application can connect only to loopback PostgreSQL. Its unit blocks all other network destinations and removes all Linux capabilities.
 
-```sh
-nmcli connection modify 'Wired connection 1' ipv4.ignore-auto-dns yes ipv4.dns '192.168.89.1,1.1.1.1,9.9.9.9' ipv6.ignore-auto-dns yes
-nmcli device reapply enp0s31f6
-```
+Nginx binds the administrator site only to `192.168.89.251:8443`. Nftables also permits that port only from `192.168.89.0/24`.
 
-Initialize AIDE after the final trusted configuration is present.
+Do not add an administrator DNS record. Never forward TCP port 8443 through RouterOS.
 
-```sh
-aideinit --yes --force
-```
+Nftables drops unmatched input. SSH accepts keys only and permits access from the local network only.
 
-The measured Lynis hardening index is 82. The scan had no warning-level findings after the applied corrections.
+PostgreSQL, Valkey, Rspamd, ClamAV, and the .NET backend listen only on loopback or local Unix sockets.
 
-Review .NET and Synapse updates each week. Apply those third-party updates during a tested maintenance window.
+Fail2ban protects SSH, Postfix, Dovecot, and nginx. Unattended security updates install automatically, with a controlled reboot window.
 
-## Protected values
+## Prepared target
 
-The workstation stores host and service values below `D:\keys\shitbox1`. Windows permits access only to the current user and `SYSTEM`.
+The target uses Debian 13 at `192.168.89.251`. Its measured public IPv4 address is `176.61.153.171`.
 
-The target stores mail values below `/etc/mk8email`. Files with private values use the `root:mk8email` owner and group.
+The host runs .NET runtime 10.0.11 and PostgreSQL 17. The production host does not contain a .NET SDK.
 
-Never add a private value to Git. Never copy a private value into a command argument.
+The host has no global IPv6 address. Do not publish an AAAA record before a complete IPv6 path passes tests.
 
-## Native release
+The database contains active `admin@mk8n.com` and `mk8n@mk8n.com` accounts. The `admin` account has the `SuperAdmin` role.
 
-Build from a clean worktree. Use locked NuGet restore before tests.
+The `mk8n.com` catch-all route sends undefined local addresses to `mk8n@mk8n.com`. An exact address always has priority.
+
+The workstation stores account credentials below `D:\keys\shitbox1\services`. Windows permits access only to the current user and `SYSTEM`.
+
+## Continuous integration and delivery
+
+GitHub Actions restores locked NuGet dependencies on Ubuntu 24.04. It treats compiler warnings as errors and runs both test projects.
+
+The workflow also checks shell scripts and Python test programs. It publishes the management command and administrator application into a checksummed artifact.
+
+Dependabot checks NuGet packages and GitHub Actions each week. Merge an update only after CI and a local production test pass.
+
+The production deployment has an operator gate because a public mail server must not deploy an unreviewed commit automatically.
+
+Run this command from the repository root on the authorized workstation.
 
 ```powershell
-dotnet restore mk8.email.slnx --locked-mode
-dotnet test mk8.email.slnx --configuration Release --no-restore
-dotnet publish mk8.email.CLI\mk8.email.Application.CLI.csproj --configuration Release --no-restore --output publish
+pwsh -NoProfile -File deploy\scripts\deploy-production.ps1 -Activate
 ```
 
-Create a release archive from the publish directory. Transfer the archive through the dedicated SSH key.
+The deployment uses locked restore, a warning-free build, all tests, and fresh publish output. It stores all temporary files below `D:\temp\mk8.email`.
 
-Run the installer with an immutable Git commit identifier.
+The release identifier covers both application files and deployment assets. The target stores immutable releases below `/opt/mk8email/releases`.
+
+An active deployment first creates a local snapshot and encrypted export. It installs and validates the new files before service activation.
+
+The activation gate checks configurations, services, PostgreSQL access, ClamAV, Valkey, the dashboard, and deep health status.
+
+If installation fails, the deployment restores the prior configuration and release link. It then starts the prior mail stack.
+
+## Database lifecycle
+
+The current initial schema was created on the empty target with the application initialization command. Project policy prohibited migration generation without explicit approval.
+
+Future schema changes require an explicit Entity Framework migration. Review its SQL and restore test before production use.
+
+Create a new backup before each schema change. Apply the change during a maintenance window with a tested rollback point.
+
+Use the local administrator dashboard for normal domains and accounts. Use the management command only for recovery or controlled automation.
 
 ```sh
-install-native-release /root/mk8email-release.tar.gz caabd4e169a1
+dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --healthcheck
+dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --ensure-domain mk8n.com mk8n
+dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --create-account user@mk8n.com User /root/protected-password-file
+dotnet /opt/mk8email/current/cli/mk8.email.Application.CLI.dll --set-catchall mk8n.com mk8n@mk8n.com
 ```
 
-Install `deploy/native/mk8email.config.json` as `/etc/mk8email/mk8email.config.json`. Set ownership to `root:mk8email` and mode `0640`.
+Never pass a password as a command argument. Place it in a root-readable file and remove that file after the command succeeds.
 
-Install `deploy/systemd/mk8email.service` as `/etc/systemd/system/mk8email.service`. Reload systemd after installation.
+## Trusted certificate
 
-The unit requires `/etc/mk8email/schema-ready`. Do not create this file before the first approved database migration exists.
+The installed certificate is temporary and self-signed. Keep public mail closed until a trusted certificate is active.
 
-## Database initialization
+Apply only the RouterOS web preflight rules first. Import `deploy/dns/mk8n.com-preflight.zone` after you verify the public address.
 
-The hardening installer installs the PostgreSQL tuning and access-control files. It keeps PostgreSQL on loopback addresses.
-
-Initialize the two restricted roles and databases from protected password files.
-
-```sh
-deploy/scripts/initialize-postgresql /etc/mk8email/secrets/database_password /etc/matrix-synapse/secrets/database_password
-```
-
-This script enables PostgreSQL page checksums before it creates data. It does not create the application schema.
-
-Generate an Entity Framework migration only after explicit approval. Review its SQL before application.
-
-Create a database backup before each schema change. Apply the migration during a measured maintenance window.
-
-Create `/etc/mk8email/schema-ready` only after the schema validation passes. Start the service after that marker exists.
-
-The first start creates only the `postmaster@mk8n.com` user row. Its password is in the protected workstation directory.
-
-Implement and test an authenticated administration path before activation. Then provision the domain and all required inboxes through that path.
-
-Create the `postmaster@mk8n.com`, `dmarc@mk8n.com`, and `tlsrpt@mk8n.com` inboxes before the DNS cutover.
-
-## TLS certificate
-
-The installed certificate is temporary and self-signed. Do not use it for public mail.
-
-Apply the RouterOS preflight rules first. Import `deploy/dns/mk8n.com-preflight.zone` after external HTTP and HTTPS checks pass.
-
-The preflight zone adds only three address records. It does not change mail routing or sender policy.
-
-Issue the mail certificate after the three `mk8n.com` names resolve to this host.
+Issue the mail certificate after all three names reach this nginx service from the Internet.
 
 ```sh
 certbot certonly --webroot --webroot-path /var/www/letsencrypt --cert-name mk8-mail --deploy-hook '/usr/local/sbin/deploy-mk8-certificate mail' -d mail.mk8n.com -d mta-sts.mk8n.com -d autoconfig.mk8n.com
 ```
 
-Run the deployment hook once after the first issuance. Confirm certificate names and expiry before service activation.
-
-Matrix uses a separate certificate and deployment hook. This separation keeps the current Matrix DNS record on the source during preparation.
-
-## Backups
-
-The `mk8-backup.timer` creates a local backup each day. It keeps 14 days of database, configuration, and Matrix media snapshots.
-
-Local backups do not protect against host loss. Copy each completed snapshot to a different system.
-
-Each snapshot contains database credentials, signing keys, and TLS keys. Encrypt off-host copies and restrict their access.
-
-Test restoration each month. Keep the test separate from the live databases.
-
-## Activation tests
-
-Run `systemctl status mk8email` after activation. Run the built-in health check with the production configuration.
+Run the deployment hook after the first issue. Check the certificate names and expiration before full activation.
 
 ```sh
-sudo -u mk8email env MK8EMAIL_CONFIG_FILE=/etc/mk8email/mk8email.config.json /usr/bin/dotnet /opt/mk8email/current/mk8.email.Application.CLI.dll --healthcheck
+/usr/local/sbin/deploy-mk8-certificate mail
+certbot renew --dry-run
 ```
 
-Test SMTP STARTTLS on ports 25 and 587. Test implicit TLS on ports 465 and 993.
+## Public activation gates
 
-Send mail only between controlled test accounts first. Confirm sender authorization and DKIM validation.
+Do not import the final MX records until every gate in this section passes.
 
-Test delivery to three independent providers. Confirm that each provider accepts the message and validates SPF, DKIM, and DMARC.
+RouterOS must forward only the documented public ports. The Cloudflare records must use DNS-only mode.
 
-Keep DMARC in monitoring mode during initial tests. Change MTA-STS from `testing` only after stable mail-flow evidence exists.
+The ISP must permit inbound and outbound TCP port 25. The target currently cannot connect to remote TCP port 25.
+
+The ISP must set PTR `176.61.153.171` to `mail.mk8n.com`. The forward `mail.mk8n.com` record must return the same address.
+
+The trusted certificate must cover `mail.mk8n.com`, `mta-sts.mk8n.com`, and `autoconfig.mk8n.com`.
+
+External tests must pass for SMTP, submission, IMAPS, DKIM, SPF, DMARC, MTA-STS, and TLS reporting.
+
+The final MTA-STS policy uses `mode: enforce`. Publish it only after the HTTPS endpoint and certificate pass external validation.
+
+Use the [RouterOS and DNS guide](routeros-and-dns.md) for the exact cutover order. Keep an encrypted off-host backup before the change.
+
+## Measured local evidence
+
+The release build completed with zero warnings and zero errors. Thirty-eight application and infrastructure tests passed.
+
+Live tests passed for exact delivery, catch-all delivery, authenticated submission, IMAPS retrieval, DKIM signing, and relay denial.
+
+Live tests also passed for sender mismatch denial and TLS version limits. TLS 1.0 failed, while TLS 1.2 and TLS 1.3 succeeded.
+
+EICAR, password-protected EICAR archives, and GTUBE content received permanent rejections. A disabled scanner caused a temporary, fail-closed rejection.
+
+A forced Dovecot outage kept the accepted message in the Postfix queue. Delivery completed after Dovecot returned, and the queue became empty.
+
+The dashboard passed authentication, authorization, antiforgery, secure-cookie, account, and network tests. The backend port was not reachable from the LAN.
+
+A cold reboot returned all required units without failed services. Deep health checks and all live mail tests passed after that reboot.
+
+The encrypted backup passed checksum, decryption, database restore, account, catch-all, configuration, and ownership tests on a separate path.
+
+## Routine operations
+
+Use [the mail operations guide](mail-operations.md) for account work, health checks, logs, backups, updates, incidents, and restores.
+
+Keep Matrix Synapse disabled until its source database, media, configuration, and original signing key pass migration validation.

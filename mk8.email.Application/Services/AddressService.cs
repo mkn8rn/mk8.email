@@ -35,7 +35,7 @@ public class AddressService(EmailDbContext db) : IAddressService
 
         var companyLimits = await db.CompanyLimits.AsNoTracking()
             .FirstOrDefaultAsync(l => l.CompanyId == request.CompanyId);
-        var globalLimits = await db.GlobalLimits.AsNoTracking().FirstAsync();
+        var globalLimits = await db.GlobalLimits.AsNoTracking().SingleAsync();
 
         var maxDomains = companyLimits?.MaxDomains ?? globalLimits.DefaultMaxDomainsPerCompany;
         if (maxDomains > 0 &&

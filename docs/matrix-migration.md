@@ -14,6 +14,20 @@ Do not create that marker before the signing key, database, media store, and pri
 
 The target does not have source-server access. Migration cannot continue until an operator supplies access or a complete verified source bundle.
 
+## Prepared target state
+
+The `synapse` PostgreSQL role can connect only to its local database through SCRAM authentication. PostgreSQL listens on loopback addresses only.
+
+The target Synapse database has no application tables. This empty state is required before the source restore.
+
+The target configuration selects PostgreSQL and a loopback HTTP listener on TCP port 8008. Nginx is the only planned public HTTP path.
+
+Public registration and URL previews stay disabled. Coturn is active with a protected shared secret and a restricted relay range.
+
+The generated new-install signing key is parked with an `UNUSED-new-install` name. It must never replace the source signing key.
+
+Synapse stays disabled and inactive. The migration marker is absent, and the loopback port 8008 is closed.
+
 ## Source data
 
 Preserve the complete Synapse configuration directory. Preserve each referenced application-service file and module configuration.
@@ -103,5 +117,9 @@ Confirm login, room history, media, sending, receiving, and federation with cont
 Change `matrix.mkn8rn.com` DNS only after local validation passes. Keep the DNS record in DNS-only mode.
 
 Do not run the old and new servers concurrently with the same identity. Concurrent writers can split database and federation state.
+
+Run `mk8-backup` after final validation and before public DNS changes. Pull its encrypted export to the workstation.
+
+Keep the old server stopped and unchanged until the target completes a stable observation period. Never use both systems as writers.
 
 The [official Synapse backup guide](https://element-hq.github.io/synapse/latest/usage/administration/backups.html) defines the protected data set.

@@ -6,10 +6,6 @@
     "Username": "mk8email",
     "PasswordFile": "/run/secrets/database_password"
   },
-  "SuperAdmin": {
-    "Username": "postmaster@mk8n.com",
-    "PasswordFile": "/run/secrets/superadmin_password"
-  },
   "Smtp": {
     "Hostname": "mail.mk8n.com",
     "Port": 2525,
@@ -41,7 +37,7 @@
   "Security": {
     "EnableSpfCheck": false,
     "EnableDmarcCheck": false,
-    "PasswordHashScheme": "PBKDF2-SHA256"
+    "PasswordHashScheme": "BLF-CRYPT"
   },
   "Limits": {
     "MaxMessageSizeBytes": 26214400,
@@ -51,5 +47,15 @@
   },
   "General": {
     "AllowRegistration": false
+  },
+  "Admin": {
+    "AllowedNetworks": [
+      "127.0.0.0/8",
+      "192.168.89.0/24",
+      "172.30.8.0/24"
+    ],
+    "DataProtectionKeyPath": "/var/lib/mk8email-admin/data-protection",
+    "AuditLogPath": "/var/log/mk8email-admin/audit.jsonl",
+    "SessionMinutes": 30
   }
 }

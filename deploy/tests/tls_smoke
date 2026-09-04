@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+reject_protocol() {
+    label=$1
+    shift
+    if timeout 15 openssl s_client -brief "$@" </dev/null >/dev/null 2>&1; then
+        echo "$label accepted a prohibited TLS protocol." >&2
+        exit 1
+    fi
+}
+
+accept_protocol() {
+    label=$1
+    protocol=$2
+    shift 2
+    output=$(timeout 15 openssl s_client -brief "$@" </dev/null 2>&1)
+    printf '%s\n' "$output" | grep -F "Protocol version: $protocol" >/dev/null
+    printf '%s\n' "$output" | grep -F "Verification error: self-signed certificate" >/dev/null
+    echo "$label accepted $protocol."
+}
+
+reject_protocol "IMAPS" -connect 127.0.0.1:993 -tls1
+reject_protocol "submissions" -connect 127.0.0.1:465 -tls1
+reject_protocol "submission" -connect 127.0.0.1:587 -starttls smtp -tls1
+
+accept_protocol "IMAPS" "TLSv1.2" -connect 127.0.0.1:993 -tls1_2
+accept_protocol "IMAPS" "TLSv1.3" -connect 127.0.0.1:993 -tls1_3
+accept_protocol "submissions" "TLSv1.2" -connect 127.0.0.1:465 -tls1_2
+accept_protocol "submissions" "TLSv1.3" -connect 127.0.0.1:465 -tls1_3
+accept_protocol "submission" "TLSv1.2" -connect 127.0.0.1:587 -starttls smtp -tls1_2
+accept_protocol "submission" "TLSv1.3" -connect 127.0.0.1:587 -starttls smtp -tls1_3
+
+echo "TLS protocol tests passed."

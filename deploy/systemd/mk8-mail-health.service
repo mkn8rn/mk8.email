@@ -1,0 +1,31 @@
+[Unit]
+Description=Check mk8 mail service health
+After=network-online.target postfix.service dovecot.service rspamd.service clamav-daemon.service valkey-server.service mk8email-admin.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mk8-mail-health
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mk8-mail-health
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=192.168.89.251/32

@@ -47,7 +47,7 @@ public class InboxService(EmailDbContext db) : IInboxService
 
         var companyLimits = await db.CompanyLimits.AsNoTracking()
             .FirstOrDefaultAsync(l => l.CompanyId == address.CompanyId);
-        var globalLimits = await db.GlobalLimits.AsNoTracking().FirstAsync();
+        var globalLimits = await db.GlobalLimits.AsNoTracking().SingleAsync();
 
         var maxPerCompany = companyLimits?.MaxInboxes ?? globalLimits.DefaultMaxInboxesPerCompany;
         if (maxPerCompany > 0 &&

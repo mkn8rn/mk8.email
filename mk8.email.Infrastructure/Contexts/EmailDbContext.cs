@@ -127,7 +127,7 @@ public class EmailDbContext(DbContextOptions<EmailDbContext> options) : DbContex
         modelBuilder.Entity<GlobalConfigDB>().HasData(new GlobalConfigDB
         {
             Id = GlobalConfigSeedId,
-            AllowRegistration = true,
+            AllowRegistration = false,
             SmtpHostname = "localhost",
             SmtpPort = 25,
             SmtpSubmissionPort = 587,
@@ -137,7 +137,7 @@ public class EmailDbContext(DbContextOptions<EmailDbContext> options) : DbContex
             EnableImplicitTls = false,
             EnableStartTls = false,
             RequireTls = false,
-            PasswordHashScheme = "PBKDF2-SHA256",
+            PasswordHashScheme = "BLF-CRYPT",
             RequireAuth = true,
             MaxMessageSizeBytes = 10 * 1024 * 1024,
             MaxRecipientsPerMessage = 100,

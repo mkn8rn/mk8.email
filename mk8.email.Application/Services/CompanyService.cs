@@ -44,7 +44,7 @@ public class CompanyService(EmailDbContext db) : ICompanyService
 
     public async Task<GlobalConfigDTO> GetGlobalConfigAsync()
     {
-        var c = await db.GlobalConfig.FirstAsync();
+        var c = await db.GlobalConfig.SingleAsync();
         return ToConfigDTO(c);
     }
 
@@ -53,7 +53,7 @@ public class CompanyService(EmailDbContext db) : ICompanyService
         if (!await IsSuperAdminAsync(userId))
             return null;
 
-        var e = await db.GlobalConfig.FirstAsync();
+        var e = await db.GlobalConfig.SingleAsync();
 
         e.AllowRegistration = config.AllowRegistration;
 
@@ -94,7 +94,7 @@ public class CompanyService(EmailDbContext db) : ICompanyService
 
     public async Task<GlobalLimitsDTO> GetGlobalLimitsAsync()
     {
-        var l = await db.GlobalLimits.FirstAsync();
+        var l = await db.GlobalLimits.SingleAsync();
         return new GlobalLimitsDTO(l.Id, l.DefaultMaxDomainsPerCompany, l.DefaultMaxInboxesPerCompany, l.DefaultMaxInboxesPerDomain);
     }
 
@@ -103,7 +103,7 @@ public class CompanyService(EmailDbContext db) : ICompanyService
         if (!await IsSuperAdminAsync(userId))
             return null;
 
-        var entity = await db.GlobalLimits.FirstAsync();
+        var entity = await db.GlobalLimits.SingleAsync();
         entity.DefaultMaxDomainsPerCompany = limits.DefaultMaxDomainsPerCompany;
         entity.DefaultMaxInboxesPerCompany = limits.DefaultMaxInboxesPerCompany;
         entity.DefaultMaxInboxesPerDomain = limits.DefaultMaxInboxesPerDomain;

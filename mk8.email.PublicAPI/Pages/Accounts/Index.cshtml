@@ -1,0 +1,38 @@
+@page
+@model AccountsModel
+@{
+    ViewData["Title"] = "Accounts";
+}
+
+<div class="title-row">
+    <h1>Accounts</h1>
+    <a class="button" asp-page="Create">Add account</a>
+</div>
+@if (!string.IsNullOrEmpty(Model.StatusMessage))
+{
+    <p class="status">@Model.StatusMessage</p>
+}
+<section class="panel">
+    <table>
+        <thead><tr><th>Address</th><th>Role</th><th>Catch-all</th><th>State</th><th>Actions</th></tr></thead>
+        <tbody>
+        @foreach (var account in Model.Accounts)
+        {
+            <tr>
+                <td>@account.Address</td>
+                <td>@account.Role</td>
+                <td>@(account.IsCatchAllTarget ? "Target" : "No")</td>
+                <td>@(account.IsActive ? "Active" : "Disabled")</td>
+                <td class="actions">
+                    <a asp-page="ResetPassword" asp-route-userId="@account.UserId">Change password</a>
+                    <form method="post" asp-page-handler="SetActive">
+                        <input type="hidden" name="userId" value="@account.UserId" />
+                        <input type="hidden" name="isActive" value="@(!account.IsActive)" />
+                        <button class="link-button" type="submit">@(account.IsActive ? "Disable" : "Enable")</button>
+                    </form>
+                </td>
+            </tr>
+        }
+        </tbody>
+    </table>
+</section>

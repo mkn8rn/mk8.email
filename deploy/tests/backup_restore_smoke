@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+test "$#" -eq 1
+backup_directory=$1
+test_database=mk8email_restore_smoke
+database_created=false
+
+case "$backup_directory" in
+    /var/backups/mk8/20??????T??????Z) ;;
+    *)
+        echo "The backup path is not valid." >&2
+        exit 64
+        ;;
+esac
+
+test -d "$backup_directory"
+test "$test_database" = mk8email_restore_smoke
+
+cleanup() {
+    if [ "$database_created" = true ]; then
+        runuser -u postgres -- dropdb --force "$test_database"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+if runuser -u postgres -- psql --quiet --tuples-only --no-align \
+    --dbname=postgres --command="SELECT 1 FROM pg_database WHERE datname = '$test_database'" \
+    | grep -q 1; then
+    echo "The restore test database already exists." >&2
+    exit 1
+fi
+
+(cd "$backup_directory" && sha256sum --quiet --check SHA256SUMS)
+pg_restore --list "$backup_directory/mk8email.dump" >/dev/null
+pg_restore --list "$backup_directory/synapse.dump" >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -F 'etc/NetworkManager/system-connections/' >/dev/null
+
+runuser -u postgres -- createdb --template=template0 "$test_database"
+database_created=true
+runuser -u postgres -- pg_restore --exit-on-error --no-owner --no-acl \
+    --dbname="$test_database" < "$backup_directory/mk8email.dump"
+
+account_count=$(runuser -u postgres -- psql --quiet --tuples-only --no-align \
+    --dbname="$test_database" \
+    --command="SELECT count(*) FROM users WHERE is_active AND username IN ('admin@mk8n.com', 'mk8n@mk8n.com')")
+test "$account_count" -eq 2
+
+catchall_count=$(runuser -u postgres -- psql --quiet --tuples-only --no-align \
+    --dbname="$test_database" \
+    --command="SELECT count(*) FROM inboxes source JOIN addresses source_domain ON source_domain.id = source.address_id JOIN inboxes target ON target.id = source.alias_for_inbox_id JOIN addresses target_domain ON target_domain.id = target.address_id WHERE source.name = '*' AND source_domain.domain = 'mk8n.com' AND target.name = 'mk8n' AND target_domain.domain = 'mk8n.com'")
+test "$catchall_count" -eq 1
+
+echo "Backup checksums, archives, accounts, and catch-all restore tests passed."

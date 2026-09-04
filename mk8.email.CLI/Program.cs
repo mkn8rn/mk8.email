@@ -1,43 +1,114 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using mk8.email.Application;
 using mk8.email.Application.Interfaces;
 using mk8.email.CLI;
+using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure;
 using mk8.email.Infrastructure.Environment;
 
-var isDev = args.Contains("--dev") || args.Contains("--development")
-         || Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") == "Development";
+var isDevelopment = args.Contains("--dev", StringComparer.Ordinal)
+    || args.Contains("--development", StringComparer.Ordinal)
+    || Environment.GetEnvironmentVariable("DOTNET_ENVIRONMENT") == "Development";
+var environmentConfig = EnvironmentLoader.Load(isDevelopment);
 
-var env = EnvironmentLoader.Load(isDev);
-
-if (args.Contains("--healthcheck"))
+if (args.SequenceEqual(["--healthcheck"]))
 {
     using var healthTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-    Environment.ExitCode = await ServerHealthCheck.IsHealthyAsync(env, healthTimeout.Token) ? 0 : 1;
+    Environment.ExitCode = await ServerHealthCheck.IsHealthyAsync(environmentConfig, healthTimeout.Token) ? 0 : 1;
     return;
 }
 
-Console.WriteLine($"mk8.email starting ({(isDev ? "Development" : "Production")})");
-Console.WriteLine($"  Database : {env.Database.Host}:{env.Database.Port}/{env.Database.Name}");
-Console.WriteLine($"  SMTP     : :{env.Smtp.Port} (enabled={env.Smtp.EnableSmtp})");
-Console.WriteLine($"  IMAP     : :{env.Imap.Port} (enabled={env.Imap.EnableImap})");
-
-var builder = Host.CreateApplicationBuilder(args);
-
-builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
-
-builder.Services.AddInfrastructure(env);
-builder.Services.AddApplication();
-
-var host = builder.Build();
-
-using (var scope = host.Services.CreateScope())
+if (args.SequenceEqual(["--initialize-empty-database"]))
 {
-    var seeder = scope.ServiceProvider.GetRequiredService<ISeederService>();
-    await seeder.SeedAsync();
+    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
+    using var scope = host.Services.CreateScope();
+    var result = await scope.ServiceProvider
+        .GetRequiredService<IDatabaseInitializationService>()
+        .InitializeEmptyDatabaseAsync();
+    Console.WriteLine(result.Message);
+    Environment.ExitCode = result.Succeeded ? 0 : 1;
+    return;
 }
 
-await host.RunAsync();
+if (args.Length == 3 && args[0] == "--ensure-domain")
+{
+    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
+    using var scope = host.Services.CreateScope();
+    var result = await scope.ServiceProvider
+        .GetRequiredService<IMailAdministrationService>()
+        .EnsureDomainAsync(args[1], args[2]);
+    Console.WriteLine(result.Message);
+    Environment.ExitCode = result.Succeeded ? 0 : 1;
+    return;
+}
+
+if (args.Length == 4 && args[0] == "--create-account")
+{
+    if (!Enum.TryParse<UserRole>(args[2], ignoreCase: true, out var role))
+    {
+        Console.Error.WriteLine("The account role is not valid.");
+        Environment.ExitCode = 2;
+        return;
+    }
+
+    var passwordPath = Path.GetFullPath(args[3]);
+    if (!File.Exists(passwordPath))
+    {
+        Console.Error.WriteLine("The password file does not exist.");
+        Environment.ExitCode = 2;
+        return;
+    }
+
+    var password = File.ReadAllText(passwordPath).TrimEnd('\r', '\n');
+    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
+    using var scope = host.Services.CreateScope();
+    var result = await scope.ServiceProvider
+        .GetRequiredService<IMailAdministrationService>()
+        .CreateAccountAsync(args[1], password, role);
+    Console.WriteLine(result.Message);
+    Environment.ExitCode = result.Succeeded ? 0 : 1;
+    return;
+}
+
+if (args.Length == 3 && args[0] == "--set-catchall")
+{
+    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: false);
+    using var scope = host.Services.CreateScope();
+    var result = await scope.ServiceProvider
+        .GetRequiredService<IMailAdministrationService>()
+        .SetCatchAllAsync(args[1], args[2]);
+    Console.WriteLine(result.Message);
+    Environment.ExitCode = result.Succeeded ? 0 : 1;
+    return;
+}
+
+if (args.SequenceEqual(["--serve-experimental-protocols"]))
+{
+    using var host = BuildHost(args, environmentConfig, includeExperimentalServers: true);
+    using (var scope = host.Services.CreateScope())
+        await scope.ServiceProvider.GetRequiredService<ISeederService>().SeedAsync();
+    await host.RunAsync();
+    return;
+}
+
+Console.Error.WriteLine(
+    "Use one management command. The experimental protocol servers require an explicit command.");
+Environment.ExitCode = 2;
+
+static IHost BuildHost(
+    string[] arguments,
+    EnvironmentConfig environmentConfig,
+    bool includeExperimentalServers)
+{
+    var builder = Host.CreateApplicationBuilder(arguments);
+    builder.Logging.ClearProviders();
+    builder.Logging.AddJsonConsole();
+    builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+    builder.Services.AddInfrastructure(environmentConfig);
+    builder.Services.AddApplication();
+    if (includeExperimentalServers)
+        builder.Services.AddExperimentalMailProtocolServers();
+    return builder.Build();
+}

@@ -17,9 +17,12 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
             return false;
 
         return await db.Inboxes.AsNoTracking()
-            .AnyAsync(i => i.Name == localPart
+            .AnyAsync(i => (i.Name == localPart || i.Name == "*")
                         && i.Address.Domain == domain
-                        && i.Address.IsActive);
+                        && i.Address.IsActive
+                        && i.Address.Company.IsActive
+                        && i.Owner.IsActive
+                        && (i.Name != "*" || i.AliasForInboxId != null));
     }
 
     public async Task<bool> DeliverAsync(string sender, string recipient, string rawMessage)
@@ -30,9 +33,14 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
 
         var inbox = await db.Inboxes
             .AsNoTracking()
-            .FirstOrDefaultAsync(i => i.Name == localPart
-                                   && i.Address.Domain == domain
-                                   && i.Address.IsActive);
+            .Where(i => (i.Name == localPart || i.Name == "*")
+                     && i.Address.Domain == domain
+                     && i.Address.IsActive
+                     && i.Address.Company.IsActive
+                     && i.Owner.IsActive
+                     && (i.Name != "*" || i.AliasForInboxId != null))
+            .OrderBy(i => i.Name == localPart ? 0 : 1)
+            .FirstOrDefaultAsync();
         if (inbox is null)
             return false;
 

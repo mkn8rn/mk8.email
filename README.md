@@ -1,13 +1,17 @@
 # mk8.email
 
-A work-in-progress self-hosted email server built with .NET 10 and designed for Thunderbird compatibility.
+mk8.email is the mail control plane for a native Debian mail server. The production data plane uses standard, maintained mail components.
 
-The host foundation is hardened, but the application is not ready for public MX traffic. Read the production boundary before activation.
+Postfix receives and queues SMTP mail. Rspamd and ClamAV inspect messages before acceptance. Dovecot provides LMTP delivery and IMAPS access.
 
-The server requires the `MK8EMAIL_CONFIG_FILE` environment variable. The variable must contain an absolute JSON configuration file path.
+PostgreSQL stores domains, accounts, password hashes, quotas, and aliases. The .NET 10 Razor Pages application provides the local administrator interface.
 
-The repository includes native Debian, host-hardening, network, and container assets for `mail.mk8n.com`.
+The original custom .NET SMTP and IMAP servers remain available only through an explicit experimental command. Production services do not use them.
 
-Read [the production deployment guide](docs/production-deployment.md) before use. Read [the network guide](docs/routeros-and-dns.md) before changing public DNS or RouterOS.
+The prepared target is Debian 13 at `192.168.89.251`. The administrator dashboard listens only at `https://192.168.89.251:8443` on the local network.
 
-The same Debian host is a locked migration target for `matrix.mkn8rn.com`. Read [the Matrix migration guide](docs/matrix-migration.md) before any cutover.
+Read [the production deployment guide](docs/production-deployment.md) before a release. Read [the mail operations guide](docs/mail-operations.md) for routine work and recovery.
+
+Read [the RouterOS and DNS guide](docs/routeros-and-dns.md) before public cutover. Read [the Matrix migration guide](docs/matrix-migration.md) before moving Synapse.
+
+Public mail is not active until RouterOS, public DNS, PTR, a trusted certificate, and unrestricted outbound TCP port 25 pass external tests.

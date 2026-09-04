@@ -17,3 +17,19 @@ enabled = true
 
 [nginx-botsearch]
 enabled = true
+
+[postfix]
+enabled = true
+backend = systemd
+mode = more
+maxretry = 8
+
+[postfix-sasl]
+enabled = true
+backend = systemd
+maxretry = 5
+
+[dovecot]
+enabled = true
+backend = systemd
+maxretry = 5

@@ -6,7 +6,6 @@ namespace mk8.email.Infrastructure.Environment;
 public sealed class EnvironmentConfig
 {
     public DatabaseConfig Database { get; init; } = new();
-    public SuperAdminConfig SuperAdmin { get; init; } = new();
     public SmtpConfig Smtp { get; init; } = new();
     public ImapConfig Imap { get; init; } = new();
     public TlsConfig Tls { get; init; } = new();
@@ -14,6 +13,7 @@ public sealed class EnvironmentConfig
     public SecurityConfig Security { get; init; } = new();
     public LimitsConfig Limits { get; init; } = new();
     public GeneralConfig General { get; init; } = new();
+    public AdminConfig Admin { get; init; } = new();
 
     public string BuildConnectionString()
     {
@@ -37,9 +37,6 @@ public sealed class EnvironmentConfig
         RequireValue(errors, Database.Name, "Database.Name is required.");
         RequireValue(errors, Database.Username, "Database.Username is required.");
         RequireSecret(errors, Database.Password, "Database.Password", isDevelopment);
-
-        RequireValue(errors, SuperAdmin.Username, "SuperAdmin.Username is required.");
-        RequireSecret(errors, SuperAdmin.Password, "SuperAdmin.Password", isDevelopment);
 
         if (Uri.CheckHostName(Smtp.Hostname) != UriHostNameType.Dns)
             errors.Add("Smtp.Hostname must be a valid DNS name.");
@@ -83,8 +80,8 @@ public sealed class EnvironmentConfig
                 errors.Add("Dkim.Selector must be a DNS label.");
         }
 
-        if (!string.Equals(Security.PasswordHashScheme, "PBKDF2-SHA256", StringComparison.Ordinal))
-            errors.Add("Security.PasswordHashScheme must be PBKDF2-SHA256.");
+        if (!string.Equals(Security.PasswordHashScheme, "BLF-CRYPT", StringComparison.Ordinal))
+            errors.Add("Security.PasswordHashScheme must be BLF-CRYPT.");
         if (!isDevelopment && (Security.EnableSpfCheck || Security.EnableDmarcCheck))
             errors.Add("The built-in SPF and DMARC checks are not approved for production.");
 
@@ -96,6 +93,15 @@ public sealed class EnvironmentConfig
             errors.Add("Limits.ConnectionTimeoutSeconds must be from 10 through 3600.");
         if (Limits.MaxConnectionsPerIp is < 1 or > 10000)
             errors.Add("Limits.MaxConnectionsPerIp must be from 1 through 10000.");
+
+        if (!isDevelopment && Admin.AllowedNetworks.Count == 0)
+            errors.Add("Admin.AllowedNetworks must contain at least one network in production.");
+        if (!isDevelopment && !Path.IsPathFullyQualified(Admin.DataProtectionKeyPath))
+            errors.Add("Admin.DataProtectionKeyPath must be an absolute path in production.");
+        if (!isDevelopment && !Path.IsPathFullyQualified(Admin.AuditLogPath))
+            errors.Add("Admin.AuditLogPath must be an absolute path in production.");
+        if (Admin.SessionMinutes is < 5 or > 480)
+            errors.Add("Admin.SessionMinutes must be from 5 through 480.");
 
         return errors;
     }
@@ -191,13 +197,6 @@ public sealed class DatabaseConfig
     public string? PasswordFile { get; init; }
 }
 
-public sealed class SuperAdminConfig
-{
-    public string Username { get; init; } = "admin";
-    public string Password { get; set; } = string.Empty;
-    public string? PasswordFile { get; init; }
-}
-
 public sealed class SmtpConfig
 {
     public string Hostname { get; init; } = "localhost";
@@ -238,7 +237,7 @@ public sealed class SecurityConfig
 {
     public bool EnableSpfCheck { get; init; }
     public bool EnableDmarcCheck { get; init; }
-    public string PasswordHashScheme { get; init; } = "PBKDF2-SHA256";
+    public string PasswordHashScheme { get; init; } = "BLF-CRYPT";
 }
 
 public sealed class LimitsConfig
@@ -251,5 +250,13 @@ public sealed class LimitsConfig
 
 public sealed class GeneralConfig
 {
-    public bool AllowRegistration { get; init; } = true;
+    public bool AllowRegistration { get; init; }
+}
+
+public sealed class AdminConfig
+{
+    public IReadOnlyList<string> AllowedNetworks { get; init; } = [];
+    public string DataProtectionKeyPath { get; init; } = "data-protection";
+    public string AuditLogPath { get; init; } = "audit/admin.jsonl";
+    public int SessionMinutes { get; init; } = 30;
 }

@@ -1,0 +1,57 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf '%s\n' "Run this command as root." >&2
+    exit 2
+fi
+
+if ! runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --tuples-only --no-align \
+    --command="SELECT to_regclass('public.companies') IS NOT NULL AND to_regclass('public.addresses') IS NOT NULL AND to_regclass('public.users') IS NOT NULL AND to_regclass('public.inboxes') IS NOT NULL" \
+    | grep -qx t; then
+    printf '%s\n' "The mk8.email schema is not ready." >&2
+    exit 1
+fi
+
+runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --set=ON_ERROR_STOP=1 <<'SQL'
+DO $roles$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'postfix') THEN
+        CREATE ROLE postfix LOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'dovecot') THEN
+        CREATE ROLE dovecot LOGIN;
+    END IF;
+END
+$roles$;
+
+ALTER ROLE postfix NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 10;
+ALTER ROLE dovecot NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 20;
+ALTER ROLE postfix SET default_transaction_read_only TO true;
+ALTER ROLE dovecot SET default_transaction_read_only TO true;
+ALTER ROLE postfix SET statement_timeout TO '5s';
+ALTER ROLE dovecot SET statement_timeout TO '5s';
+ALTER ROLE postfix SET lock_timeout TO '2s';
+ALTER ROLE dovecot SET lock_timeout TO '2s';
+
+REVOKE ALL ON DATABASE mk8email FROM postfix, dovecot;
+GRANT CONNECT ON DATABASE mk8email TO postfix, dovecot;
+REVOKE ALL ON SCHEMA public FROM postfix, dovecot;
+GRANT USAGE ON SCHEMA public TO postfix, dovecot;
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM postfix, dovecot;
+
+GRANT SELECT (id, is_active) ON TABLE companies TO postfix;
+GRANT SELECT (id, company_id, domain, is_active) ON TABLE addresses TO postfix;
+GRANT SELECT (id, address_id, owner_id, name, alias_for_inbox_id) ON TABLE inboxes TO postfix;
+GRANT SELECT (id, username, is_active) ON TABLE users TO postfix;
+
+GRANT SELECT (id, is_active) ON TABLE companies TO dovecot;
+GRANT SELECT (id, company_id, domain, is_active) ON TABLE addresses TO dovecot;
+GRANT SELECT (id, address_id, owner_id, name, alias_for_inbox_id) ON TABLE inboxes TO dovecot;
+GRANT SELECT (id, password_hash, quota_bytes, is_active) ON TABLE users TO dovecot;
+SQL
+
+runuser -u postfix -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM addresses LIMIT 1' >/dev/null
+runuser -u dovecot -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM users LIMIT 1' >/dev/null
+
+printf '%s\n' "Mail database access is ready."

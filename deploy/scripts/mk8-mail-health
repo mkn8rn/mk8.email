@@ -1,0 +1,132 @@
+#!/bin/sh
+set -eu
+
+deep=false
+strict=false
+for option in "$@"; do
+    case "$option" in
+        --deep) deep=true ;;
+        --strict) strict=true ;;
+        *)
+            printf '%s\n' "Usage: mk8-mail-health [--deep] [--strict]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+state_directory=/var/lib/mk8-mail-health
+state_file=$state_directory/status
+backup_lock=/run/lock/mk8-backup.lock
+exec 8>"$backup_lock"
+if ! flock --shared --nonblock 8; then
+    printf '%s\n' "The mail health check was skipped during a backup."
+    exit 0
+fi
+
+errors=$(mktemp /run/mk8-mail-health.XXXXXX)
+queue_data=$(mktemp /run/mk8-mail-queue.XXXXXX)
+trap 'rm -f -- "$errors" "$queue_data"' EXIT INT TERM
+
+install -d -o root -g root -m 0750 "$state_directory"
+
+record_error() {
+    printf '%s\n' "$1" >> "$errors"
+}
+
+for service_name in postgresql.service postfix.service dovecot.service rspamd.service \
+    clamav-daemon.service clamav-freshclam.service valkey-server.service \
+    mk8email-admin.service nginx.service nftables.service fail2ban.service; do
+    systemctl is-active --quiet "$service_name" || record_error "$service_name is not active."
+done
+
+pg_isready --host=127.0.0.1 --port=5432 --dbname=mk8email --quiet \
+    || record_error "PostgreSQL is not ready."
+valkey-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG \
+    || record_error "Valkey is not ready."
+clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1 \
+    || record_error "ClamAV is not ready."
+find /var/lib/clamav -maxdepth 1 -type f \( -name '*.cvd' -o -name '*.cld' \) -mtime -2 -print -quit \
+    | grep -q . || record_error "ClamAV signatures are older than two days."
+if [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
+    if [ ! -d /var/backups/mk8-export ] \
+        || ! find /var/backups/mk8-export -maxdepth 1 -type f -name '*.tar.gz.age' -mtime -2 -print -quit \
+            | grep -q .; then
+        record_error "The encrypted backup export is older than two days."
+    fi
+fi
+
+if postqueue -j > "$queue_data" 2>/dev/null; then
+    queue_count=$(wc -l < "$queue_data" | tr -d ' ')
+    [ "$queue_count" -le 100 ] || record_error "The Postfix queue contains more than 100 messages."
+    oldest=$(sed -n 's/.*"arrival_time":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$queue_data" | sort -n | head -n 1)
+    if [ -n "$oldest" ] && [ "$(( $(date +%s) - oldest ))" -gt 86400 ]; then
+        record_error "The Postfix queue contains a message older than one day."
+    fi
+else
+    record_error "The Postfix queue is not available."
+fi
+
+used_percent=$(df -P /var/vmail | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
+[ "${used_percent:-100}" -lt 90 ] || record_error "Mail storage is at least 90 percent full."
+openssl x509 -in /etc/mk8email/tls/fullchain.pem -noout -checkend 1209600 >/dev/null 2>&1 \
+    || record_error "The mail certificate expires within 14 days."
+openssl x509 -in /etc/mk8email/admin-tls/fullchain.pem -noout -checkend 1209600 >/dev/null 2>&1 \
+    || record_error "The administrator certificate expires within 14 days."
+curl --silent --fail --insecure --max-time 10 \
+    --noproxy '*' \
+    --resolve admin.mk8n.com:8443:192.168.89.251 \
+    https://admin.mk8n.com:8443/health/ready >/dev/null \
+    || record_error "The administrator dashboard is not ready."
+
+if [ "$deep" = true ]; then
+    postfix check >/dev/null 2>&1 || record_error "The Postfix configuration is not valid."
+    doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null 2>&1 \
+        || record_error "The Dovecot configuration is not valid."
+    rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet >/dev/null 2>&1 \
+        || record_error "The Rspamd configuration is not valid."
+    clamconf --config-dir=/etc/clamav --non-default >/dev/null 2>&1 \
+        || record_error "The ClamAV configuration is not valid."
+    nginx -t >/dev/null 2>&1 || record_error "The nginx configuration is not valid."
+    nft -c -f /etc/nftables.conf >/dev/null 2>&1 \
+        || record_error "The nftables configuration is not valid."
+    runuser -u postfix -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM addresses LIMIT 1' >/dev/null 2>&1 \
+        || record_error "Postfix cannot read its database maps."
+    runuser -u dovecot -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM users LIMIT 1' >/dev/null 2>&1 \
+        || record_error "Dovecot cannot read its authentication data."
+fi
+
+previous_status=UNKNOWN
+previous_key=UNKNOWN
+if [ -f "$state_file" ]; then
+    previous_status=$(cut -d' ' -f1 "$state_file")
+    previous_key=$(cut -d' ' -f1-2 "$state_file")
+fi
+
+if [ ! -s "$errors" ]; then
+    if [ "$previous_status" != HEALTHY ]; then
+        logger --priority=mail.notice --tag=mk8-mail-health "The mail stack recovered."
+    fi
+    printf 'HEALTHY %s\n' "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$state_file.new"
+    mv "$state_file.new" "$state_file"
+    printf '%s\n' "The mail stack is healthy."
+    exit 0
+fi
+
+error_hash=$(sha256sum "$errors" | cut -d' ' -f1)
+current="UNHEALTHY $error_hash"
+printf '%s %s\n' "$current" "$(date --utc +%Y-%m-%dT%H:%M:%SZ)" > "$state_file.new"
+mv "$state_file.new" "$state_file"
+
+if [ "$previous_key" != "$current" ]; then
+    summary=$(tr '\n' ' ' < "$errors")
+    logger --priority=mail.err --tag=mk8-mail-health -- "$summary"
+    cat "$errors" >&2
+    exit 1
+fi
+
+if [ "$strict" = true ]; then
+    cat "$errors" >&2
+    exit 1
+fi
+
+exit 0

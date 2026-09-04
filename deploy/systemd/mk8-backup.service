@@ -1,7 +1,7 @@
 [Unit]
 Description=Back up mk8 services
 Requires=postgresql.service
-After=postgresql.service
+After=postgresql.service postfix.service dovecot.service rspamd.service valkey-server.service mk8email-admin.service
 
 [Service]
 Type=oneshot
@@ -23,11 +23,13 @@ ProtectKernelTunables=true
 ProtectProc=invisible
 ProtectSystem=strict
 ProcSubset=pid
-ReadWritePaths=/var/backups/mk8
-RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/backups/mk8 /var/backups/mk8-export
+RestrictAddressFamilies=AF_UNIX AF_INET
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 SystemCallArchitectures=native
+IPAddressDeny=any
+IPAddressAllow=localhost
