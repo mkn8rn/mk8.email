@@ -6,11 +6,11 @@ timestamp=$(date --utc +%Y%m%dT%H%M%SZ)
 stage="$backup_root/.incomplete-$timestamp"
 final="$backup_root/$timestamp"
 lock=/run/lock/mk8-backup.lock
-managed_services="mk8email-admin.service postfix.service dovecot.service valkey-server.service"
+managed_services="mk8email.service mk8email-admin.service valkey-server.service"
 active_services=
 
 resume_services() {
-    for service_name in valkey-server.service dovecot.service postfix.service mk8email-admin.service; do
+    for service_name in valkey-server.service mk8email.service mk8email-admin.service; do
         case " $active_services " in
             *" $service_name "*) systemctl start "$service_name" ;;
         esac
@@ -50,8 +50,8 @@ for service_name in $managed_services; do
     fi
 done
 
-systemctl stop mk8email-admin.service postfix.service dovecot.service 2>/dev/null || true
-for service_name in mk8email-admin.service postfix.service dovecot.service; do
+systemctl stop mk8email.service mk8email-admin.service 2>/dev/null || true
+for service_name in mk8email.service mk8email-admin.service; do
     if systemctl is-active --quiet "$service_name"; then
         printf '%s\n' "$service_name did not stop for the backup." >&2
         exit 1
@@ -70,20 +70,6 @@ apt-mark showmanual | sort > "$stage/debian-manual-packages.txt"
 cp -p /etc/os-release "$stage/os-release"
 uname -a > "$stage/kernel.txt"
 
-previous=$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -printf '%f\n' | sort | tail -n 1)
-
-install -d -m 0700 "$stage/mail"
-if [ -n "$previous" ] && [ -d "$backup_root/$previous/mail" ]; then
-    rsync --archive --delete --numeric-ids --link-dest="$backup_root/$previous/mail" /var/vmail/ "$stage/mail/"
-else
-    rsync --archive --delete --numeric-ids /var/vmail/ "$stage/mail/"
-fi
-
-install -d -m 0700 "$stage/postfix-spool"
-rsync --archive --delete --numeric-ids \
-    --exclude=pid/master.pid --exclude=private/ --exclude=public/ \
-    /var/spool/postfix/ "$stage/postfix-spool/"
-
 install -d -m 0700 "$stage/valkey"
 rsync --archive --delete --numeric-ids /var/lib/valkey/ "$stage/valkey/"
 
@@ -100,7 +86,6 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/default/aide \
     etc/default/debsums \
     etc/default/sysstat \
-    etc/dovecot \
     etc/fail2ban \
     etc/letsencrypt \
     etc/logrotate.d/mk8-mail \
@@ -110,7 +95,6 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/nginx \
     etc/nftables.conf \
     etc/nftables.d \
-    etc/postfix \
     etc/postgresql \
     etc/profile.d/90-mk8-umask.sh \
     etc/rspamd \
@@ -134,7 +118,6 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/systemd/system/drkonqi-coredump-processor@.service \
     etc/systemd/system/dailyaidecheck.service.d \
     etc/systemd/system/dailyaidecheck.timer.d \
-    etc/systemd/system/dovecot.service.d \
     etc/systemd/system/mk8-backup.service \
     etc/systemd/system/mk8-backup.timer \
     etc/systemd/system/mk8-mail-health.service \
@@ -142,15 +125,14 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     etc/systemd/system/mk8email-admin.service \
     etc/systemd/system/mk8email.service \
     etc/systemd/system/nginx.service.d \
-    etc/systemd/system/postfix@.service.d \
     etc/systemd/system/postgresql@.service.d \
     etc/systemd/system/rspamd.service.d \
     etc/systemd/system/valkey-server.service.d \
-    etc/systemd/system/var-vmail.mount \
     etc/tmpfiles.d/mk8-mail.conf \
     etc/tmpfiles.d/mk8-postgresql.conf \
     etc/valkey \
     var/lib/aide/aide.db \
+    var/lib/mk8email \
     var/lib/mk8email-admin \
     var/log/mk8email-admin \
     var/www/autoconfig \

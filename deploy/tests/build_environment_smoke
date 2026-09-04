@@ -39,7 +39,6 @@ runuser -u mk8build -- git --git-dir="$repository" \
 
 runuser -u mk8build -- test ! -r /etc/mk8email/secrets/database_password
 runuser -u mk8build -- test ! -r /etc/ssh/ssh_host_ed25519_key
-runuser -u mk8build -- test ! -r /var/vmail
 runuser -u mk8build -- test ! -w /opt/mk8email-build/sdk
 
 printf '%s\n' "The isolated build environment passed its safety checks."

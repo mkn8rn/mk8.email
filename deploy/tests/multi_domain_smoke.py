@@ -43,7 +43,7 @@ def require_recipient_rejected(recipient: str) -> None:
         client.ehlo("probe.debian.org")
         require(client.mail("probe@debian.org")[0] == 250, "The test sender was rejected.")
         code, _ = client.rcpt(recipient)
-        require(code in (550, 554), "Postfix accepted a recipient for an inactive domain.")
+        require(code in (550, 554), "mk8.email accepted a recipient for an inactive domain.")
 
 
 def require_login_rejected(account: str, password: str) -> None:
@@ -52,7 +52,7 @@ def require_login_rejected(account: str, password: str) -> None:
             client.login(account, password)
     except imaplib.IMAP4.error:
         return
-    raise RuntimeError("Dovecot accepted a login for an inactive domain.")
+    raise RuntimeError("mk8.email accepted an IMAP login for an inactive domain.")
 
 
 def send_inbound(value: EmailMessage) -> None:
@@ -103,7 +103,7 @@ def require_sender_mismatch_rejected(account: str, password: str) -> None:
         code, _ = client.mail("admin@mk8n.com")
         if code < 400:
             code, _ = client.rcpt(account)
-        require(code in (550, 553), "Postfix accepted a sender from another hosted domain.")
+        require(code in (550, 553), "mk8.email accepted a sender from another hosted domain.")
 
 
 def test_active(domain: str, account: str, password: str, selector: str) -> None:

@@ -13,6 +13,7 @@ public static class InfrastructureServiceExtensions
 
         services.AddDbContext<EmailDbContext>(options =>
             options.UseNpgsql(env.BuildConnectionString()));
+        services.AddScoped<MailRuntimeSchemaService>();
 
         return services;
     }

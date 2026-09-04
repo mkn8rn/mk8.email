@@ -29,7 +29,7 @@ public sealed class MailAdministrationTests
             "mk8n@mk8n.com")).Succeeded);
         Assert.IsTrue((await administration.SetDomainActiveAsync("mk8n.com", true)).Succeeded);
 
-        var mail = new EmailService(database, new UnusedRelay());
+        var mail = new EmailService(database);
         Assert.IsTrue(await mail.CanReceiveAsync("undefined@mk8n.com"));
         Assert.IsTrue(await mail.DeliverAsync(
             "sender@example.net",
@@ -58,7 +58,7 @@ public sealed class MailAdministrationTests
         await administration.SetCatchAllAsync("mk8n.com", "mk8n@mk8n.com");
         await administration.SetDomainActiveAsync("mk8n.com", true);
 
-        var mail = new EmailService(database, new UnusedRelay());
+        var mail = new EmailService(database);
         Assert.IsTrue(await mail.DeliverAsync(
             "sender@example.net",
             "admin@mk8n.com",
@@ -90,7 +90,7 @@ public sealed class MailAdministrationTests
     {
         await using var database = CreateDatabase();
         var administration = new MailAdministrationService(database);
-        var mail = new EmailService(database, new UnusedRelay());
+        var mail = new EmailService(database);
 
         Assert.IsTrue((await administration.EnsureDomainAsync("Example", "example.com")).Succeeded);
         Assert.IsTrue((await administration.CreateAccountAsync(
@@ -111,7 +111,7 @@ public sealed class MailAdministrationTests
     {
         await using var database = CreateDatabase();
         var administration = new MailAdministrationService(database);
-        var mail = new EmailService(database, new UnusedRelay());
+        var mail = new EmailService(database);
 
         await administration.EnsureDomainAsync("Example", "example.com");
         await administration.CreateAccountAsync(
@@ -143,14 +143,5 @@ public sealed class MailAdministrationTests
         var database = new EmailDbContext(options);
         database.Database.EnsureCreated();
         return database;
-    }
-
-    private sealed class UnusedRelay : IOutboundMailRelay
-    {
-        public Task<bool> RelayAsync(
-            string sender,
-            string recipient,
-            string rawMessage) =>
-            throw new InvalidOperationException("This test does not relay mail.");
     }
 }

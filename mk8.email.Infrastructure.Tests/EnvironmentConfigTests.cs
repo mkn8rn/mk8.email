@@ -59,6 +59,26 @@ public sealed class EnvironmentConfigTests
     }
 
     [TestMethod]
+    public void ProductionRequiresLoopbackRspamdEndpoint()
+    {
+        var errors = CreateValidConfiguration(rspamdEndpoint: "http://scanner.example/checkv2").Validate();
+
+        StringAssert.Contains(
+            string.Join('|', errors),
+            "Filtering.RspamdEndpoint must use a loopback address in production.");
+    }
+
+    [TestMethod]
+    public void QueueAttemptLimitMustBeBounded()
+    {
+        var errors = CreateValidConfiguration(queueMaxAttempts: 0).Validate();
+
+        StringAssert.Contains(
+            string.Join('|', errors),
+            "Queue.MaxAttempts must be from 1 through 100.");
+    }
+
+    [TestMethod]
     public void LoaderReadsPasswordsFromSecretFiles()
     {
         var databasePasswordPath = WriteFile("database-password", "database-secret-value");
@@ -89,7 +109,9 @@ public sealed class EnvironmentConfigTests
         bool enableImap = true,
         bool enableSpfCheck = false,
         bool enableDkimSigning = false,
-        string dkimSelector = "default")
+        string dkimSelector = "default",
+        string rspamdEndpoint = "http://127.0.0.1:11333/checkv2",
+        int queueMaxAttempts = 20)
     {
         return new EnvironmentConfig
         {
@@ -138,6 +160,19 @@ public sealed class EnvironmentConfigTests
                 EnableSpfCheck = enableSpfCheck,
                 EnableDmarcCheck = false,
                 PasswordHashScheme = "BLF-CRYPT",
+            },
+            Filtering = new FilteringConfig
+            {
+                RspamdEndpoint = rspamdEndpoint,
+                TimeoutSeconds = 70,
+            },
+            Queue = new QueueConfig
+            {
+                PollIntervalMilliseconds = 500,
+                LeaseSeconds = 300,
+                MaxAttempts = queueMaxAttempts,
+                MaxAgeHours = 120,
+                CompletedRetentionDays = 14,
             },
             Limits = new LimitsConfig
             {

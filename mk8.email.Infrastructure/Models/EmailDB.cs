@@ -77,6 +77,9 @@ public class EmailDB
     [Column("received_at")]
     public DateTime ReceivedAt { get; set; } = DateTime.UtcNow;
 
+    [Column("queue_delivery_id")]
+    public Guid? QueueDeliveryId { get; set; }
+
     [Column("folder_id")]
     public Guid FolderId { get; set; }
 

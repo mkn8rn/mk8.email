@@ -16,6 +16,8 @@ public class EmailDbContext(DbContextOptions<EmailDbContext> options) : DbContex
     public DbSet<CompanyConfigDB> CompanyConfigs => Set<CompanyConfigDB>();
     public DbSet<CompanyLimitsDB> CompanyLimits => Set<CompanyLimitsDB>();
     public DbSet<ExpungedUidDB> ExpungedUids => Set<ExpungedUidDB>();
+    public DbSet<MailQueueMessageDB> MailQueueMessages => Set<MailQueueMessageDB>();
+    public DbSet<MailQueueRecipientDB> MailQueueRecipients => Set<MailQueueRecipientDB>();
 
     private static readonly Guid GlobalConfigSeedId = Guid.Parse("00000000-0000-0000-0000-000000000001");
     private static readonly Guid GlobalLimitsSeedId = Guid.Parse("00000000-0000-0000-0000-000000000002");
@@ -86,10 +88,27 @@ public class EmailDbContext(DbContextOptions<EmailDbContext> options) : DbContex
             entity.HasIndex(e => new { e.FolderId, e.ModSeq });
             entity.HasIndex(e => e.MessageId);
             entity.HasIndex(e => e.EmailObjectId);
+            entity.HasIndex(e => e.QueueDeliveryId).IsUnique();
 
             entity.HasOne(e => e.Folder)
                   .WithMany(f => f.Emails)
                   .HasForeignKey(e => e.FolderId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<MailQueueMessageDB>(entity =>
+        {
+            entity.HasIndex(message => new { message.State, message.NextAttemptAt });
+            entity.HasIndex(message => message.ReceivedAt);
+        });
+
+        modelBuilder.Entity<MailQueueRecipientDB>(entity =>
+        {
+            entity.HasIndex(recipient => new { recipient.MessageId, recipient.State });
+
+            entity.HasOne(recipient => recipient.Message)
+                  .WithMany(message => message.Recipients)
+                  .HasForeignKey(recipient => recipient.MessageId)
                   .OnDelete(DeleteBehavior.Cascade);
         });
 

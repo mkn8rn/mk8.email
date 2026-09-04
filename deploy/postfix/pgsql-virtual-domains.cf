@@ -1,5 +1,0 @@
-hosts = unix:/run/postgresql
-user = postfix
-dbname = mk8email
-query = SELECT 1 FROM addresses a JOIN companies c ON c.id = a.company_id WHERE a.domain = lower('%s') AND a.is_active AND c.is_active
-expansion_limit = 1

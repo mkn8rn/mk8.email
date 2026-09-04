@@ -1,7 +1,7 @@
 [Unit]
 Description=Back up mk8 services
 Requires=postgresql.service
-After=postgresql.service postfix.service dovecot.service rspamd.service valkey-server.service mk8email-admin.service
+After=postgresql.service mk8email.service rspamd.service valkey-server.service mk8email-admin.service
 
 [Service]
 Type=oneshot

@@ -25,7 +25,7 @@ fi
 sh "$asset_root/deploy/scripts/verify-host-prerequisites" \
     "$asset_root/deploy/prerequisites"
 
-for command_name in postfix postconf doveconf rspamadm clamd freshclam valkey-server nginx nft fail2ban-client psql s-nail; do
+for command_name in rspamadm clamd freshclam valkey-server nginx nft fail2ban-client psql s-nail; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf '%s\n' "A required mail command is missing: $command_name" >&2
         exit 1
@@ -43,34 +43,28 @@ systemctl stop mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer \
 if [ "$aide_was_active" = yes ]; then
     systemctl reset-failed dailyaidecheck.service
 fi
-systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service \
+systemctl stop mk8email.service mk8email-admin.service postfix.service dovecot.service rspamd.service \
     clamav-freshclam.service clamav-daemon.service clamav-daemon.socket valkey-server.service 2>/dev/null || true
-systemctl disable mk8email.service 2>/dev/null || true
-rm -f -- /etc/systemd/system/mk8email.service
-ln -s /dev/null /etc/systemd/system/mk8email.service
-
-if getent group vmail >/dev/null; then
-    [ "$(getent group vmail | cut -d: -f3)" = 5000 ] || {
-        printf '%s\n' "The vmail group identifier is not 5000." >&2
-        exit 1
-    }
-else
-    groupadd --system --gid 5000 vmail
-fi
-
+systemctl unmask mk8email.service
+systemctl disable postfix.service dovecot.service 2>/dev/null || true
+systemctl mask postfix.service dovecot.service
+timeout 300s env DEBIAN_FRONTEND=noninteractive apt-get purge --yes \
+    postfix postfix-pcre postfix-pgsql \
+    dovecot-core dovecot-imapd dovecot-lmtpd dovecot-pgsql dovecot-sieve
+rm -rf -- /etc/postfix /etc/dovecot /var/spool/postfix /var/lib/dovecot /var/vmail
+rm -f -- /etc/systemd/system/var-vmail.mount /etc/mailname
+rm -rf -- /etc/systemd/system/postfix@.service.d \
+    /etc/systemd/system/dovecot.service.d
 if getent passwd vmail >/dev/null; then
-    if [ "$(id -u vmail)" != 5000 ] || [ "$(id -g vmail)" != 5000 ]; then
-        printf '%s\n' "The vmail user identifiers are not 5000." >&2
-        exit 1
-    fi
-else
-    useradd --system --uid 5000 --gid vmail --home-dir /var/vmail \
-        --no-create-home --shell /usr/sbin/nologin vmail
+    userdel vmail
+fi
+if getent group vmail >/dev/null; then
+    groupdel vmail
 fi
 
 getent group tlskeys >/dev/null || groupadd --system tlskeys
 getent group dkimkeys >/dev/null || groupadd --system dkimkeys
-usermod --append --groups tlskeys postfix
+usermod --append --groups tlskeys mk8email
 usermod --append --groups dkimkeys,clamav _rspamd
 
 install -d -o root -g mk8email -m 0751 /etc/mk8email
@@ -179,23 +173,6 @@ fi
 chown root:dkimkeys "$primary_key"
 chmod 0640 "$primary_key"
 
-install -d -o root -g root -m 0755 /etc/postfix
-install -o root -g root -m 0644 "$asset_root/deploy/postfix/main.cf" /etc/postfix/main.cf
-install -o root -g root -m 0644 "$asset_root/deploy/postfix/master.cf" /etc/postfix/master.cf
-install -o root -g root -m 0644 "$asset_root/deploy/postfix/aliases" /etc/aliases
-for map_file in "$asset_root"/deploy/postfix/pgsql-*.cf; do
-    install -o root -g postfix -m 0640 "$map_file" "/etc/postfix/$(basename "$map_file")"
-done
-printf '%s\n' "mk8n.com" > /etc/mailname
-newaliases
-
-install -d -o root -g tlskeys -m 0751 /var/spool/postfix/etc/mk8email/tls
-install -o root -g tlskeys -m 0444 /etc/mk8email/tls/fullchain.pem /var/spool/postfix/etc/mk8email/tls/fullchain.pem
-install -o root -g tlskeys -m 0440 /etc/mk8email/tls/privkey.pem /var/spool/postfix/etc/mk8email/tls/privkey.pem
-
-install -d -o root -g root -m 0755 /etc/dovecot
-install -o root -g root -m 0644 "$asset_root/deploy/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
-
 install -d -o root -g root -m 0755 /etc/rspamd/local.d
 for rspamd_file in "$asset_root"/deploy/rspamd/local.d/*; do
     install -o root -g root -m 0644 "$rspamd_file" "/etc/rspamd/local.d/$(basename "$rspamd_file")"
@@ -214,15 +191,11 @@ install -o root -g root -m 0644 "$asset_root/deploy/clamav/freshclam.conf" /etc/
 install -o root -g valkey -m 0640 "$asset_root/deploy/valkey/valkey.conf" /etc/valkey/valkey.conf
 
 install -d -o root -g root -m 0755 \
-    /etc/systemd/system/postfix@.service.d \
-    /etc/systemd/system/dovecot.service.d \
     /etc/systemd/system/rspamd.service.d \
     /etc/systemd/system/clamav-daemon.service.d \
     /etc/systemd/system/clamav-daemon.socket.d \
     /etc/systemd/system/clamav-freshclam.service.d \
     /etc/systemd/system/valkey-server.service.d
-install -o root -g root -m 0644 "$asset_root/deploy/systemd/postfix@.service.d/90-mk8-hardening.conf" /etc/systemd/system/postfix@.service.d/90-mk8-hardening.conf
-install -o root -g root -m 0644 "$asset_root/deploy/systemd/dovecot.service.d/90-mk8-hardening.conf" /etc/systemd/system/dovecot.service.d/90-mk8-hardening.conf
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/rspamd.service.d/90-mk8-hardening.conf" /etc/systemd/system/rspamd.service.d/90-mk8-hardening.conf
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/clamav-daemon.service.d/90-mk8-hardening.conf" /etc/systemd/system/clamav-daemon.service.d/90-mk8-hardening.conf
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/clamav-daemon.socket.d/90-mk8-hardening.conf" /etc/systemd/system/clamav-daemon.socket.d/90-mk8-hardening.conf
@@ -236,10 +209,10 @@ install -o root -g root -m 0644 "$asset_root/deploy/aide/90_mk8_dynamic_data" /e
 install -o root -g root -m 0644 "$asset_root/deploy/default/aide" /etc/default/aide
 install -d -o root -g root -m 0755 /etc/systemd/system/nginx.service.d
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/nginx.service.d/90-mk8-hardening.conf" /etc/systemd/system/nginx.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8email.service" /etc/systemd/system/mk8email.service
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8email-admin.service" /etc/systemd/system/mk8email-admin.service
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-mail-health.service" /etc/systemd/system/mk8-mail-health.service
 install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-mail-health.timer" /etc/systemd/system/mk8-mail-health.timer
-install -o root -g root -m 0644 "$asset_root/deploy/systemd/var-vmail.mount" /etc/systemd/system/var-vmail.mount
 
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/configure-mail-database-access" /usr/local/sbin/configure-mail-database-access
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/configure-apt-sources" /usr/local/sbin/configure-apt-sources
@@ -322,6 +295,10 @@ elif [ ! -s "$primary_domain_certificate" ] \
     exit 1
 fi
 install -o root -g root -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
+install -d -o root -g root -m 0755 /etc/fail2ban/filter.d
+install -o root -g root -m 0644 \
+    "$asset_root/deploy/fail2ban/filter.d/mk8email-auth.conf" \
+    /etc/fail2ban/filter.d/mk8email-auth.conf
 install -o root -g root -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
 
 if ! python3 - /etc/mk8email/mk8email.config.json <<'PY'
@@ -339,8 +316,6 @@ then
     exit 1
 fi
 
-postfix check
-doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
 rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict >/dev/null
 clamconf --config-dir=/etc/clamav --non-default >/dev/null
 nginx -t
@@ -352,13 +327,13 @@ if [ "$legacy_key_migrated" = true ]; then
     rm -f -- /etc/mk8email/dkim/s202609.private.pem
 fi
 
-systemctl unmask postfix.service dovecot.service rspamd.service clamav-daemon.service \
+systemctl unmask mk8email.service rspamd.service clamav-daemon.service \
     clamav-daemon.socket clamav-freshclam.service valkey-server.service
+systemctl mask postfix.service dovecot.service
 systemctl daemon-reload
-systemctl enable var-vmail.mount
 systemd-analyze verify mk8email-admin.service mk8-mail-health.service mk8-mail-health.timer \
-    dovecot.service rspamd.service clamav-daemon.service clamav-freshclam.service valkey-server.service \
-    var-vmail.mount dailyaidecheck.service dailyaidecheck.timer
+    mk8email.service rspamd.service clamav-daemon.service clamav-freshclam.service \
+    valkey-server.service dailyaidecheck.service dailyaidecheck.timer
 nft -f /etc/nftables.conf
 systemctl reload nginx.service
 systemctl restart fail2ban.service
@@ -368,4 +343,4 @@ if runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --tuples-only --no-
     /usr/local/sbin/configure-mail-database-access
 fi
 
-printf '%s\n' "Mail stack assets are installed. The public mail services remain inactive."
+printf '%s\n' "Native mail assets are installed. The public mail service remains inactive."

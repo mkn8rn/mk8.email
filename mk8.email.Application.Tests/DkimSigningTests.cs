@@ -94,9 +94,35 @@ public sealed class DkimSigningTests
             () => signer.Sign("Subject: Missing From\r\n\r\nbody", "mk8n.com", "default", _key.PrivateKeyPath));
     }
 
+    [TestMethod]
+    public void SignPreservesEightBitMessageOctets()
+    {
+        var signer = new MimeKitDkimSigningService();
+        var utf8Text = Encoding.UTF8.GetBytes("café");
+        var wireText = Encoding.Latin1.GetString(utf8Text);
+        var rawMessage =
+            "From: admin@mk8n.com\r\n" +
+            "To: recipient@example.net\r\n" +
+            "Subject: UTF-8 body\r\n" +
+            "Date: Thu, 04 Sep 2026 12:00:00 +0000\r\n" +
+            "Message-ID: <utf8-test@mk8n.com>\r\n" +
+            "MIME-Version: 1.0\r\n" +
+            "Content-Type: text/plain; charset=utf-8\r\n" +
+            "Content-Transfer-Encoding: 8bit\r\n\r\n" +
+            wireText + "\r\n";
+
+        var signed = signer.Sign(rawMessage, "mk8n.com", "default", _key.PrivateKeyPath);
+
+        Assert.IsTrue(Encoding.Latin1.GetBytes(signed).AsSpan().IndexOf(utf8Text) >= 0);
+        using var message = LoadMessage(signed);
+        var signature = message.Headers[message.Headers.IndexOf(HeaderId.DkimSignature)];
+        var verifier = new DkimVerifier(new TestPublicKeyLocator(_key.PublicDnsRecord));
+        Assert.IsTrue(verifier.Verify(message, signature));
+    }
+
     private static MimeMessage LoadMessage(string rawMessage)
     {
-        var stream = new MemoryStream(Encoding.UTF8.GetBytes(rawMessage), writable: false);
+        var stream = new MemoryStream(Encoding.Latin1.GetBytes(rawMessage), writable: false);
         try
         {
             return MimeMessage.Load(stream);

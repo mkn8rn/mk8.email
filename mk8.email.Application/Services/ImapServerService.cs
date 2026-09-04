@@ -1,8 +1,8 @@
-using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -10,11 +10,12 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using mk8.email.Application.Interfaces;
+using mk8.email.Application.Protocol;
 using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
 using mk8.email.Infrastructure.Models;
-using mk8.email.Utils;
 
 namespace mk8.email.Application.Services;
 
@@ -23,7 +24,10 @@ IServiceScopeFactory scopeFactory,
 EnvironmentConfig env,
 ILogger<ImapServerService> logger) : BackgroundService
 {
-    private static readonly Encoding ProtocolEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    private const int MaximumCommandLineCharacters = 16 * 1024;
+    private const int MaximumAuthenticationLineCharacters = 4096;
+    private const int MaximumConcurrentConnections = 1000;
+    private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
     private enum ListenerMode { Imap, ImplicitTls }
 
@@ -40,13 +44,15 @@ ILogger<ImapServerService> logger) : BackgroundService
         public bool CondstoreEnabled { get; set; }
         public bool QresyncEnabled { get; set; }
         public bool CompressEnabled { get; set; }
+        public required string RemoteIp { get; init; }
+        public int AuthenticationFailures { get; set; }
     }
 
     private enum ImapState { NotAuthenticated, Authenticated, Selected, Logout }
 
     private enum SessionUpgrade { None, StartTls, Compress }
 
-    private readonly ConcurrentDictionary<IPAddress, int> _connectionsPerIp = new();
+    private readonly ConnectionLimiter _connectionLimiter = new(MaximumConcurrentConnections);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -97,11 +103,12 @@ ILogger<ImapServerService> logger) : BackgroundService
         var remoteIp = (remoteEndpoint as IPEndPoint)?.Address ?? IPAddress.None;
         var remoteLabel = remoteEndpoint?.ToString() ?? "unknown";
 
-        var currentCount = _connectionsPerIp.AddOrUpdate(remoteIp, 1, (_, c) => c + 1);
-        if (currentCount > config.MaxConnectionsPerIp)
+        using var connectionLease = _connectionLimiter.TryAcquire(
+            remoteIp,
+            config.MaxConnectionsPerIp);
+        if (connectionLease is null)
         {
-            _connectionsPerIp.AddOrUpdate(remoteIp, 0, (_, c) => c - 1);
-            logger.LogWarning("Rejected IMAP connection from {Endpoint}: too many connections", remoteLabel);
+            logger.LogWarning("Rejected IMAP connection from {Endpoint}: connection limit", remoteLabel);
             client.Dispose();
             return;
         }
@@ -121,9 +128,9 @@ ILogger<ImapServerService> logger) : BackgroundService
                     if (config.TlsCertificatePath is null)
                         throw new InvalidOperationException("Implicit TLS requires a certificate.");
 
-                    var cert = LoadCertificate(config);
+                    using var cert = LoadCertificate(config);
                     sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
-                    await sslStream.AuthenticateAsServerAsync(cert);
+                    await AuthenticateAsServerAsync(sslStream, cert, timeout.Token);
                     stream = sslStream;
                 }
 
@@ -131,6 +138,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 {
                     Mode = mode,
                     IsSecure = mode == ListenerMode.ImplicitTls,
+                    RemoteIp = remoteIp.ToString(),
                 };
                 var sendGreeting = true;
 
@@ -142,9 +150,9 @@ ILogger<ImapServerService> logger) : BackgroundService
 
                     if (upgrade == SessionUpgrade.StartTls && config.TlsCertificatePath is not null)
                     {
-                        var cert = LoadCertificate(config);
+                        using var cert = LoadCertificate(config);
                         var tlsStream = new SslStream(stream, leaveInnerStreamOpen: false);
-                        await tlsStream.AuthenticateAsServerAsync(cert);
+                        await AuthenticateAsServerAsync(tlsStream, cert, timeout.Token);
                         stream = tlsStream;
                         session.IsSecure = true;
                     }
@@ -165,10 +173,6 @@ ILogger<ImapServerService> logger) : BackgroundService
         {
             logger.LogWarning(ex, "Error handling IMAP connection from {Endpoint}", remoteLabel);
         }
-        finally
-        {
-            _connectionsPerIp.AddOrUpdate(remoteIp, 0, (_, c) => Math.Max(0, c - 1));
-        }
     }
 
     private async Task<SessionUpgrade> RunImapSessionAsync(
@@ -176,7 +180,8 @@ ILogger<ImapServerService> logger) : BackgroundService
     {
         var ct = timeout.Token;
 
-        using var reader = new StreamReader(stream, ProtocolEncoding, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+        using var streamReader = new StreamReader(stream, ProtocolEncoding, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true);
+        var reader = new BoundedLineReader(streamReader);
         await using var writer = new StreamWriter(stream, ProtocolEncoding, bufferSize: 4096, leaveOpen: true)
         {
             AutoFlush = true,
@@ -188,7 +193,14 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         while (!timeout.IsCancellationRequested && session.State != ImapState.Logout)
         {
-            var line = await reader.ReadLineAsync(ct);
+            var lineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
+            if (lineResult.IsTooLong)
+            {
+                await writer.WriteLineAsync("* BAD Command line is too long");
+                continue;
+            }
+
+            var line = lineResult.Value;
             if (line is null)
                 break;
 
@@ -244,10 +256,12 @@ ILogger<ImapServerService> logger) : BackgroundService
 
                 case "LOGIN":
                     await HandleLoginAsync(writer, tag, args, session, ct);
+                    await StopAfterTooManyAuthenticationFailuresAsync(writer, session);
                     break;
 
                 case "AUTHENTICATE":
                     await HandleAuthenticateAsync(reader, writer, tag, args, session, ct);
+                    await StopAfterTooManyAuthenticationFailuresAsync(writer, session);
                     break;
 
                 case "NAMESPACE":
@@ -442,7 +456,14 @@ ILogger<ImapServerService> logger) : BackgroundService
                         await writer.WriteLineAsync($"{tag} NO Not authenticated");
                         break;
                     }
-                    await HandleAppendAsync(reader, writer, tag, args, session, ct);
+                    await HandleAppendAsync(
+                        reader,
+                        writer,
+                        tag,
+                        args,
+                        session,
+                        config.MaxMessageSizeBytes,
+                        ct);
                     break;
 
                 case "IDLE":
@@ -495,7 +516,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                         await writer.WriteLineAsync($"{tag} NO No mailbox selected");
                         break;
                     }
-                    await HandleUidAsync(writer, reader, tag, args, session, ct);
+                    await HandleUidAsync(writer, tag, args, session, ct);
                     break;
 
                 case "SORT":
@@ -555,7 +576,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         GlobalConfigDB config,
         ImapSession session)
     {
-        var caps = "IMAP4rev1 LITERAL+ IDLE NAMESPACE SPECIAL-USE MOVE UNSELECT ID QUOTA UIDPLUS ENABLE LIST-STATUS SORT THREAD=REFERENCES THREAD=ORDEREDSUBJECT CONDSTORE QRESYNC ESEARCH MULTIAPPEND COMPRESS=DEFLATE BINARY OBJECTID";
+        var caps = "IMAP4rev1 LITERAL+ IDLE NAMESPACE SPECIAL-USE UIDPLUS";
         if (session.IsSecure)
         {
             caps += " AUTH=PLAIN";
@@ -594,6 +615,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         var user = await AuthenticateUserAsync(username, password, ct);
         if (user is null)
         {
+            RecordAuthenticationFailure(session);
             await writer.WriteLineAsync($"{tag} NO LOGIN failed");
             return;
         }
@@ -605,7 +627,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     }
 
     private async Task HandleAuthenticateAsync(
-        StreamReader reader, StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+        BoundedLineReader reader, StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
         if (!session.IsSecure)
         {
@@ -628,7 +650,13 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
 
         await writer.WriteLineAsync("+ ");
-        var encoded = await reader.ReadLineAsync(ct);
+        var encodedResult = await reader.ReadLineAsync(MaximumAuthenticationLineCharacters, ct);
+        var encoded = encodedResult.Value;
+        if (encodedResult.IsTooLong)
+        {
+            await writer.WriteLineAsync($"{tag} BAD Authentication response is too long");
+            return;
+        }
         if (encoded is null || encoded == "*")
         {
             await writer.WriteLineAsync($"{tag} BAD Authentication cancelled");
@@ -655,6 +683,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         if (username is null || password is null)
         {
+            RecordAuthenticationFailure(session);
             await writer.WriteLineAsync($"{tag} NO Authentication failed");
             return;
         }
@@ -662,6 +691,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         var user = await AuthenticateUserAsync(username, password, ct);
         if (user is null)
         {
+            RecordAuthenticationFailure(session);
             await writer.WriteLineAsync($"{tag} NO Authentication failed");
             return;
         }
@@ -672,18 +702,33 @@ ILogger<ImapServerService> logger) : BackgroundService
         await writer.WriteLineAsync($"{tag} OK AUTHENTICATE completed");
     }
 
-    private async Task<UserDB?> AuthenticateUserAsync(string username, string password, CancellationToken ct)
+    private async Task<AuthenticatedMailUser?> AuthenticateUserAsync(
+        string username,
+        string password,
+        CancellationToken ct)
     {
         using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        var authenticator = scope.ServiceProvider.GetRequiredService<IMailAuthenticator>();
+        return await authenticator.AuthenticateAsync(username, password, ct);
+    }
 
-        var user = await db.Users.AsNoTracking()
-            .FirstOrDefaultAsync(u => u.Username == username && u.IsActive, ct);
+    private void RecordAuthenticationFailure(ImapSession session)
+    {
+        session.AuthenticationFailures++;
+        logger.LogWarning(
+            "Mail authentication failed for protocol IMAP from {RemoteIp}",
+            session.RemoteIp);
+    }
 
-        if (user is null || !PasswordHasher.Verify(password, user.PasswordHash))
-            return null;
+    private static async Task StopAfterTooManyAuthenticationFailuresAsync(
+        StreamWriter writer,
+        ImapSession session)
+    {
+        if (session.AuthenticationFailures < 5)
+            return;
 
-        return user;
+        await writer.WriteLineAsync("* BYE Too many authentication failures");
+        session.State = ImapState.Logout;
     }
 
     private async Task HandleListAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
@@ -1395,7 +1440,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     }
 
     private async Task HandleUidAsync(
-        StreamWriter writer, StreamReader reader, string tag, string args, ImapSession session, CancellationToken ct)
+        StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
         var spaceIdx = args.IndexOf(' ');
         if (spaceIdx <= 0)
@@ -1799,7 +1844,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     {
         return await db.Emails
             .Where(e => e.FolderId == folderId)
-            .OrderBy(e => e.ReceivedAt)
+            .OrderBy(e => e.Uid)
             .ToListAsync(ct);
     }
 
@@ -1885,6 +1930,20 @@ ILogger<ImapServerService> logger) : BackgroundService
         return X509CertificateLoader.LoadPkcs12FromFile(config.TlsCertificatePath!, password: null);
     }
 
+    private static Task AuthenticateAsServerAsync(
+        SslStream stream,
+        X509Certificate2 certificate,
+        CancellationToken cancellationToken) =>
+        stream.AuthenticateAsServerAsync(
+            new SslServerAuthenticationOptions
+            {
+                ServerCertificate = certificate,
+                ClientCertificateRequired = false,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+            },
+            cancellationToken);
+
     private static bool ShouldSetSeen(string fetchItems)
     {
         var upper = fetchItems.ToUpperInvariant();
@@ -1959,7 +2018,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         if (normalizedItems.Contains("RFC822.SIZE") || isMacroAll || isMacroFast || isMacroFull)
         {
-            var size = email.SizeBytes > 0 ? email.SizeBytes : Encoding.UTF8.GetByteCount(BuildRfc822(email));
+            var size = email.SizeBytes > 0 ? email.SizeBytes : MailWireEncoding.Instance.GetByteCount(BuildRfc822(email));
             parts.Add($"RFC822.SIZE {size}");
         }
 
@@ -1973,19 +2032,19 @@ ILogger<ImapServerService> logger) : BackgroundService
             var rfc822 = BuildRfc822(email);
             var (data, origin) = ApplyPartial(rfc822, partialOffset, partialCount);
             var suffix = origin is not null ? $"<{origin}>" : "";
-            parts.Add($"BODY[]{suffix} {{{Encoding.UTF8.GetByteCount(data)}}}\r\n{data}");
+            parts.Add($"BODY[]{suffix} {{{MailWireEncoding.Instance.GetByteCount(data)}}}\r\n{data}");
         }
 
         if (normalizedItems.Contains("BODY[HEADER]") || normalizedItems.Contains("RFC822.HEADER"))
         {
             var header = BuildRfc822Header(email);
-            parts.Add($"BODY[HEADER] {{{Encoding.UTF8.GetByteCount(header)}}}\r\n{header}");
+            parts.Add($"BODY[HEADER] {{{MailWireEncoding.Instance.GetByteCount(header)}}}\r\n{header}");
         }
 
         if (normalizedItems.Contains("BODY[TEXT]") || normalizedItems.Contains("RFC822.TEXT"))
         {
             var body = email.Body;
-            parts.Add($"BODY[TEXT] {{{Encoding.UTF8.GetByteCount(body)}}}\r\n{body}");
+            parts.Add($"BODY[TEXT] {{{MailWireEncoding.Instance.GetByteCount(body)}}}\r\n{body}");
         }
 
         var headerFieldsMatch = HeaderFieldsRegex().Match(items);
@@ -1994,7 +2053,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             var requestedFields = headerFieldsMatch.Groups[1].Value
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries);
             var filtered = FilterHeaders(email, requestedFields);
-            parts.Add($"BODY[HEADER.FIELDS ({headerFieldsMatch.Groups[1].Value})] {{{Encoding.UTF8.GetByteCount(filtered)}}}\r\n{filtered}");
+            parts.Add($"BODY[HEADER.FIELDS ({headerFieldsMatch.Groups[1].Value})] {{{MailWireEncoding.Instance.GetByteCount(filtered)}}}\r\n{filtered}");
         }
 
         var headerFieldsNotMatch = HeaderFieldsNotRegex().Match(items);
@@ -2003,18 +2062,18 @@ ILogger<ImapServerService> logger) : BackgroundService
             var excludedFields = headerFieldsNotMatch.Groups[1].Value
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries);
             var filtered = FilterHeadersNot(email, excludedFields);
-            parts.Add($"BODY[HEADER.FIELDS.NOT ({headerFieldsNotMatch.Groups[1].Value})] {{{Encoding.UTF8.GetByteCount(filtered)}}}\r\n{filtered}");
+            parts.Add($"BODY[HEADER.FIELDS.NOT ({headerFieldsNotMatch.Groups[1].Value})] {{{MailWireEncoding.Instance.GetByteCount(filtered)}}}\r\n{filtered}");
         }
 
         if (normalizedItems.Contains("BODYSTRUCTURE"))
         {
-            var size = Encoding.UTF8.GetByteCount(email.Body);
+            var size = MailWireEncoding.Instance.GetByteCount(email.Body);
             var lines = email.Body.Split('\n').Length;
             parts.Add($"BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {size} {lines})");
         }
         else if (BodyStandaloneRegex().IsMatch(normalizedItems))
         {
-            var size = Encoding.UTF8.GetByteCount(email.Body);
+            var size = MailWireEncoding.Instance.GetByteCount(email.Body);
             var lines = email.Body.Split('\n').Length;
             parts.Add($"BODY (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {size} {lines})");
         }
@@ -2030,13 +2089,13 @@ ILogger<ImapServerService> logger) : BackgroundService
                 if (sectionUpper == "1")
                 {
                     var bodyContent = email.Body;
-                    parts.Add($"BODY[1] {{{Encoding.UTF8.GetByteCount(bodyContent)}}}\r\n{bodyContent}");
+                    parts.Add($"BODY[1] {{{MailWireEncoding.Instance.GetByteCount(bodyContent)}}}\r\n{bodyContent}");
                 }
             }
             else if (sectionUpper == "1.MIME")
             {
                 var mime = "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
-                parts.Add($"BODY[1.MIME] {{{Encoding.UTF8.GetByteCount(mime)}}}\r\n{mime}");
+                parts.Add($"BODY[1.MIME] {{{MailWireEncoding.Instance.GetByteCount(mime)}}}\r\n{mime}");
             }
         }
 
@@ -2067,7 +2126,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 "TEXT" => email.Body,
                 _ => email.Body,
             };
-            var contentBytes = Encoding.UTF8.GetBytes(content);
+            var contentBytes = MailWireEncoding.Instance.GetBytes(content);
             parts.Add($"BINARY[{binarySection}] ~{{{contentBytes.Length}}}\r\n{content}");
         }
 
@@ -2080,7 +2139,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 "" or "1" => email.Body,
                 _ => email.Body,
             };
-            parts.Add($"BINARY.SIZE[{sizeSection}] {Encoding.UTF8.GetByteCount(content)}");
+            parts.Add($"BINARY.SIZE[{sizeSection}] {MailWireEncoding.Instance.GetByteCount(content)}");
         }
 
         if (useUid || normalizedItems.Contains("UID"))
@@ -2115,10 +2174,10 @@ ILogger<ImapServerService> logger) : BackgroundService
         if (offset is null || count is null)
             return (content, null);
 
-        var bytes = Encoding.UTF8.GetBytes(content);
+        var bytes = MailWireEncoding.Instance.GetBytes(content);
         var start = Math.Min(offset.Value, bytes.Length);
         var length = Math.Min(count.Value, bytes.Length - start);
-        var sliced = Encoding.UTF8.GetString(bytes, start, length);
+        var sliced = MailWireEncoding.Instance.GetString(bytes, start, length);
         return (sliced, start);
     }
 
@@ -3261,7 +3320,13 @@ ILogger<ImapServerService> logger) : BackgroundService
     }
 
     private async Task HandleAppendAsync(
-        StreamReader reader, StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+        BoundedLineReader reader,
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        int maximumMessageSize,
+        CancellationToken ct)
     {
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
@@ -3298,6 +3363,19 @@ ILogger<ImapServerService> logger) : BackgroundService
             }
 
             var isLiteralPlus = remaining.Contains("{" + literalSize + "+}");
+            if (literalSize < 0 || literalSize > maximumMessageSize)
+            {
+                if (isLiteralPlus)
+                {
+                    await writer.WriteLineAsync("* BYE APPEND literal exceeds the message limit");
+                    session.State = ImapState.Logout;
+                }
+                else
+                {
+                    await writer.WriteLineAsync($"{tag} NO [TOOBIG] APPEND literal exceeds the message limit");
+                }
+                return;
+            }
             if (!isLiteralPlus)
                 await writer.WriteLineAsync("+ Ready for literal data");
 
@@ -3306,18 +3384,24 @@ ILogger<ImapServerService> logger) : BackgroundService
             while (totalRead < literalSize.Value)
             {
                 var read = await reader.ReadAsync(buffer.AsMemory(totalRead, literalSize.Value - totalRead), ct);
-                if (read == 0) break;
+                if (read == 0)
+                    throw new EndOfStreamException("The APPEND literal ended before its declared size.");
                 totalRead += read;
             }
 
             var messageData = new string(buffer, 0, totalRead);
+            if (messageData.Contains('\0'))
+            {
+                await writer.WriteLineAsync($"{tag} NO APPEND content contains a NUL byte");
+                return;
+            }
 
-            var (subject, body, headers) = ParseAppendMessage(messageData);
-            var sender = ExtractHeaderValue(headers, "From");
-            var recipient = ExtractHeaderValue(headers, "To");
+            var (subject, body, headers) = MailMessageParser.Parse(messageData);
+            var sender = MailMessageParser.ExtractHeaderValue(headers, "From");
+            var recipient = MailMessageParser.ExtractHeaderValue(headers, "To");
 
-            var msgId = ExtractHeaderValue(headers, "Message-ID");
-            var inReplyTo = ExtractHeaderValue(headers, "In-Reply-To");
+            var msgId = MailMessageParser.ExtractHeaderValue(headers, "Message-ID");
+            var inReplyTo = MailMessageParser.ExtractHeaderValue(headers, "In-Reply-To");
 
             var email = new EmailDB
             {
@@ -3327,10 +3411,10 @@ ILogger<ImapServerService> logger) : BackgroundService
                 Subject = subject.Length > 998 ? subject[..998] : subject,
                 Body = body,
                 RawHeaders = headers,
-                SizeBytes = Encoding.UTF8.GetByteCount(messageData),
+                SizeBytes = MailWireEncoding.Instance.GetByteCount(messageData),
                 MessageId = msgId,
                 InReplyTo = inReplyTo,
-                Cc = ExtractHeaderValue(headers, "Cc"),
+                Cc = MailMessageParser.ExtractHeaderValue(headers, "Cc"),
                 EmailObjectId = Guid.CreateVersion7().ToString("N"),
                 ThreadObjectId = GenerateThreadObjectId(inReplyTo, msgId),
                 Uid = folder.NextUid++,
@@ -3355,7 +3439,13 @@ ILogger<ImapServerService> logger) : BackgroundService
             allUids.Add(email.Uid);
 
             // Read the next line — could be empty (single APPEND) or contain another message spec (MULTIAPPEND)
-            var nextLine = await reader.ReadLineAsync(ct);
+            var nextLineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
+            if (nextLineResult.IsTooLong)
+            {
+                await writer.WriteLineAsync($"{tag} BAD APPEND continuation is too long");
+                return;
+            }
+            var nextLine = nextLineResult.Value;
             if (nextLine is null || nextLine.Length == 0 || !nextLine.TrimStart().StartsWith('(') && !nextLine.TrimStart().StartsWith('{'))
                 break;
 
@@ -3423,66 +3513,8 @@ ILogger<ImapServerService> logger) : BackgroundService
         return (mailboxName, flags, internalDate, literalSize);
     }
 
-    private static (string subject, string body, string headers) ParseAppendMessage(string rawMessage)
-    {
-        var subject = string.Empty;
-
-        var separatorIdx = rawMessage.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-        if (separatorIdx < 0)
-            separatorIdx = rawMessage.IndexOf("\n\n", StringComparison.Ordinal);
-
-        string headers;
-        string body;
-
-        if (separatorIdx >= 0)
-        {
-            headers = rawMessage[..separatorIdx];
-            var bodyStart = separatorIdx;
-            while (bodyStart < rawMessage.Length && rawMessage[bodyStart] is '\r' or '\n')
-                bodyStart++;
-            body = rawMessage[bodyStart..];
-        }
-        else
-        {
-            headers = rawMessage;
-            body = string.Empty;
-        }
-
-        subject = ExtractHeaderValue(headers, "Subject");
-        return (subject, body, headers);
-    }
-
-    private static string ExtractHeaderValue(string headers, string fieldName)
-    {
-        var lines = headers.Split('\n');
-        var sb = new StringBuilder();
-        var found = false;
-
-        foreach (var line in lines)
-        {
-            var trimmed = line.TrimEnd('\r');
-
-            if (found && trimmed.Length > 0 && trimmed[0] is ' ' or '\t')
-            {
-                sb.Append(' ').Append(trimmed.Trim());
-                continue;
-            }
-
-            if (found)
-                break;
-
-            if (trimmed.StartsWith(fieldName + ":", StringComparison.OrdinalIgnoreCase))
-            {
-                sb.Append(trimmed[(fieldName.Length + 1)..].Trim());
-                found = true;
-            }
-        }
-
-        return sb.ToString();
-    }
-
     private async Task HandleIdleAsync(
-        StreamReader reader, StreamWriter writer, string tag,
+        BoundedLineReader reader, StreamWriter writer, string tag,
         ImapSession session, CancellationTokenSource timeout, int connectionTimeoutSeconds)
     {
         await writer.WriteLineAsync("+ idling");
@@ -3501,15 +3533,21 @@ ILogger<ImapServerService> logger) : BackgroundService
             lastKnownModSeq = folder?.HighestModSeq ?? 0;
         }
 
+        var readTask = reader.ReadLineAsync(MaximumCommandLineCharacters, timeout.Token).AsTask();
         while (!timeout.IsCancellationRequested)
         {
-            // Poll for new messages every 5 seconds while waiting for DONE
-            var readTask = reader.ReadLineAsync(timeout.Token).AsTask();
             var completed = await Task.WhenAny(readTask, Task.Delay(TimeSpan.FromSeconds(5), timeout.Token));
 
             if (completed == readTask)
             {
-                var line = await readTask;
+                var lineResult = await readTask;
+                if (lineResult.IsTooLong)
+                {
+                    timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
+                    await writer.WriteLineAsync($"{tag} BAD IDLE terminator is too long");
+                    return;
+                }
+                var line = lineResult.Value;
                 if (line is null)
                     break;
 
@@ -3519,6 +3557,10 @@ ILogger<ImapServerService> logger) : BackgroundService
                     await writer.WriteLineAsync($"{tag} OK IDLE terminated");
                     return;
                 }
+
+                timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
+                await writer.WriteLineAsync($"{tag} BAD IDLE requires DONE");
+                return;
             }
             else if (session.SelectedFolderId is not null)
             {

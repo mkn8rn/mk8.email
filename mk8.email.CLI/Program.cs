@@ -6,6 +6,7 @@ using mk8.email.Application.Interfaces;
 using mk8.email.CLI;
 using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure;
+using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
 
 return await RunManagementCommandAsync(args);
@@ -49,7 +50,7 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
 
         if (arguments.SequenceEqual(["--initialize-empty-database"]))
         {
-            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
             using var scope = host.Services.CreateScope();
             var result = await scope.ServiceProvider
                 .GetRequiredService<IDatabaseInitializationService>()
@@ -58,9 +59,20 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
             return result.Succeeded ? 0 : 1;
         }
 
+        if (arguments.SequenceEqual(["--ensure-runtime-schema"]))
+        {
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
+            using var scope = host.Services.CreateScope();
+            await scope.ServiceProvider
+                .GetRequiredService<MailRuntimeSchemaService>()
+                .EnsureAsync();
+            Console.WriteLine("The native mail runtime schema is ready.");
+            return 0;
+        }
+
         if (arguments.Length == 3 && arguments[0] == "--ensure-domain")
         {
-            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
             using var scope = host.Services.CreateScope();
             var result = await scope.ServiceProvider
                 .GetRequiredService<IMailAdministrationService>()
@@ -80,7 +92,7 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
 
             var password = File.ReadAllText(passwordPath).TrimEnd('\r', '\n');
             _ = Enum.TryParse<UserRole>(arguments[2], ignoreCase: true, out var role);
-            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
             using var scope = host.Services.CreateScope();
             var result = await scope.ServiceProvider
                 .GetRequiredService<IMailAdministrationService>()
@@ -91,7 +103,7 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
 
         if (arguments.Length == 3 && arguments[0] == "--set-catchall")
         {
-            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
             using var scope = host.Services.CreateScope();
             var result = await scope.ServiceProvider
                 .GetRequiredService<IMailAdministrationService>()
@@ -103,7 +115,7 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
         if (arguments.Length == 3 && arguments[0] == "--set-domain-active")
         {
             _ = bool.TryParse(arguments[2], out var isActive);
-            using var host = BuildHost(arguments, environmentConfig, includeExperimentalServers: false);
+            using var host = BuildHost(arguments, environmentConfig, includeMailServers: false);
             using var scope = host.Services.CreateScope();
             var result = await scope.ServiceProvider
                 .GetRequiredService<IMailAdministrationService>()
@@ -112,7 +124,7 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
             return result.Succeeded ? 0 : 1;
         }
 
-        using var protocolHost = BuildHost(arguments, environmentConfig, includeExperimentalServers: true);
+        using var protocolHost = BuildHost(arguments, environmentConfig, includeMailServers: true);
         using (var scope = protocolHost.Services.CreateScope())
             await scope.ServiceProvider.GetRequiredService<ISeederService>().SeedAsync();
         await protocolHost.RunAsync();
@@ -128,22 +140,23 @@ static async Task<int> RunManagementCommandAsync(string[] arguments)
 static bool IsSupportedCommand(string[] arguments) =>
     arguments.SequenceEqual(["--healthcheck"])
     || arguments.SequenceEqual(["--initialize-empty-database"])
+    || arguments.SequenceEqual(["--ensure-runtime-schema"])
     || arguments.Length == 3 && arguments[0] == "--ensure-domain"
     || arguments.Length == 4 && arguments[0] == "--create-account"
     || arguments.Length == 3 && arguments[0] == "--set-catchall"
     || arguments.Length == 3 && arguments[0] == "--set-domain-active"
-    || arguments.SequenceEqual(["--serve-experimental-protocols"]);
+    || arguments.SequenceEqual(["--serve"]);
 
 static void WriteUsage()
 {
     Console.Error.WriteLine("Use one valid management command.");
-    Console.Error.WriteLine("The experimental protocol servers require an explicit command.");
+    Console.Error.WriteLine("The mail server requires the --serve command.");
 }
 
 static IHost BuildHost(
     string[] arguments,
     EnvironmentConfig environmentConfig,
-    bool includeExperimentalServers)
+    bool includeMailServers)
 {
     var builder = Host.CreateApplicationBuilder(arguments);
     builder.Logging.ClearProviders();
@@ -151,7 +164,7 @@ static IHost BuildHost(
     builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
     builder.Services.AddInfrastructure(environmentConfig);
     builder.Services.AddApplication();
-    if (includeExperimentalServers)
-        builder.Services.AddExperimentalMailProtocolServers();
+    if (includeMailServers)
+        builder.Services.AddMailProtocolServers();
     return builder.Build();
 }

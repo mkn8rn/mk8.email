@@ -10,31 +10,15 @@ if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ] || [ "$1" != mail ]; then
     printf '%s\n' "Usage: deploy-mk8-certificate mail" >&2
     exit 2
 fi
-certificate_target=$1
+
+lineage=${RENEWED_LINEAGE:-/etc/letsencrypt/live/mk8-mail}
+destination=/etc/mk8email/tls
+required_names="email.mk8n.com"
 
 fail() {
     printf '%s\n' "$1" >&2
     exit 1
 }
-
-case "$1" in
-    mail)
-        lineage=${RENEWED_LINEAGE:-/etc/letsencrypt/live/mk8-mail}
-        destination=/etc/mk8email/tls
-        spool_destination=/var/spool/postfix/etc/mk8email/tls
-        owner=root
-        group=tlskeys
-        directory_mode=0751
-        certificate_mode=0444
-        private_mode=0440
-        required_names="email.mk8n.com"
-        getent group tlskeys >/dev/null || groupadd --system tlskeys
-        ;;
-    *)
-        printf '%s\n' "The certificate target is not valid." >&2
-        exit 2
-        ;;
-esac
 
 case "$lineage" in
     /*) ;;
@@ -45,12 +29,6 @@ for required_command in flock nginx openssl systemctl timeout; do
     command -v "$required_command" >/dev/null \
         || fail "A required certificate command is missing: $required_command"
 done
-if [ "$1" = mail ]; then
-    for required_command in doveconf postfix; do
-        command -v "$required_command" >/dev/null \
-            || fail "A required certificate command is missing: $required_command"
-    done
-fi
 
 exec 9>/run/lock/mk8-certificate.lock
 flock --exclusive --nonblock 9 \
@@ -82,27 +60,30 @@ check_lineage_file "$lineage/privkey.pem" true
 work=$(mktemp -d /run/mk8-certificate.XXXXXX)
 completed=false
 changed=false
-reload_attempted=false
+nginx_reloaded=false
 destination_created=false
-spool_destination_created=false
-nginx_active=false
-postfix_active=false
-dovecot_active=false
+certificate_new=$destination/fullchain.pem.mk8-new
+private_new=$destination/privkey.pem.mk8-new
+certificate_rollback=$destination/fullchain.pem.mk8-rollback
+private_rollback=$destination/privkey.pem.mk8-rollback
 
-destination_certificate_new="$destination/fullchain.pem.mk8-new"
-destination_private_new="$destination/privkey.pem.mk8-new"
-destination_certificate_rollback="$destination/fullchain.pem.mk8-rollback"
-destination_private_rollback="$destination/privkey.pem.mk8-rollback"
-spool_certificate_new=
-spool_private_new=
-spool_certificate_rollback=
-spool_private_rollback=
-if [ -n "$spool_destination" ]; then
-    spool_certificate_new="$spool_destination/fullchain.pem.mk8-new"
-    spool_private_new="$spool_destination/privkey.pem.mk8-new"
-    spool_certificate_rollback="$spool_destination/fullchain.pem.mk8-rollback"
-    spool_private_rollback="$spool_destination/privkey.pem.mk8-rollback"
-fi
+snapshot_file() {
+    source_path=$1
+    snapshot_name=$2
+    if [ -L "$source_path" ]; then
+        fail "A managed certificate path must not be a symbolic link."
+    fi
+    if [ -e "$source_path" ] && [ ! -f "$source_path" ]; then
+        fail "A managed certificate path must be a regular file."
+    fi
+    if [ -f "$source_path" ]; then
+        [ "$(stat -c '%h' "$source_path")" -eq 1 ] \
+            || fail "A managed certificate file must not have another hard link."
+        cp -p -- "$source_path" "$work/$snapshot_name"
+        : > "$work/$snapshot_name.present"
+    fi
+    : > "$work/$snapshot_name.checked"
+}
 
 restore_snapshot() {
     restored_path=$1
@@ -118,53 +99,16 @@ restore_snapshot() {
     fi
 }
 
-reload_active_services() {
-    reload_status=0
-    if [ "$nginx_active" = true ]; then
-        systemctl reload nginx.service || reload_status=1
-    fi
-    if [ "$postfix_active" = true ]; then
-        systemctl reload postfix.service || reload_status=1
-    fi
-    if [ "$dovecot_active" = true ]; then
-        systemctl reload dovecot.service || reload_status=1
-    fi
-    return "$reload_status"
-}
-
 restore_previous_certificate() {
     restore_status=0
-    restore_snapshot "$destination/fullchain.pem" destination-fullchain \
-        "$destination_certificate_rollback" || restore_status=1
-    restore_snapshot "$destination/privkey.pem" destination-privkey \
-        "$destination_private_rollback" || restore_status=1
-    rm -f -- "$destination_certificate_new" "$destination_private_new"
-
-    if [ -n "$spool_destination" ]; then
-        restore_snapshot "$spool_destination/fullchain.pem" spool-fullchain \
-            "$spool_certificate_rollback" || restore_status=1
-        restore_snapshot "$spool_destination/privkey.pem" spool-privkey \
-            "$spool_private_rollback" || restore_status=1
-        rm -f -- "$spool_certificate_new" "$spool_private_new"
-    fi
-
-    if [ "$reload_attempted" = true ]; then
-        rollback_configuration_valid=true
-        nginx -t || rollback_configuration_valid=false
-        if [ "$certificate_target" = mail ]; then
-            postfix check || rollback_configuration_valid=false
-            doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null \
-                || rollback_configuration_valid=false
-        fi
-        if [ "$rollback_configuration_valid" = true ]; then
-            reload_active_services || restore_status=1
-        else
-            restore_status=1
-        fi
-    fi
-
-    if [ "$spool_destination_created" = true ]; then
-        rmdir "$spool_destination" 2>/dev/null || restore_status=1
+    restore_snapshot "$destination/fullchain.pem" fullchain "$certificate_rollback" \
+        || restore_status=1
+    restore_snapshot "$destination/privkey.pem" private "$private_rollback" \
+        || restore_status=1
+    rm -f -- "$certificate_new" "$private_new"
+    if [ "$nginx_reloaded" = true ]; then
+        nginx -t >/dev/null 2>&1 || restore_status=1
+        systemctl reload nginx.service || restore_status=1
     fi
     if [ "$destination_created" = true ]; then
         rmdir "$destination" 2>/dev/null || restore_status=1
@@ -195,65 +139,12 @@ finish() {
 trap finish EXIT
 trap 'exit 1' HUP INT TERM
 
-check_certificate_directory() {
-    checked_directory=$1
-    expected_group=$2
-    expected_mode=${3#0}
-    created_marker=$4
-    if [ -L "$checked_directory" ]; then
-        fail "A certificate directory must not be a symbolic link."
-    fi
-    if [ -e "$checked_directory" ] && [ ! -d "$checked_directory" ]; then
-        fail "A certificate directory must be a directory."
-    fi
-    if [ ! -d "$checked_directory" ]; then
-        install -d -o root -g "$expected_group" -m "$3" "$checked_directory"
-        case "$created_marker" in
-            destination_created) destination_created=true ;;
-            spool_destination_created) spool_destination_created=true ;;
-            *) fail "The certificate directory marker is not valid." ;;
-        esac
-        changed=true
-    fi
-    [ "$(stat -c '%U:%G' "$checked_directory")" = "root:$expected_group" ] \
-        || fail "A certificate directory has unexpected ownership."
-    [ "$(stat -c '%a' "$checked_directory")" = "$expected_mode" ] \
-        || fail "A certificate directory has unexpected permissions."
-}
-
-snapshot_file() {
-    source_path=$1
-    snapshot_name=$2
-    if [ -L "$source_path" ]; then
-        fail "A managed certificate path must not be a symbolic link."
-    fi
-    if [ -e "$source_path" ] && [ ! -f "$source_path" ]; then
-        fail "A managed certificate path must be a regular file."
-    fi
-    if [ -f "$source_path" ]; then
-        [ "$(stat -c '%h' "$source_path")" -eq 1 ] \
-            || fail "A managed certificate file must not have another hard link."
-        cp -p -- "$source_path" "$work/$snapshot_name"
-        : > "$work/$snapshot_name.present"
-    fi
-    : > "$work/$snapshot_name.checked"
-}
-
-check_pending_path() {
-    pending_path=$1
-    if [ -e "$pending_path" ] || [ -L "$pending_path" ]; then
-        fail "A stale certificate transaction file exists."
-    fi
-}
-
 openssl x509 -in "$lineage/fullchain.pem" -noout -checkend 1209600
-openssl pkey -in "$lineage/privkey.pem" -noout -check \
-    </dev/null >/dev/null
+openssl pkey -in "$lineage/privkey.pem" -noout -check </dev/null >/dev/null
 for required_name in $required_names; do
-    if ! openssl x509 -in "$lineage/fullchain.pem" -noout \
-        -checkhost "$required_name" >/dev/null 2>&1; then
-        fail "The certificate does not cover $required_name."
-    fi
+    openssl x509 -in "$lineage/fullchain.pem" -noout \
+        -checkhost "$required_name" >/dev/null 2>&1 \
+        || fail "The certificate does not cover $required_name."
 done
 openssl x509 -in "$lineage/fullchain.pem" -pubkey -noout \
     | openssl pkey -pubin -outform DER > "$work/certificate-public-key.der"
@@ -266,73 +157,42 @@ expected_fingerprint=$(openssl x509 -in "$lineage/fullchain.pem" \
 
 systemctl is-active --quiet nginx.service \
     || fail "nginx must be active before certificate deployment."
-nginx_active=true
-if [ "$1" = mail ]; then
-    systemctl is-active --quiet postfix.service \
-        || fail "Postfix must be active before mail certificate deployment."
-    systemctl is-active --quiet dovecot.service \
-        || fail "Dovecot must be active before mail certificate deployment."
-    postfix_active=true
-    dovecot_active=true
-fi
-
+systemctl is-active --quiet mk8email.service \
+    || fail "mk8.email must be active before certificate deployment."
 nginx -t
-if [ "$1" = mail ]; then
-    postfix check
-    doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
-fi
 
-snapshot_file "$destination/fullchain.pem" destination-fullchain
-snapshot_file "$destination/privkey.pem" destination-privkey
-check_pending_path "$destination_certificate_new"
-check_pending_path "$destination_private_new"
-check_pending_path "$destination_certificate_rollback"
-check_pending_path "$destination_private_rollback"
-if [ -n "$spool_destination" ]; then
-    snapshot_file "$spool_destination/fullchain.pem" spool-fullchain
-    snapshot_file "$spool_destination/privkey.pem" spool-privkey
-    check_pending_path "$spool_certificate_new"
-    check_pending_path "$spool_private_new"
-    check_pending_path "$spool_certificate_rollback"
-    check_pending_path "$spool_private_rollback"
+if [ -L "$destination" ]; then
+    fail "The certificate directory must not be a symbolic link."
 fi
+if [ -e "$destination" ] && [ ! -d "$destination" ]; then
+    fail "The certificate path must be a directory."
+fi
+if [ ! -d "$destination" ]; then
+    install -d -o root -g tlskeys -m 0751 "$destination"
+    destination_created=true
+    changed=true
+fi
+[ "$(stat -c '%U:%G %a' "$destination")" = "root:tlskeys 751" ] \
+    || fail "The certificate directory has unsafe metadata."
 
-check_certificate_directory "$destination" "$group" "$directory_mode" \
-    destination_created
-if [ -n "$spool_destination" ]; then
-    check_certificate_directory "$spool_destination" "$group" "$directory_mode" \
-        spool_destination_created
-fi
+snapshot_file "$destination/fullchain.pem" fullchain
+snapshot_file "$destination/privkey.pem" private
+for pending_path in "$certificate_new" "$private_new" \
+    "$certificate_rollback" "$private_rollback"; do
+    [ ! -e "$pending_path" ] && [ ! -L "$pending_path" ] \
+        || fail "A stale certificate transaction file exists."
+done
 
 changed=true
-install -o "$owner" -g "$group" -m "$certificate_mode" \
-    "$lineage/fullchain.pem" "$destination_certificate_new"
-install -o "$owner" -g "$group" -m "$private_mode" \
-    "$lineage/privkey.pem" "$destination_private_new"
-mv -f -- "$destination_certificate_new" "$destination/fullchain.pem"
-mv -f -- "$destination_private_new" "$destination/privkey.pem"
-
-if [ -n "$spool_destination" ]; then
-    install -o root -g "$group" -m "$certificate_mode" \
-        "$destination/fullchain.pem" "$spool_certificate_new"
-    install -o root -g "$group" -m "$private_mode" \
-        "$destination/privkey.pem" "$spool_private_new"
-    mv -f -- "$spool_certificate_new" "$spool_destination/fullchain.pem"
-    mv -f -- "$spool_private_new" "$spool_destination/privkey.pem"
-fi
+install -o root -g tlskeys -m 0444 "$lineage/fullchain.pem" "$certificate_new"
+install -o root -g tlskeys -m 0440 "$lineage/privkey.pem" "$private_new"
+mv -f -- "$certificate_new" "$destination/fullchain.pem"
+mv -f -- "$private_new" "$destination/privkey.pem"
 sync -f "$destination"
-if [ -n "$spool_destination" ]; then
-    sync -f "$spool_destination"
-fi
 
 nginx -t
-if [ "$1" = mail ]; then
-    postfix check
-    doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
-fi
-
-reload_attempted=true
-reload_active_services
+nginx_reloaded=true
+systemctl reload nginx.service
 
 probe_certificate() {
     probe_name=$1
@@ -356,20 +216,18 @@ probe_certificate() {
 }
 
 for required_name in $required_names; do
-    probe_certificate "https-$required_name" "$required_name" \
-        -connect 127.0.0.1:443
+    probe_certificate "https-$required_name" "$required_name" -connect 127.0.0.1:443
 done
-if [ "$1" = mail ]; then
-    probe_certificate smtp email.mk8n.com -starttls smtp -connect 127.0.0.1:25
-    probe_certificate submissions email.mk8n.com -connect 127.0.0.1:465
-    probe_certificate submission email.mk8n.com -starttls smtp -connect 127.0.0.1:587
-    probe_certificate imaps email.mk8n.com -connect 127.0.0.1:993
-fi
+probe_certificate smtp email.mk8n.com -starttls smtp -connect 127.0.0.1:25
+probe_certificate submissions email.mk8n.com -connect 127.0.0.1:465
+probe_certificate submission email.mk8n.com -starttls smtp -connect 127.0.0.1:587
+probe_certificate imaps email.mk8n.com -connect 127.0.0.1:993
 
 systemctl is-active --quiet nginx.service
-if [ "$1" = mail ]; then
-    systemctl is-active --quiet postfix.service
-    systemctl is-active --quiet dovecot.service
+systemctl is-active --quiet mk8email.service
+if systemctl is-active --quiet postfix.service \
+    || systemctl is-active --quiet dovecot.service; then
+    fail "A forbidden mail service is active."
 fi
 
 completed=true

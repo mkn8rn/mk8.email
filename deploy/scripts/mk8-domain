@@ -22,10 +22,6 @@ fail() {
     exit 1
 }
 
-postmap_query() {
-    runuser -u postfix -- postmap -q "$1" "$2"
-}
-
 usage() {
     printf '%s\n' "Usage: mk8-domain prepare COMPANY DOMAIN" >&2
     printf '%s\n' "       mk8-domain request-certificate DOMAIN CONTACT_EMAIL" >&2
@@ -613,7 +609,6 @@ activate_domain() {
     verify_domain_web_services "$domain"
     rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet
     nginx -t >/dev/null
-    postfix check >/dev/null
     prior_state=$(database_domain_state "$domain")
     case "$prior_state" in
         active|pending) ;;
@@ -628,11 +623,6 @@ activate_domain() {
         if [ "$activation_completed" != true ] && [ "$activation_changed" = true ]; then
             set +e
             run_internal_cli --set-domain-active "$domain" false >/dev/null
-            postfix reload >/dev/null
-            if systemctl is-active --quiet dovecot.service; then
-                doveadm auth cache flush "*@$domain" >/dev/null
-                doveadm kick "*@$domain" >/dev/null
-            fi
             set -e
             printf '%s\n' "Domain activation failed. The domain was returned to pending state." >&2
             activation_status=1
@@ -646,15 +636,9 @@ activate_domain() {
     if [ "$prior_state" = pending ]; then
         activation_changed=true
     fi
-    postfix reload >/dev/null
-    [ "$(postmap_query "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" = 1 ] \
-        || fail "Postfix did not activate the domain."
-    mailbox_route=$(postmap_query "postmaster@$domain" \
-        pgsql:/etc/postfix/pgsql-virtual-mailboxes.cf)
-    alias_route=$(postmap_query "postmaster@$domain" \
-        pgsql:/etc/postfix/pgsql-virtual-aliases.cf)
-    [ -n "$mailbox_route$alias_route" ] \
-        || fail "Postfix did not activate the postmaster route."
+    [ "$(database_domain_state "$domain")" = active ] \
+        || fail "The native mail service did not activate the domain."
+    /usr/local/sbin/mk8email --healthcheck >/dev/null
     /usr/local/sbin/mk8-mail-health --deep --strict >/dev/null
 
     activation_completed=true
@@ -666,13 +650,8 @@ deactivate_domain() {
     domain=$1
     validate_domain "$domain" || fail "Use a normalized ASCII domain name."
     run_internal_cli --set-domain-active "$domain" false
-    postfix reload >/dev/null
-    if systemctl is-active --quiet dovecot.service; then
-        doveadm auth cache flush "*@$domain" >/dev/null
-        doveadm kick "*@$domain" >/dev/null
-    fi
-    [ -z "$(postmap_query "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" ] \
-        || fail "Postfix still accepts the deactivated domain."
+    [ "$(database_domain_state "$domain")" = pending ] \
+        || fail "The native mail service did not deactivate the domain."
     printf '%s\n' "The domain is inactive."
 }
 

@@ -36,6 +36,29 @@ for unit_name in \
     fi
 done
 
+for forbidden_unit in postfix.service dovecot.service; do
+    [ "$(systemctl is-enabled "$forbidden_unit" 2>/dev/null || true)" = masked ] \
+        || fail "$forbidden_unit is not masked."
+    if systemctl is-active --quiet "$forbidden_unit" 2>/dev/null; then
+        fail "$forbidden_unit is active."
+    fi
+done
+for forbidden_package in \
+    postfix postfix-pcre postfix-pgsql \
+    dovecot-core dovecot-imapd dovecot-lmtpd dovecot-pgsql dovecot-sieve; do
+    if dpkg-query --show --showformat='${db:Status-Abbrev}\n' "$forbidden_package" 2>/dev/null \
+        | grep -q '^ii'; then
+        fail "A forbidden mail package is installed: $forbidden_package"
+    fi
+done
+if pgrep -x master >/dev/null || pgrep -x dovecot >/dev/null; then
+    fail "A forbidden mail process is running."
+fi
+test -f /etc/fail2ban/filter.d/mk8email-auth.conf \
+    || fail "The native mail authentication filter is not installed."
+fail2ban-client status mk8email-auth >/dev/null \
+    || fail "The native mail authentication jail is not active."
+
 coredump_configuration=$(systemd-analyze cat-config systemd/coredump.conf)
 coredump_storage=$(printf '%s\n' "$coredump_configuration" \
     | sed -n 's/^[[:space:]]*Storage=//p' | tail -n 1)

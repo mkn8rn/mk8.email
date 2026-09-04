@@ -14,7 +14,7 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
     private const int MaximumAttempts = 5;
     private const int MaximumResponseLines = 100;
     private const int MaximumResponseLineCharacters = 4096;
-    private static readonly Encoding ProtocolEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
     private readonly IMailExchangeResolver _resolver;
     private readonly EnvironmentConfig _environment;
@@ -41,18 +41,33 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
         _certificateValidationCallback = certificateValidationCallback;
     }
 
-    public async Task<bool> RelayAsync(string sender, string recipient, string rawMessage)
+    public async Task<OutboundDeliveryResult> RelayAsync(
+        string sender,
+        string recipient,
+        string rawMessage,
+        CancellationToken cancellationToken = default)
     {
         if (!IsSafeMailbox(sender) || !TryGetDomain(recipient, out var domain))
-            return false;
+        {
+            return new OutboundDeliveryResult(
+                OutboundDeliveryStatus.PermanentFailure,
+                "The envelope address is not valid.");
+        }
 
         var timeoutSeconds = Math.Clamp(_environment.Limits.ConnectionTimeoutSeconds, 10, 60);
-        using var lookupTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        using var lookupTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        lookupTimeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
         var route = await _resolver.ResolveAsync(domain, lookupTimeout.Token);
         if (route.Status != MailRoutingStatus.Available)
         {
             _logger.LogWarning("Mail routing is unavailable for {Domain}: {Status}", domain, route.Status);
-            return false;
+            return route.Status == MailRoutingStatus.DoesNotAcceptMail
+                ? new OutboundDeliveryResult(
+                    OutboundDeliveryStatus.PermanentFailure,
+                    "The recipient domain does not accept mail.")
+                : new OutboundDeliveryResult(
+                    OutboundDeliveryStatus.TemporaryFailure,
+                    "Mail routing is temporarily unavailable.");
         }
 
         foreach (var endpoint in route.Exchanges
@@ -66,7 +81,8 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
                 continue;
             }
 
-            using var attemptTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+            using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            attemptTimeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             var result = await TryDeliverAsync(
                 endpoint,
                 sender,
@@ -77,15 +93,23 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
             if (result == DeliveryAttemptResult.Delivered)
             {
                 _logger.LogInformation("Outbound SMTP delivery through {Host} completed", endpoint.Host);
-                return true;
+                return new OutboundDeliveryResult(
+                    OutboundDeliveryStatus.Delivered,
+                    "The remote mail server accepted the message.");
             }
 
             _logger.LogWarning("Outbound SMTP delivery through {Host} ended with {Result}", endpoint.Host, result);
             if (result == DeliveryAttemptResult.PermanentFailure)
-                return false;
+            {
+                return new OutboundDeliveryResult(
+                    OutboundDeliveryStatus.PermanentFailure,
+                    "The remote mail server rejected the message permanently.");
+            }
         }
 
-        return false;
+        return new OutboundDeliveryResult(
+            OutboundDeliveryStatus.TemporaryFailure,
+            "All remote delivery attempts failed temporarily.");
     }
 
     private async Task<DeliveryAttemptResult> TryDeliverAsync(
@@ -140,9 +164,18 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
                     return Classify(ehlo);
             }
 
+            var containsEightBit = rawMessage.Any(character => character > 127);
+            if (containsEightBit
+                && (ehlo.Code != 250 || !HasCapability(ehlo, "8BITMIME")))
+            {
+                return DeliveryAttemptResult.PermanentFailure;
+            }
+
             var mail = await SendCommandAsync(
                 connection,
-                $"MAIL FROM:<{sender}>",
+                containsEightBit
+                    ? $"MAIL FROM:<{sender}> BODY=8BITMIME"
+                    : $"MAIL FROM:<{sender}>",
                 cancellationToken);
             if (mail?.Code / 100 != 2)
                 return Classify(mail);
@@ -165,6 +198,10 @@ public sealed class OutboundSmtpRelay : IOutboundMailRelay
 
             await connection.WriteLineAsync("QUIT", cancellationToken);
             return DeliveryAttemptResult.Delivered;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception exception) when (
             exception is SocketException or IOException or AuthenticationException or OperationCanceledException)

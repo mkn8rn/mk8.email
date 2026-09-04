@@ -4,6 +4,7 @@ import base64
 import imaplib
 import smtplib
 import ssl
+import subprocess
 import time
 import uuid
 from email.message import EmailMessage
@@ -77,13 +78,19 @@ def send_submission(value: EmailMessage, password: str, implicit_tls: bool) -> N
         client.send_message(value)
 
 
-def wait_for_message(account: str, password: str, marker: str, delete: bool = True) -> bytes:
+def wait_for_message(
+    account: str,
+    password: str,
+    marker: str,
+    folder: str = "INBOX",
+    delete: bool = True,
+) -> bytes:
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=15) as client:
             client.login(account, password)
-            status, _ = client.select("INBOX")
-            require(status == "OK", f"IMAP could not select {account}.")
+            status, _ = client.select(folder)
+            require(status == "OK", f"IMAP could not select {folder} for {account}.")
             status, data = client.uid("SEARCH", None, "HEADER", "X-Mk8-Test", marker)
             require(status == "OK", f"IMAP search failed for {account}.")
             identifiers = data[0].split()
@@ -108,12 +115,81 @@ def require_absent(account: str, password: str, marker: str) -> None:
         require(status == "OK" and not data[0].split(), "A rejected message reached a mailbox.")
 
 
+def queue_status(marker: str) -> tuple[str, int]:
+    require(marker.isascii() and marker.isalnum(), "The queue marker is not safe.")
+    query = (
+        "SELECT state || '|' || attempt_count FROM mail_queue_messages "
+        f"WHERE raw_message LIKE '%{marker}%' ORDER BY received_at DESC LIMIT 1"
+    )
+    result = subprocess.run(
+        [
+            "runuser",
+            "-u",
+            "postgres",
+            "--",
+            "psql",
+            "--dbname=mk8email",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            query,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    output = result.stdout.strip()
+    if not output:
+        return "", 0
+    state, separator, attempts = output.partition("|")
+    require(separator == "|" and attempts.isdecimal(), "The queue status is not valid.")
+    return state, int(attempts)
+
+
+def wait_for_queue_state(
+    marker: str,
+    expected: str,
+    timeout: int = 90,
+    minimum_attempts: int = 0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state, attempts = queue_status(marker)
+        if state == expected and attempts >= minimum_attempts:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"The queue message did not enter the {expected} state.")
+
+
+def delete_queue_message(marker: str) -> None:
+    require(marker.isascii() and marker.isalnum(), "The queue marker is not safe.")
+    query = f"DELETE FROM mail_queue_messages WHERE raw_message LIKE '%{marker}%'"
+    subprocess.run(
+        [
+            "runuser",
+            "-u",
+            "postgres",
+            "--",
+            "psql",
+            "--dbname=mk8email",
+            "--no-psqlrc",
+            "--quiet",
+            "--command",
+            query,
+        ],
+        check=True,
+        timeout=15,
+    )
+
+
 def test_open_relay() -> None:
     with smtplib.SMTP(INBOUND_HOST, 25, timeout=30) as client:
         client.ehlo("probe.debian.org")
         require(client.mail("probe@debian.org")[0] == 250, "The relay test sender was not accepted.")
         code, _ = client.rcpt("recipient@debian.org")
-        require(code in (550, 554), "Postfix accepted an unauthenticated relay recipient.")
+        require(code in (550, 554), "mk8.email accepted an unauthenticated relay recipient.")
 
 
 def test_sender_mismatch(password: str) -> None:
@@ -125,19 +201,7 @@ def test_sender_mismatch(password: str) -> None:
         code, _ = client.mail(PRIMARY)
         if code < 400:
             code, _ = client.rcpt(ADMIN)
-        require(code in (550, 553), "Postfix accepted an unauthorized sender identity.")
-
-
-def expect_content_rejection(value: EmailMessage, temporary: bool) -> None:
-    try:
-        send_inbound(value)
-    except smtplib.SMTPDataError as error:
-        if temporary:
-            require(400 <= error.smtp_code < 500, "The scanner failure was not temporary.")
-        else:
-            require(500 <= error.smtp_code < 600, "Unsafe content was not rejected permanently.")
-        return
-    raise RuntimeError("Postfix accepted content that the test expected it to reject.")
+        require(code in (550, 553), "mk8.email accepted an unauthorized sender identity.")
 
 
 def baseline(admin_password: str, primary_password: str) -> None:
@@ -172,8 +236,12 @@ def unsafe_content(admin_password: str) -> None:
         subtype="octet-stream",
         filename="eicar.com",
     )
-    expect_content_rejection(eicar, temporary=False)
-    require_absent(ADMIN, admin_password, eicar_marker)
+    try:
+        send_inbound(eicar)
+        wait_for_queue_state(eicar_marker, "quarantined")
+        require_absent(ADMIN, admin_password, eicar_marker)
+    finally:
+        delete_queue_message(eicar_marker)
 
     gtube_marker = uuid.uuid4().hex
     gtube = message(
@@ -181,8 +249,8 @@ def unsafe_content(admin_password: str) -> None:
         gtube_marker,
         "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X",
     )
-    expect_content_rejection(gtube, temporary=False)
-    require_absent(ADMIN, admin_password, gtube_marker)
+    send_inbound(gtube)
+    wait_for_message(ADMIN, admin_password, gtube_marker, folder="Spam")
 
     encrypted_marker = uuid.uuid4().hex
     encrypted = message(ADMIN, encrypted_marker)
@@ -192,12 +260,16 @@ def unsafe_content(admin_password: str) -> None:
         subtype="zip",
         filename="encrypted-eicar.zip",
     )
-    expect_content_rejection(encrypted, temporary=False)
-    require_absent(ADMIN, admin_password, encrypted_marker)
+    try:
+        send_inbound(encrypted)
+        wait_for_queue_state(encrypted_marker, "quarantined")
+        require_absent(ADMIN, admin_password, encrypted_marker)
+    finally:
+        delete_queue_message(encrypted_marker)
     print("EICAR, GTUBE, and encrypted archive rejection tests passed.")
 
 
-def scanner_unavailable() -> None:
+def scanner_unavailable() -> str:
     marker = uuid.uuid4().hex
     value = message(ADMIN, marker, f"Scanner availability probe {marker}.")
     value.add_attachment(
@@ -206,8 +278,10 @@ def scanner_unavailable() -> None:
         subtype="octet-stream",
         filename=f"{marker}.bin",
     )
-    expect_content_rejection(value, temporary=True)
-    print("The unavailable-scanner fail-closed test passed.")
+    send_inbound(value)
+    wait_for_queue_state(marker, "pending", minimum_attempts=1)
+    print(marker)
+    return marker
 
 
 def send_queue_probe() -> str:
@@ -219,7 +293,8 @@ def send_queue_probe() -> str:
 
 def receive_queue_probe(admin_password: str, marker: str) -> None:
     wait_for_message(ADMIN, admin_password, marker)
-    print("The queued message was delivered after Dovecot recovered.")
+    wait_for_queue_state(marker, "completed")
+    print("The persisted queue message was delivered after service recovery.")
 
 
 def main() -> None:

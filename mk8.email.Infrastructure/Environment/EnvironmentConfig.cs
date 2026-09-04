@@ -1,5 +1,6 @@
 using mk8.email.Infrastructure.Models;
 using Npgsql;
+using System.Net;
 
 namespace mk8.email.Infrastructure.Environment;
 
@@ -11,6 +12,8 @@ public sealed class EnvironmentConfig
     public TlsConfig Tls { get; init; } = new();
     public DkimConfig Dkim { get; init; } = new();
     public SecurityConfig Security { get; init; } = new();
+    public FilteringConfig Filtering { get; init; } = new();
+    public QueueConfig Queue { get; init; } = new();
     public LimitsConfig Limits { get; init; } = new();
     public GeneralConfig General { get; init; } = new();
     public AdminConfig Admin { get; init; } = new();
@@ -85,6 +88,30 @@ public sealed class EnvironmentConfig
         if (!isDevelopment && (Security.EnableSpfCheck || Security.EnableDmarcCheck))
             errors.Add("The built-in SPF and DMARC checks are not approved for production.");
 
+        if (!Uri.TryCreate(Filtering.RspamdEndpoint, UriKind.Absolute, out var rspamdEndpoint)
+            || rspamdEndpoint.Scheme != Uri.UriSchemeHttp
+            || rspamdEndpoint.AbsolutePath != "/checkv2")
+        {
+            errors.Add("Filtering.RspamdEndpoint must be an HTTP checkv2 URL.");
+        }
+        else if (!isDevelopment && !IsLoopbackHost(rspamdEndpoint.Host))
+        {
+            errors.Add("Filtering.RspamdEndpoint must use a loopback address in production.");
+        }
+        if (Filtering.TimeoutSeconds is < 5 or > 120)
+            errors.Add("Filtering.TimeoutSeconds must be from 5 through 120.");
+
+        if (Queue.PollIntervalMilliseconds is < 100 or > 60_000)
+            errors.Add("Queue.PollIntervalMilliseconds must be from 100 through 60000.");
+        if (Queue.LeaseSeconds is < 30 or > 3600)
+            errors.Add("Queue.LeaseSeconds must be from 30 through 3600.");
+        if (Queue.MaxAttempts is < 1 or > 100)
+            errors.Add("Queue.MaxAttempts must be from 1 through 100.");
+        if (Queue.MaxAgeHours is < 1 or > 720)
+            errors.Add("Queue.MaxAgeHours must be from 1 through 720.");
+        if (Queue.CompletedRetentionDays is < 1 or > 90)
+            errors.Add("Queue.CompletedRetentionDays must be from 1 through 90.");
+
         if (Limits.MaxMessageSizeBytes < 64 * 1024)
             errors.Add("Limits.MaxMessageSizeBytes must be at least 65536.");
         if (Limits.MaxRecipientsPerMessage is < 1 or > 1000)
@@ -106,6 +133,14 @@ public sealed class EnvironmentConfig
             errors.Add("Admin.SessionMinutes must be from 5 through 480.");
 
         return errors;
+    }
+
+    private static bool IsLoopbackHost(string host)
+    {
+        if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address);
     }
 
     private static void AddEnabledPort(List<(string Name, int Port)> ports, bool enabled, string name, int port)
@@ -240,6 +275,21 @@ public sealed class SecurityConfig
     public bool EnableSpfCheck { get; init; }
     public bool EnableDmarcCheck { get; init; }
     public string PasswordHashScheme { get; init; } = "BLF-CRYPT";
+}
+
+public sealed class FilteringConfig
+{
+    public string RspamdEndpoint { get; init; } = "http://127.0.0.1:11333/checkv2";
+    public int TimeoutSeconds { get; init; } = 70;
+}
+
+public sealed class QueueConfig
+{
+    public int PollIntervalMilliseconds { get; init; } = 500;
+    public int LeaseSeconds { get; init; } = 300;
+    public int MaxAttempts { get; init; } = 20;
+    public int MaxAgeHours { get; init; } = 120;
+    public int CompletedRetentionDays { get; init; } = 14;
 }
 
 public sealed class LimitsConfig

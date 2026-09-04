@@ -1,54 +1,63 @@
-using System.Net.Sockets;
-using System.Text;
+using System.Data;
 using Microsoft.EntityFrameworkCore;
 using mk8.email.Application.Interfaces;
+using mk8.email.Application.Protocol;
 using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Models;
 
 namespace mk8.email.Application.Services;
 
-public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRelay) : IEmailService
+public class EmailService(EmailDbContext db) : IEmailService
 {
-    public async Task<bool> CanReceiveAsync(string recipient)
+    public async Task<bool> CanReceiveAsync(
+        string recipient,
+        CancellationToken cancellationToken = default)
     {
-        var (localPart, domain) = ParseRecipient(recipient);
-        if (localPart is null || domain is null)
-            return false;
-
-        return await db.Inboxes.AsNoTracking()
-            .AnyAsync(i => (i.Name == localPart || i.Name == "*")
-                        && i.Address.Domain == domain
-                        && i.Address.IsActive
-                        && i.Address.Company.IsActive
-                        && i.Owner.IsActive
-                        && (i.Name != "*" || i.AliasForInboxId != null));
+        var target = await ResolveTargetInboxAsync(
+            recipient,
+            allowCatchAll: true,
+            cancellationToken);
+        return target is not null;
     }
 
-    public async Task<bool> DeliverAsync(string sender, string recipient, string rawMessage)
+    public async Task<bool> DeliverAsync(
+        string sender,
+        string recipient,
+        string rawMessage,
+        string folderName = DefaultFolders.Inbox,
+        Guid? queueDeliveryId = null,
+        CancellationToken cancellationToken = default)
     {
-        var (localPart, domain) = ParseRecipient(recipient);
-        if (localPart is null || domain is null)
+        if (!DefaultFolders.All.Contains(folderName, StringComparer.Ordinal))
+            throw new ArgumentException("The delivery folder is not valid.", nameof(folderName));
+
+        if (queueDeliveryId is not null
+            && await db.Emails.AsNoTracking().AnyAsync(
+                message => message.QueueDeliveryId == queueDeliveryId,
+                cancellationToken))
+        {
+            return true;
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
+        var target = await ResolveTargetInboxAsync(
+            recipient,
+            allowCatchAll: true,
+            cancellationToken);
+        if (target is null)
             return false;
 
-        var inbox = await db.Inboxes
-            .AsNoTracking()
-            .Where(i => (i.Name == localPart || i.Name == "*")
-                     && i.Address.Domain == domain
-                     && i.Address.IsActive
-                     && i.Address.Company.IsActive
-                     && i.Owner.IsActive
-                     && (i.Name != "*" || i.AliasForInboxId != null))
-            .OrderBy(i => i.Name == localPart ? 0 : 1)
-            .FirstOrDefaultAsync();
-        if (inbox is null)
+        var messageSize = MailWireEncoding.Instance.GetByteCount(rawMessage);
+        if (!await HasQuotaCapacityAsync(target, messageSize, cancellationToken))
             return false;
-
-        var targetInboxId = inbox.AliasForInboxId ?? inbox.Id;
 
         var folder = await db.Folders
-            .FirstOrDefaultAsync(f => f.InboxId == targetInboxId
-                                   && f.Name == DefaultFolders.Inbox);
+            .FirstOrDefaultAsync(f => f.InboxId == target.Id
+                                   && f.Name == folderName,
+                cancellationToken);
         if (folder is null)
             return false;
 
@@ -57,12 +66,12 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
 
         var (subject, body, headers) = ParseMessage(rawMessage);
 
-        var messageId = ExtractHeaderValue(headers, "Message-ID");
+        var messageId = MailMessageParser.ExtractHeaderValue(headers, "Message-ID");
         if (string.IsNullOrEmpty(messageId))
-            messageId = $"<{Guid.NewGuid()}@{domain}>";
+            messageId = $"<{Guid.NewGuid()}@{target.Domain}>";
 
-        var inReplyTo = ExtractHeaderValue(headers, "In-Reply-To");
-        var threadId = ResolveThreadObjectId(inReplyTo, messageId);
+        var inReplyTo = MailMessageParser.ExtractHeaderValue(headers, "In-Reply-To");
+        var threadId = await ResolveThreadObjectIdAsync(inReplyTo, messageId, cancellationToken);
 
         db.Emails.Add(new EmailDB
         {
@@ -72,55 +81,73 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
             Subject = subject.Length > 998 ? subject[..998] : subject,
             Body = body,
             RawHeaders = headers,
-            SizeBytes = Encoding.UTF8.GetByteCount(rawMessage),
+            SizeBytes = messageSize,
             MessageId = messageId,
             InReplyTo = inReplyTo,
-            Cc = ExtractHeaderValue(headers, "Cc"),
+            Cc = MailMessageParser.ExtractHeaderValue(headers, "Cc"),
             EmailObjectId = Guid.CreateVersion7().ToString("N"),
             ThreadObjectId = threadId,
+            QueueDeliveryId = queueDeliveryId,
             Uid = uid,
             ModSeq = modSeq,
             FolderId = folder.Id,
         });
 
-        await db.SaveChangesAsync();
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
         return true;
     }
 
-    public async Task SaveSentCopyAsync(string sender, string rawMessage)
+    public async Task<bool> SaveSentCopyAsync(
+        string sender,
+        string rawMessage,
+        Guid? queueDeliveryId = null,
+        CancellationToken cancellationToken = default)
     {
-        var (localPart, domain) = ParseRecipient(sender);
-        if (localPart is null || domain is null)
-            return;
+        if (queueDeliveryId is not null
+            && await db.Emails.AsNoTracking().AnyAsync(
+                message => message.QueueDeliveryId == queueDeliveryId,
+                cancellationToken))
+        {
+            return true;
+        }
 
-        var inbox = await db.Inboxes
-            .AsNoTracking()
-            .FirstOrDefaultAsync(i => i.Name == localPart
-                                   && i.Address.Domain == domain
-                                   && i.Address.IsActive);
-        if (inbox is null)
-            return;
+        await using var transaction = await db.Database.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            cancellationToken);
+        var target = await ResolveTargetInboxAsync(
+            sender,
+            allowCatchAll: false,
+            cancellationToken);
+        if (target is null)
+            return false;
 
-        var targetInboxId = inbox.AliasForInboxId ?? inbox.Id;
+        var messageSize = MailWireEncoding.Instance.GetByteCount(rawMessage);
+        if (!await HasQuotaCapacityAsync(target, messageSize, cancellationToken))
+            return false;
 
         var folder = await db.Folders
-            .FirstOrDefaultAsync(f => f.InboxId == targetInboxId
-                                   && f.Name == DefaultFolders.Sent);
+            .FirstOrDefaultAsync(f => f.InboxId == target.Id
+                                   && f.Name == DefaultFolders.Sent,
+                cancellationToken);
         if (folder is null)
-            return;
+            return false;
 
         var uid = folder.NextUid++;
         var modSeq = ++folder.HighestModSeq;
 
         var (subject, body, headers) = ParseMessage(rawMessage);
-        var recipient = ExtractHeaderValue(headers, "To");
+        var recipient = MailMessageParser.ExtractHeaderValue(headers, "To");
 
-        var sentMessageId = ExtractHeaderValue(headers, "Message-ID");
+        var sentMessageId = MailMessageParser.ExtractHeaderValue(headers, "Message-ID");
         if (string.IsNullOrEmpty(sentMessageId))
-            sentMessageId = $"<{Guid.NewGuid()}@{domain}>";
+            sentMessageId = $"<{Guid.NewGuid()}@{target.Domain}>";
 
-        var sentInReplyTo = ExtractHeaderValue(headers, "In-Reply-To");
-        var sentThreadId = ResolveThreadObjectId(sentInReplyTo, sentMessageId);
+        var sentInReplyTo = MailMessageParser.ExtractHeaderValue(headers, "In-Reply-To");
+        var sentThreadId = await ResolveThreadObjectIdAsync(
+            sentInReplyTo,
+            sentMessageId,
+            cancellationToken);
 
         db.Emails.Add(new EmailDB
         {
@@ -130,48 +157,22 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
             Subject = subject.Length > 998 ? subject[..998] : subject,
             Body = body,
             RawHeaders = headers,
-            SizeBytes = Encoding.UTF8.GetByteCount(rawMessage),
+            SizeBytes = messageSize,
             MessageId = sentMessageId,
             InReplyTo = sentInReplyTo,
-            Cc = ExtractHeaderValue(headers, "Cc"),
+            Cc = MailMessageParser.ExtractHeaderValue(headers, "Cc"),
             EmailObjectId = Guid.CreateVersion7().ToString("N"),
             ThreadObjectId = sentThreadId,
+            QueueDeliveryId = queueDeliveryId,
             Uid = uid,
             ModSeq = modSeq,
             IsRead = true,
             FolderId = folder.Id,
         });
 
-        await db.SaveChangesAsync();
-    }
-
-    private static string ExtractHeaderValue(string headers, string fieldName)
-    {
-        var lines = headers.Split('\n');
-        var sb = new StringBuilder();
-        var found = false;
-
-        foreach (var line in lines)
-        {
-            var trimmed = line.TrimEnd('\r');
-
-            if (found && trimmed.Length > 0 && trimmed[0] is ' ' or '\t')
-            {
-                sb.Append(' ').Append(trimmed.Trim());
-                continue;
-            }
-
-            if (found)
-                break;
-
-            if (trimmed.StartsWith(fieldName + ":", StringComparison.OrdinalIgnoreCase))
-            {
-                sb.Append(trimmed[(fieldName.Length + 1)..].Trim());
-                found = true;
-            }
-        }
-
-        return sb.ToString();
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return true;
     }
 
     private static (string? localPart, string? domain) ParseRecipient(string address)
@@ -182,13 +183,74 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
             : (null, null);
     }
 
-    private string ResolveThreadObjectId(string? inReplyTo, string? messageId)
+    private async Task<TargetInbox?> ResolveTargetInboxAsync(
+        string address,
+        bool allowCatchAll,
+        CancellationToken cancellationToken)
+    {
+        var (localPart, domain) = ParseRecipient(address);
+        if (localPart is null || domain is null)
+            return null;
+
+        var route = await db.Inboxes
+            .AsNoTracking()
+            .Where(inbox => (inbox.Name == localPart
+                    || allowCatchAll && inbox.Name == "*")
+                && inbox.Address.Domain == domain
+                && inbox.Address.IsActive
+                && inbox.Address.Company.IsActive
+                && (inbox.Name != "*" || inbox.AliasForInboxId != null))
+            .OrderBy(inbox => inbox.Name == localPart ? 0 : 1)
+            .Select(inbox => new
+            {
+                inbox.Id,
+                inbox.AliasForInboxId,
+            })
+            .FirstOrDefaultAsync(cancellationToken);
+        if (route is null)
+            return null;
+
+        var targetId = route.AliasForInboxId ?? route.Id;
+        return await db.Inboxes
+            .AsNoTracking()
+            .Where(inbox => inbox.Id == targetId
+                && inbox.Owner.IsActive
+                && inbox.Address.IsActive
+                && inbox.Address.Company.IsActive)
+            .Select(inbox => new TargetInbox(
+                inbox.Id,
+                inbox.Address.Domain,
+                inbox.Owner.QuotaBytes))
+            .SingleOrDefaultAsync(cancellationToken);
+    }
+
+    private async Task<bool> HasQuotaCapacityAsync(
+        TargetInbox target,
+        int addedBytes,
+        CancellationToken cancellationToken)
+    {
+        if (target.QuotaBytes <= 0)
+            return true;
+
+        var usedBytes = await db.Emails
+            .AsNoTracking()
+            .Where(message => message.Folder.InboxId == target.Id)
+            .SumAsync(message => (long?)message.SizeBytes, cancellationToken)
+            ?? 0;
+        return usedBytes < target.QuotaBytes
+            && addedBytes <= target.QuotaBytes - usedBytes;
+    }
+
+    private async Task<string> ResolveThreadObjectIdAsync(
+        string? inReplyTo,
+        string? messageId,
+        CancellationToken cancellationToken)
     {
         // If this message is a reply, try to find the thread of the parent message
         if (!string.IsNullOrEmpty(inReplyTo))
         {
-            var parent = db.Emails.AsNoTracking()
-                .FirstOrDefault(e => e.MessageId == inReplyTo);
+            var parent = await db.Emails.AsNoTracking()
+                .FirstOrDefaultAsync(e => e.MessageId == inReplyTo, cancellationToken);
             if (parent?.ThreadObjectId is not null)
                 return parent.ThreadObjectId;
         }
@@ -196,8 +258,10 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
         // Check if any existing message references this one (forward-thread linking)
         if (!string.IsNullOrEmpty(messageId))
         {
-            var child = db.Emails.AsNoTracking()
-                .FirstOrDefault(e => e.InReplyTo == messageId && e.ThreadObjectId != null);
+            var child = await db.Emails.AsNoTracking()
+                .FirstOrDefaultAsync(
+                    e => e.InReplyTo == messageId && e.ThreadObjectId != null,
+                    cancellationToken);
             if (child?.ThreadObjectId is not null)
                 return child.ThreadObjectId;
         }
@@ -206,47 +270,9 @@ public class EmailService(EmailDbContext db, IOutboundMailRelay outboundMailRela
         return Guid.CreateVersion7().ToString("N");
     }
 
-    private static (string subject, string body, string headers) ParseMessage(string rawMessage)
-    {
-        var subject = string.Empty;
+    private static ParsedMailMessage ParseMessage(string rawMessage) =>
+        MailMessageParser.Parse(rawMessage);
 
-        var separatorIdx = rawMessage.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-        if (separatorIdx < 0)
-            separatorIdx = rawMessage.IndexOf("\n\n", StringComparison.Ordinal);
-
-        string headers;
-        string body;
-
-        if (separatorIdx >= 0)
-        {
-            headers = rawMessage[..separatorIdx];
-            var bodyStart = separatorIdx;
-            while (bodyStart < rawMessage.Length && rawMessage[bodyStart] is '\r' or '\n')
-                bodyStart++;
-            body = rawMessage[bodyStart..];
-        }
-        else
-        {
-            headers = rawMessage;
-            body = string.Empty;
-        }
-
-        subject = ExtractHeaderValue(headers, "Subject");
-
-        return (subject, body, headers);
-    }
-
-    // ?? SMTP Relay (outbound delivery) ??
-
-    public async Task<bool> RelayAsync(string sender, string recipient, string rawMessage)
-    {
-        return await outboundMailRelay.RelayAsync(sender, recipient, rawMessage);
-    }
-
-    // ?? SPF / DKIM / DMARC verification (inbound) ??
-
-    public Task<(bool spfPass, bool dkimPass, bool dmarcPass)> VerifyInboundAuthAsync(
-        string senderDomain, string rawMessage, string? clientIp) =>
-        Task.FromResult((false, false, false));
+    private sealed record TargetInbox(Guid Id, string Domain, long QuotaBytes);
 
 }

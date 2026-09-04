@@ -17,11 +17,6 @@ clamdscan
 curl
 debian-archive-keyring
 debsums
-dovecot-core
-dovecot-imapd
-dovecot-lmtpd
-dovecot-pgsql
-dovecot-sieve
 fail2ban
 git
 gnupg
@@ -37,9 +32,6 @@ nginx
 openssh-server
 openssl
 packages-microsoft-prod
-postfix
-postfix-pcre
-postfix-pgsql
 postgresql-17
 postgresql-client-17
 python3

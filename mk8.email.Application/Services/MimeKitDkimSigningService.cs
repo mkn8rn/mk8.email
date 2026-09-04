@@ -1,7 +1,7 @@
-using System.Text;
 using MimeKit;
 using MimeKit.Cryptography;
 using mk8.email.Application.Interfaces;
+using mk8.email.Application.Protocol;
 using mk8.email.Infrastructure.Environment;
 
 namespace mk8.email.Application.Services;
@@ -29,7 +29,9 @@ public sealed class MimeKitDkimSigningService : IDkimSigningService
         {
             ValidateIdentity(domain, selector);
 
-            using var input = new MemoryStream(Encoding.UTF8.GetBytes(rawMessage), writable: false);
+            using var input = new MemoryStream(
+                MailWireEncoding.Instance.GetBytes(rawMessage),
+                writable: false);
             using var message = MimeMessage.Load(input);
             if (message.Headers.IndexOf(HeaderId.From) < 0)
                 throw new FormatException("The message requires a From header for DKIM signing.");
@@ -53,7 +55,7 @@ public sealed class MimeKitDkimSigningService : IDkimSigningService
 
             using var output = new MemoryStream();
             message.WriteTo(options, output);
-            return Encoding.UTF8.GetString(output.ToArray());
+            return MailWireEncoding.Instance.GetString(output.ToArray());
         }
         catch (Exception exception) when (exception is not DkimSigningException)
         {

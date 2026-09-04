@@ -18,7 +18,6 @@ domain_directory=/etc/mk8email/domains/$domain
 key_directory=/etc/mk8email/dkim/$domain
 web_directory=/var/www/mk8email-domains/$domain
 nginx_configuration=/etc/nginx/mk8email-domains.d/$domain.conf
-mail_directory=/var/vmail/$domain
 cli_dll=/opt/mk8email/current/cli/mk8.email.Application.CLI.dll
 work=$(mktemp -d /run/mk8-multi-domain-smoke.XXXXXX)
 test_started=false
@@ -52,11 +51,6 @@ cleanup_test_state() {
             run_internal_cli --set-domain-active "$domain" false >/dev/null \
                 || state_cleanup_status=1
         fi
-        if systemctl is-active --quiet dovecot.service; then
-            doveadm auth cache flush "*@$domain" >/dev/null \
-                || state_cleanup_status=1
-            doveadm kick "*@$domain" >/dev/null || state_cleanup_status=1
-        fi
         rm -f -- "$nginx_configuration" || state_cleanup_status=1
         nginx -t >/dev/null 2>&1 || state_cleanup_status=1
         systemctl reload nginx.service || state_cleanup_status=1
@@ -70,9 +64,6 @@ cleanup_test_state() {
             || state_cleanup_status=1
         database_value "BEGIN; DELETE FROM users WHERE username = '$account'; DELETE FROM addresses WHERE domain = '$domain'; DELETE FROM companies WHERE name = '$company' AND NOT EXISTS (SELECT 1 FROM addresses WHERE company_id = companies.id) AND NOT EXISTS (SELECT 1 FROM users WHERE company_id = companies.id); COMMIT;" >/dev/null \
             || state_cleanup_status=1
-        remove_test_directory "$mail_directory" /var/vmail \
-            || state_cleanup_status=1
-        postfix reload >/dev/null || state_cleanup_status=1
     fi
     if [ "$state_cleanup_status" -eq 0 ]; then
         test_started=false
@@ -112,7 +103,7 @@ grep -Fx "email IN A $primary_public_ipv4 ; cf_tags=cf-proxied:false" \
 [ "$(database_value "SELECT count(*) FROM companies WHERE name = '$company'")" -eq 0 ] \
     || { printf '%s\n' "The test company already exists." >&2; exit 1; }
 for unused_path in "$domain_directory" "$key_directory" "$web_directory" \
-    "$nginx_configuration" "$mail_directory"; do
+    "$nginx_configuration"; do
     if [ -e "$unused_path" ] || [ -L "$unused_path" ]; then
         printf '%s\n' "A multi-domain test path already exists." >&2
         exit 1
@@ -183,16 +174,14 @@ grep -F "The certificate does not cover autoconfig.$domain." \
     || { printf '%s\n' "A rejected certificate changed the active certificate." >&2; exit 1; }
 
 run_internal_cli --set-domain-active "$domain" true >/dev/null
-postfix reload >/dev/null
 python3 /usr/local/lib/mk8email/tests/multi_domain_smoke.py active \
     --domain "$domain" --account "$account" --password-file "$work/password" \
     --selector "$selector"
 
 deactivation_log=$work/deactivation.log
 /usr/local/sbin/mk8-domain deactivate "$domain" >/dev/null 2>"$deactivation_log"
-if grep -E 'Peer authentication failed|postmap: (warning|fatal)' \
-    "$deactivation_log" >/dev/null; then
-    printf '%s\n' "The domain command hid a Postfix map query failure." >&2
+if [ -s "$deactivation_log" ]; then
+    printf '%s\n' "The domain command wrote an unexpected deactivation error." >&2
     exit 1
 fi
 python3 /usr/local/lib/mk8email/tests/multi_domain_smoke.py pending \
@@ -209,7 +198,7 @@ if grep -q "^$domain " /etc/rspamd/dkim_selectors.map \
     exit 1
 fi
 for removed_path in "$domain_directory" "$key_directory" "$web_directory" \
-    "$nginx_configuration" "$mail_directory"; do
+    "$nginx_configuration"; do
     if [ -e "$removed_path" ] || [ -L "$removed_path" ]; then
         printf '%s\n' "A multi-domain test path remains after cleanup." >&2
         exit 1

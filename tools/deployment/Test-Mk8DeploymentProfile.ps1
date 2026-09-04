@@ -113,12 +113,12 @@ try {
         | Select-String -Pattern '(?<![A-Za-z0-9.-])mail\.mk8n\.com' `
         | Select-Object -First 1
     Assert-True ($null -eq $oldHostname) 'The rendered assets contain the old mail hostname.'
-    $renderedPostfix = Get-Content `
-        -LiteralPath (Join-Path $renderedRoot 'deploy/postfix/main.cf') -Raw
-    Assert-True ($renderedPostfix.Contains(
-        'myhostname = email.mk8n.com',
+    $renderedMailConfig = Get-Content `
+        -LiteralPath (Join-Path $renderedRoot 'deploy/native/mk8email.config.json') -Raw
+    Assert-True ($renderedMailConfig.Contains(
+        '"Hostname": "email.mk8n.com"',
         [StringComparison]::Ordinal)) `
-        'The rendered Postfix configuration has the wrong mail hostname.'
+        'The rendered native mail configuration has the wrong mail hostname.'
     $renderedDns = Get-Content `
         -LiteralPath (Join-Path $renderedRoot 'deploy/dns/mk8n.com.zone') -Raw
     Assert-True ($renderedDns.Contains(

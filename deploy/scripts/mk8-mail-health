@@ -25,10 +25,9 @@ if ! flock --shared --nonblock 8; then
 fi
 
 errors=$(mktemp /run/mk8-mail-health.XXXXXX)
-queue_data=$(mktemp /run/mk8-mail-queue.XXXXXX)
 install -d -o root -g mk8email -m 2750 "$state_directory"
 status_snapshot=$(mktemp "$state_directory/status.json.XXXXXX")
-trap 'rm -f -- "$errors" "$queue_data" "$status_snapshot"' EXIT INT TERM
+trap 'rm -f -- "$errors" "$status_snapshot"' EXIT INT TERM
 
 check_epoch=$(date +%s)
 queue_count=0
@@ -68,12 +67,29 @@ write_status_snapshot() {
     mv -f -- "$status_snapshot" "$status_json"
 }
 
-for service_name in postgresql.service postfix.service dovecot.service rspamd.service \
+for service_name in postgresql.service mk8email.service rspamd.service \
     clamav-daemon.service clamav-freshclam.service valkey-server.service \
     mk8email-admin.service nginx.service nftables.service fail2ban.service \
     mk8-backup.timer mk8-mail-health.timer dailyaidecheck.timer; do
     systemctl is-active --quiet "$service_name" || record_error "$service_name is not active."
 done
+
+for forbidden_service in postfix.service dovecot.service; do
+    if systemctl is-active --quiet "$forbidden_service"; then
+        record_error "A forbidden mail service is active: $forbidden_service"
+    fi
+done
+for forbidden_package in \
+    postfix postfix-pcre postfix-pgsql \
+    dovecot-core dovecot-imapd dovecot-lmtpd dovecot-pgsql dovecot-sieve; do
+    if dpkg-query --show --showformat='${db:Status-Abbrev}\n' "$forbidden_package" 2>/dev/null \
+        | grep -q '^ii'; then
+        record_error "A forbidden mail package is installed: $forbidden_package"
+    fi
+done
+if pgrep -x master >/dev/null || pgrep -x dovecot >/dev/null; then
+    record_error "A forbidden mail process is running."
+fi
 
 for completed_service in mk8-backup.service dailyaidecheck.service; do
     service_result=$(systemctl show "$completed_service" --property=Result --value 2>/dev/null || true)
@@ -86,6 +102,8 @@ valkey-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG \
     || record_error "Valkey is not ready."
 clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1 \
     || record_error "ClamAV is not ready."
+/usr/local/sbin/mk8email --healthcheck >/dev/null 2>&1 \
+    || record_error "The native SMTP or IMAP service is not ready."
 signature_path=$(find /var/lib/clamav -maxdepth 1 -type f \
     \( -name '*.cvd' -o -name '*.cld' \) -printf '%T@ %p\n' \
     | sort -nr | sed -n '1s/^[^ ]* //p')
@@ -119,24 +137,50 @@ if [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
     fi
 fi
 
-if postqueue -j > "$queue_data" 2>/dev/null; then
-    queue_count=$(wc -l < "$queue_data" | tr -d ' ')
-    [ "$queue_count" -le 100 ] || record_error "The Postfix queue contains more than 100 messages."
-    oldest=$(sed -n 's/.*"arrival_time":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$queue_data" | sort -n | head -n 1)
-    if [ -n "$oldest" ]; then
-        oldest_age=$((check_epoch - oldest))
-        if [ "$oldest_age" -lt 0 ]; then
-            oldest_age=0
-            record_error "A Postfix queue timestamp is in the future."
-        elif [ "$oldest_age" -gt 86400 ]; then
-            record_error "The Postfix queue contains a message older than one day."
-        fi
-    fi
-else
-    record_error "The Postfix queue is not available."
+queue_stats=$(runuser -u postgres -- psql --dbname=mk8email --no-psqlrc \
+    --tuples-only --no-align --field-separator='|' --set=ON_ERROR_STOP=1 \
+    --command="WITH queue AS (
+        SELECT
+            count(*) FILTER (WHERE state IN ('pending', 'processing')) AS active_count,
+            min(received_at) FILTER (WHERE state IN ('pending', 'processing')) AS oldest,
+            count(*) FILTER (WHERE state = 'quarantined') AS quarantine_count,
+            count(*) FILTER (WHERE state = 'dead') AS dead_count
+        FROM mail_queue_messages
+    )
+    SELECT active_count,
+        COALESCE(GREATEST(0, EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - oldest))::bigint::text, 'null'),
+        quarantine_count,
+        dead_count
+    FROM queue" 2>/dev/null) || {
+    queue_stats=
+    record_error "The native mail queue is not available."
+}
+if [ -n "$queue_stats" ]; then
+    queue_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 1)
+    oldest_age=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 2)
+    quarantine_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 3)
+    dead_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 4)
+    case "$queue_count:$oldest_age:$quarantine_count:$dead_count" in
+        *[!0-9:null]*|*:*:*:*:*)
+            queue_count=0
+            oldest_age=null
+            record_error "The native mail queue returned invalid health data."
+            ;;
+        *)
+            [ "$queue_count" -le 100 ] \
+                || record_error "The native queue contains more than 100 active messages."
+            if [ "$oldest_age" != null ] && [ "$oldest_age" -gt 86400 ]; then
+                record_error "The native queue contains an active message older than one day."
+            fi
+            [ "$quarantine_count" -eq 0 ] \
+                || record_error "The native queue contains quarantined messages."
+            [ "$dead_count" -eq 0 ] \
+                || record_error "The native queue contains dead messages."
+            ;;
+    esac
 fi
 
-used_percent=$(df -P /var/vmail | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
+used_percent=$(df -P /var/lib/postgresql | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
 case "$used_percent" in
     ''|*[!0-9]*)
         used_percent=null
@@ -266,9 +310,6 @@ case "$current_release" in
 esac
 
 if [ "$deep" = true ]; then
-    postfix check >/dev/null 2>&1 || record_error "The Postfix configuration is not valid."
-    doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null 2>&1 \
-        || record_error "The Dovecot configuration is not valid."
     rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet >/dev/null 2>&1 \
         || record_error "The Rspamd configuration is not valid."
     clamconf --config-dir=/etc/clamav --non-default >/dev/null 2>&1 \
@@ -280,10 +321,11 @@ if [ "$deep" = true ]; then
         || record_error "The host attack-surface controls are not valid."
     /usr/local/sbin/prune-native-releases --check >/dev/null 2>&1 \
         || record_error "The immutable release retention state is not valid."
-    runuser -u postfix -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM addresses LIMIT 1' >/dev/null 2>&1 \
-        || record_error "Postfix cannot read its database maps."
-    runuser -u dovecot -- /usr/lib/postgresql/17/bin/psql --dbname=mk8email --no-psqlrc --command='SELECT 1 FROM users LIMIT 1' >/dev/null 2>&1 \
-        || record_error "Dovecot cannot read its authentication data."
+    printf 'From: health@localhost\r\nTo: health@localhost\r\nSubject: Health probe\r\n\r\nHealth probe.\r\n' \
+        | curl --silent --fail --max-time 10 --noproxy '*' \
+            --request POST --header 'Content-Type: message/rfc822' \
+            --data-binary @- http://127.0.0.1:11333/checkv2 >/dev/null 2>&1 \
+        || record_error "The Rspamd message scanner is not ready."
 fi
 
 previous_status=UNKNOWN

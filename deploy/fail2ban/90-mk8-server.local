@@ -18,18 +18,8 @@ enabled = true
 [nginx-botsearch]
 enabled = true
 
-[postfix]
-enabled = true
-backend = systemd
-mode = more
-maxretry = 8
-
-[postfix-sasl]
+[mk8email-auth]
 enabled = true
 backend = systemd
 maxretry = 5
-
-[dovecot]
-enabled = true
-backend = systemd
-maxretry = 5
+port = 25,143,465,587,993

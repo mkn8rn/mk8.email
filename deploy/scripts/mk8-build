@@ -121,7 +121,7 @@ run_unit() {
         --property="ReadWritePaths=$run_root" \
         --property="ReadOnlyPaths=$source_root" \
         --property="BindReadOnlyPaths=$source_root:$stable_source" \
-        --property="InaccessiblePaths=-/etc/letsencrypt -/etc/mk8email -/etc/ssh -/var/lib/postgresql -/var/vmail" \
+        --property="InaccessiblePaths=-/etc/letsencrypt -/etc/mk8email -/etc/ssh -/var/lib/postgresql" \
         --setenv="HOME=$run_root/home" \
         --setenv="DOTNET_CLI_HOME=$run_root/home" \
         --setenv="NUGET_PACKAGES=$run_root/packages" \
@@ -152,7 +152,6 @@ run_unit "mk8-build-$short_commit-$$" yes /bin/sh -eu -c '
     test ! -w "$run_root/source"
     test ! -r /etc/mk8email/secrets/database_password
     test ! -r /etc/ssh/ssh_host_ed25519_key
-    test ! -r /var/vmail
     test ! -w /opt/mk8email-build/sdk
     "$sdk" build mk8.email.slnx --configuration Release --no-restore \
         --artifacts-path "$run_root/artifacts" \

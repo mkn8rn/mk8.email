@@ -1,7 +1,7 @@
-using System.Text;
 using Microsoft.EntityFrameworkCore;
 using MimeKit;
 using mk8.email.Application.Interfaces;
+using mk8.email.Application.Protocol;
 using mk8.email.Infrastructure.Data;
 using mk8.email.Infrastructure.Environment;
 
@@ -38,7 +38,9 @@ public sealed class SenderAuthorizationService(EmailDbContext db) : ISenderAutho
 
         try
         {
-            using var input = new MemoryStream(Encoding.UTF8.GetBytes(rawMessage), writable: false);
+            using var input = new MemoryStream(
+                MailWireEncoding.Instance.GetBytes(rawMessage),
+                writable: false);
             using var message = MimeMessage.Load(input);
             if (message.Headers.Count(header => header.Id == HeaderId.From) != 1
                 || message.From.Count != 1

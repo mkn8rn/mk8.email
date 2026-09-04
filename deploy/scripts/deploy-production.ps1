@@ -143,6 +143,7 @@ release_digest='$releaseDigest'
 asset_digest='$assetDigest'
 activate_requested='$activationRequested'
 was_active=false
+rollback_supported=false
 changes_started=false
 apt_sources_changing=false
 backup_path=
@@ -238,31 +239,42 @@ finish() {
         set -e
     fi
     if [ "`$deployment_status" -ne 0 ] && [ "`$changes_started" = true ] && [ "`$was_active" = true ]; then
-        printf '%s\n' "The deployment failed. The prior release will be restored." >&2
         set +e
         rollback_status=0
-        /usr/local/sbin/deactivate-mail-stack || rollback_status=1
-        if [ "`$rollback_status" -eq 0 ]; then
-            restore_configuration || rollback_status=1
-        fi
-        if [ "`$rollback_status" -eq 0 ]; then
-            ln -sfnT "`$previous_release" /opt/mk8email/current \
-                || rollback_status=1
-            systemctl daemon-reload || rollback_status=1
-            nft -f /etc/nftables.conf || rollback_status=1
-            systemctl reload nginx.service || rollback_status=1
-            systemctl restart fail2ban.service || rollback_status=1
-        fi
-        if [ "`$rollback_status" -eq 0 ]; then
-            /usr/local/sbin/activate-mail-stack || rollback_status=1
+        sh "`$remote_root/assets/deploy/scripts/deactivate-mail-stack" \
+            || rollback_status=1
+        systemctl mask postfix.service dovecot.service || rollback_status=1
+        if [ "`$rollback_supported" = true ]; then
+            printf '%s\n' "The deployment failed. The prior native release will be restored." >&2
+            if [ "`$rollback_status" -eq 0 ]; then
+                restore_configuration || rollback_status=1
+            fi
+            systemctl mask postfix.service dovecot.service || rollback_status=1
+            if [ "`$rollback_status" -eq 0 ]; then
+                ln -sfnT "`$previous_release" /opt/mk8email/current \
+                    || rollback_status=1
+                systemctl daemon-reload || rollback_status=1
+                nft -f /etc/nftables.conf || rollback_status=1
+                systemctl reload nginx.service || rollback_status=1
+                systemctl restart fail2ban.service || rollback_status=1
+            fi
+            if [ "`$rollback_status" -eq 0 ]; then
+                sh "`$remote_root/assets/deploy/scripts/activate-mail-stack" \
+                    || rollback_status=1
+            fi
+            if [ "`$rollback_status" -eq 0 ]; then
+                case "`$release_id" in
+                    *[!0-9a-f]*|'') ;;
+                    *) rm -rf -- "/opt/mk8email/releases/`$release_id" ;;
+                esac
+            fi
+        else
+            printf '%s\n' "The deployment failed before a compatible native rollback existed." >&2
+            rollback_status=1
         fi
         if [ "`$rollback_status" -ne 0 ]; then
-            printf '%s\n' "Automatic rollback failed. Immediate operator action is required." >&2
+            printf '%s\n' "The native mail service remains inactive. Immediate operator action is required." >&2
         fi
-        case "`$release_id" in
-            *[!0-9a-f]*|'') ;;
-            *) rm -rf -- "/opt/mk8email/releases/`$release_id" ;;
-        esac
         set -e
     fi
     case "`$remote_root" in
@@ -334,6 +346,10 @@ if [ -f /etc/mk8email/mail-stack-ready ]; then
         /opt/mk8email/releases/*) ;;
         *) printf '%s\n' "The current release path is not valid." >&2; exit 1 ;;
     esac
+    if systemctl cat mk8email.service 2>/dev/null \
+        | grep -Eq '^ExecStart=.* --serve$'; then
+        rollback_supported=true
+    fi
     timeout 180s apt-get update
     /usr/local/sbin/verify-host-prerequisites
     backup_path=`$(/usr/local/sbin/mk8-backup)

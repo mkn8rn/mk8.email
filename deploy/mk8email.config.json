@@ -39,6 +39,17 @@
     "EnableDmarcCheck": false,
     "PasswordHashScheme": "BLF-CRYPT"
   },
+  "Filtering": {
+    "RspamdEndpoint": "http://127.0.0.1:11333/checkv2",
+    "TimeoutSeconds": 70
+  },
+  "Queue": {
+    "PollIntervalMilliseconds": 500,
+    "LeaseSeconds": 300,
+    "MaxAttempts": 20,
+    "MaxAgeHours": 120,
+    "CompletedRetentionDays": 14
+  },
   "Limits": {
     "MaxMessageSizeBytes": 26214400,
     "MaxRecipientsPerMessage": 100,

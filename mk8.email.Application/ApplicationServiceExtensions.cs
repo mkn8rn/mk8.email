@@ -21,7 +21,7 @@ public static class ApplicationServiceExtensions
         return services;
     }
 
-    public static IServiceCollection AddExperimentalMailProtocolServers(this IServiceCollection services)
+    public static IServiceCollection AddMailProtocolServers(this IServiceCollection services)
     {
         services.AddSingleton<ILookupClient>(_ => new LookupClient(new LookupClientOptions
         {
@@ -32,9 +32,13 @@ public static class ApplicationServiceExtensions
         }));
         services.AddSingleton<IMailExchangeResolver, DnsMailExchangeResolver>();
         services.AddSingleton<IOutboundMailRelay, OutboundSmtpRelay>();
-        services.AddSingleton<IDkimSigningService, MimeKitDkimSigningService>();
+        services.AddSingleton<IMailScanner, RspamdMailScanner>();
+        services.AddSingleton(TimeProvider.System);
         services.AddScoped<ISenderAuthorizationService, SenderAuthorizationService>();
+        services.AddScoped<IMailAuthenticator, MailAuthenticator>();
         services.AddScoped<IEmailService, EmailService>();
+        services.AddScoped<IMailSubmissionQueue, PostgresMailSubmissionQueue>();
+        services.AddHostedService<MailQueueWorker>();
         services.AddHostedService<SmtpServerService>();
         services.AddHostedService<ImapServerService>();
 

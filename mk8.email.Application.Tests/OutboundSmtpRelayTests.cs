@@ -88,13 +88,13 @@ public sealed class OutboundSmtpRelayTests
             session => RunSuccessfulDeliveryAsync(session, useStartTls: true, _certificatePath));
         var relay = CreateRelay(new StubResolver(Available(server.Port)));
 
-        var delivered = await relay.RelayAsync(
+        var result = await relay.RelayAsync(
             "sender@mk8n.com",
             "recipient@example.com",
             "Subject: test\r\n\r\n.first\r\nlast\r\n");
         await server.WaitForCompletionAsync();
 
-        Assert.IsTrue(delivered);
+        Assert.AreEqual(OutboundDeliveryStatus.Delivered, result.Status);
         Assert.IsTrue(server.Session!.UsedTls);
         CollectionAssert.Contains(server.Session.DataLines, "..first");
         Assert.AreEqual(1, server.ConnectionCount);
@@ -117,14 +117,14 @@ public sealed class OutboundSmtpRelayTests
                 new MailExchangeEndpoint("localhost", 20, secondServer.Port),
             ])));
 
-        var delivered = await relay.RelayAsync(
+        var result = await relay.RelayAsync(
             "sender@mk8n.com",
             "recipient@example.com",
             "Subject: fallback\r\n\r\nbody");
         await firstServer.WaitForCompletionAsync();
         await secondServer.WaitForCompletionAsync();
 
-        Assert.IsTrue(delivered);
+        Assert.AreEqual(OutboundDeliveryStatus.Delivered, result.Status);
         Assert.AreEqual(1, firstServer.ConnectionCount);
         Assert.AreEqual(1, secondServer.ConnectionCount);
     }
@@ -144,13 +144,13 @@ public sealed class OutboundSmtpRelayTests
         });
         var relay = CreateRelay(new StubResolver(Available(server.Port)));
 
-        var delivered = await relay.RelayAsync(
+        var result = await relay.RelayAsync(
             "sender@mk8n.com",
             "recipient@example.com",
             "Subject: no downgrade\r\n\r\nbody");
         await server.WaitForCompletionAsync();
 
-        Assert.IsFalse(delivered);
+        Assert.AreEqual(OutboundDeliveryStatus.TemporaryFailure, result.Status);
         Assert.IsFalse(server.Session!.Commands.Any(command => command.StartsWith("MAIL ", StringComparison.Ordinal)));
     }
 
@@ -170,14 +170,72 @@ public sealed class OutboundSmtpRelayTests
         });
         var relay = CreateRelay(new StubResolver(Available(server.Port)));
 
-        var delivered = await relay.RelayAsync(
+        var result = await relay.RelayAsync(
             "sender@mk8n.com",
             "recipient@example.com",
             "Subject: reject\r\n\r\nbody");
         await server.WaitForCompletionAsync();
 
-        Assert.IsFalse(delivered);
+        Assert.AreEqual(OutboundDeliveryStatus.PermanentFailure, result.Status);
         Assert.IsFalse(server.Session!.Commands.Contains("DATA"));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task RelayDoesNotSendEightBitContentWithoutRemoteCapability()
+    {
+        await using var server = new ScriptedSmtpServer(async session =>
+        {
+            await session.WriteLineAsync("220 receiver.test ESMTP");
+            session.Commands.Add(await session.ReadLineAsync());
+            await session.WriteLineAsync("250 receiver.test");
+        });
+        var relay = CreateRelay(new StubResolver(Available(server.Port)));
+
+        var result = await relay.RelayAsync(
+            "sender@mk8n.com",
+            "recipient@example.com",
+            "Subject: eight bit\r\n\r\ncafé");
+        await server.WaitForCompletionAsync();
+
+        Assert.AreEqual(OutboundDeliveryStatus.PermanentFailure, result.Status);
+        Assert.IsFalse(server.Session!.Commands.Any(command => command.StartsWith("MAIL ", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task RelayDeclaresEightBitBodyWhenRemoteSupportsIt()
+    {
+        await using var server = new ScriptedSmtpServer(async session =>
+        {
+            await session.WriteLineAsync("220 receiver.test ESMTP");
+            session.Commands.Add(await session.ReadLineAsync());
+            await session.WriteLineAsync("250-receiver.test");
+            await session.WriteLineAsync("250 8BITMIME");
+            session.Commands.Add(await session.ReadLineAsync());
+            await session.WriteLineAsync("250 Sender accepted");
+            session.Commands.Add(await session.ReadLineAsync());
+            await session.WriteLineAsync("250 Recipient accepted");
+            session.Commands.Add(await session.ReadLineAsync());
+            await session.WriteLineAsync("354 Send message");
+            while (await session.ReadLineAsync() is { } line && line != ".")
+                session.DataLines.Add(line);
+            await session.WriteLineAsync("250 Queued");
+            session.Commands.Add(await session.ReadLineAsync());
+        });
+        var relay = CreateRelay(new StubResolver(Available(server.Port)));
+
+        var result = await relay.RelayAsync(
+            "sender@mk8n.com",
+            "recipient@example.com",
+            "Subject: eight bit\r\n\r\ncafé");
+        await server.WaitForCompletionAsync();
+
+        Assert.AreEqual(OutboundDeliveryStatus.Delivered, result.Status);
+        CollectionAssert.Contains(
+            server.Session!.Commands,
+            "MAIL FROM:<sender@mk8n.com> BODY=8BITMIME");
+        CollectionAssert.Contains(server.Session.DataLines, "café");
     }
 
     [TestMethod]
@@ -186,12 +244,12 @@ public sealed class OutboundSmtpRelayTests
         var resolver = new StubResolver(Available(25));
         var relay = CreateRelay(resolver);
 
-        var delivered = await relay.RelayAsync(
+        var result = await relay.RelayAsync(
             "sender@mk8n.com\r\nRCPT TO:<attacker@example.com>",
             "recipient@example.com",
             "body");
 
-        Assert.IsFalse(delivered);
+        Assert.AreEqual(OutboundDeliveryStatus.PermanentFailure, result.Status);
         Assert.AreEqual(0, resolver.CallCount);
     }
 
@@ -314,7 +372,7 @@ public sealed class OutboundSmtpRelayTests
 
     private sealed class SmtpTestSession(Stream initialStream) : IAsyncDisposable
     {
-        private static readonly Encoding ProtocolEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+        private static readonly Encoding ProtocolEncoding = Encoding.Latin1;
         private Stream _stream = initialStream;
         private StreamReader _reader = CreateReader(initialStream);
         private StreamWriter _writer = CreateWriter(initialStream);

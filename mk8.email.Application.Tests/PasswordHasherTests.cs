@@ -6,13 +6,13 @@ namespace mk8.email.Application.Tests;
 public sealed class PasswordHasherTests
 {
     [TestMethod]
-    public void HashUsesDovecotCompatibleBcrypt()
+    public void HashUsesTaggedBcrypt()
     {
         const string password = "correct-horse-battery-staple";
 
         var hash = PasswordHasher.Hash(password);
 
-        StringAssert.StartsWith(hash, PasswordHasher.DovecotSchemePrefix);
+        StringAssert.StartsWith(hash, PasswordHasher.BcryptSchemePrefix);
         Assert.IsTrue(PasswordHasher.Verify(password, hash));
         Assert.IsFalse(PasswordHasher.Verify("different-password", hash));
         Assert.IsFalse(PasswordHasher.Verify(password, "invalid-hash"));
