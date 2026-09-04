@@ -22,6 +22,10 @@ fail() {
     exit 1
 }
 
+postmap_query() {
+    runuser -u postfix -- postmap -q "$1" "$2"
+}
+
 usage() {
     printf '%s\n' "Usage: mk8-domain prepare COMPANY DOMAIN" >&2
     printf '%s\n' "       mk8-domain request-certificate DOMAIN CONTACT_EMAIL" >&2
@@ -643,11 +647,11 @@ activate_domain() {
         activation_changed=true
     fi
     postfix reload >/dev/null
-    [ "$(postmap -q "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" = 1 ] \
+    [ "$(postmap_query "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" = 1 ] \
         || fail "Postfix did not activate the domain."
-    mailbox_route=$(postmap -q "postmaster@$domain" \
+    mailbox_route=$(postmap_query "postmaster@$domain" \
         pgsql:/etc/postfix/pgsql-virtual-mailboxes.cf)
-    alias_route=$(postmap -q "postmaster@$domain" \
+    alias_route=$(postmap_query "postmaster@$domain" \
         pgsql:/etc/postfix/pgsql-virtual-aliases.cf)
     [ -n "$mailbox_route$alias_route" ] \
         || fail "Postfix did not activate the postmaster route."
@@ -667,7 +671,7 @@ deactivate_domain() {
         doveadm auth cache flush "*@$domain" >/dev/null
         doveadm kick "*@$domain" >/dev/null
     fi
-    [ -z "$(postmap -q "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" ] \
+    [ -z "$(postmap_query "$domain" pgsql:/etc/postfix/pgsql-virtual-domains.cf)" ] \
         || fail "Postfix still accepts the deactivated domain."
     printf '%s\n' "The domain is inactive."
 }

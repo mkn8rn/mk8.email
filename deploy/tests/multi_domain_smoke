@@ -188,7 +188,13 @@ python3 /usr/local/lib/mk8email/tests/multi_domain_smoke.py active \
     --domain "$domain" --account "$account" --password-file "$work/password" \
     --selector "$selector"
 
-/usr/local/sbin/mk8-domain deactivate "$domain" >/dev/null
+deactivation_log=$work/deactivation.log
+/usr/local/sbin/mk8-domain deactivate "$domain" >/dev/null 2>"$deactivation_log"
+if grep -E 'Peer authentication failed|postmap: (warning|fatal)' \
+    "$deactivation_log" >/dev/null; then
+    printf '%s\n' "The domain command hid a Postfix map query failure." >&2
+    exit 1
+fi
 python3 /usr/local/lib/mk8email/tests/multi_domain_smoke.py pending \
     --domain "$domain" --account "$account" --password-file "$work/password"
 
