@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 1 ]; then
+    printf '%s\n' "Usage: release_retention_smoke [PRUNE_SCRIPT]" >&2
+    exit 2
+fi
+
+prune_script=${1:-/usr/local/sbin/prune-native-releases}
+[ -r "$prune_script" ] || {
+    printf '%s\n' "The release pruning script is not readable." >&2
+    exit 1
+}
+
+test_root=$(mktemp -d /run/mk8-release-retention.XXXXXX)
+cleanup() {
+    case "$test_root" in
+        /run/mk8-release-retention.*) rm -rf -- "$test_root" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+test_opt="$test_root/opt"
+test_releases="$test_opt/releases"
+install -d -o root -g root -m 0755 "$test_releases"
+for release_name in \
+    aaaaaaaaaaaa \
+    bbbbbbbbbbbb \
+    cccccccccccc \
+    dddddddddddd \
+    eeeeeeeeeeee; do
+    install -d -o root -g root -m 0555 "$test_releases/$release_name"
+done
+touch --date='2026-01-05 UTC' "$test_releases/aaaaaaaaaaaa"
+touch --date='2026-01-01 UTC' "$test_releases/bbbbbbbbbbbb"
+touch --date='2026-01-04 UTC' "$test_releases/cccccccccccc"
+touch --date='2026-01-03 UTC' "$test_releases/dddddddddddd"
+touch --date='2026-01-02 UTC' "$test_releases/eeeeeeeeeeee"
+ln -s /opt/mk8email/releases/aaaaaaaaaaaa "$test_opt/current"
+install -d -o root -g root -m 0755 "$test_releases/unsafe-name"
+
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+unshare --mount sh -eu -c '
+    mount --make-rprivate /
+    mount --bind "$1" /opt/mk8email
+    if sh "$2" /opt/mk8email/releases/bbbbbbbbbbbb >/dev/null 2>&1; then
+        printf "%s\n" "Release pruning accepted an unsafe directory." >&2
+        exit 1
+    fi
+    test -d /opt/mk8email/releases/dddddddddddd
+    rmdir /opt/mk8email/releases/unsafe-name
+    ln -s /opt/mk8email/releases/aaaaaaaaaaaa \
+        /opt/mk8email/releases/ffffffffffff
+    if sh "$2" /opt/mk8email/releases/bbbbbbbbbbbb >/dev/null 2>&1; then
+        printf "%s\n" "Release pruning accepted a symbolic link." >&2
+        exit 1
+    fi
+    test -d /opt/mk8email/releases/dddddddddddd
+    rm /opt/mk8email/releases/ffffffffffff
+    sh "$2" /opt/mk8email/releases/bbbbbbbbbbbb >/dev/null
+    test -d /opt/mk8email/releases/aaaaaaaaaaaa
+    test -d /opt/mk8email/releases/bbbbbbbbbbbb
+    test -d /opt/mk8email/releases/cccccccccccc
+    test ! -e /opt/mk8email/releases/dddddddddddd
+    test ! -e /opt/mk8email/releases/eeeeeeeeeeee
+    sh "$2" --check >/dev/null
+' sh "$test_opt" "$prune_script"
+
+printf '%s\n' "Release retention validation, protection, and pruning tests passed."

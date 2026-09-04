@@ -176,8 +176,15 @@ fi
 changes_started=true
 sh "`$remote_root/assets/deploy/scripts/install-native-release" "`$remote_root/mk8email-release.tar.gz" '$releaseId'
 sh "`$remote_root/assets/deploy/scripts/install-mail-stack" "`$remote_root/assets"
+if [ -n "`$previous_release" ]; then
+    /usr/local/sbin/prune-native-releases "`$previous_release"
+else
+    /usr/local/sbin/prune-native-releases
+fi
+/usr/local/lib/mk8email/tests/release_retention_smoke
 if [ "`$activate_requested" = true ] || [ "`$was_active" = true ]; then
     /usr/local/sbin/activate-mail-stack
+    /usr/local/lib/mk8email/tests/management_cli_smoke
 fi
 "@
     [IO.File]::WriteAllText($remoteScript, $remoteScriptText, [Text.UTF8Encoding]::new($false))
