@@ -1,0 +1,240 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: install-mail-stack ASSET_ROOT" >&2
+    exit 2
+fi
+
+asset_root=$1
+if [ ! -d "$asset_root/deploy" ]; then
+    printf '%s\n' "The deployment asset root is not valid." >&2
+    exit 1
+fi
+
+sh "$asset_root/deploy/scripts/verify-host-prerequisites" \
+    "$asset_root/deploy/prerequisites"
+
+for command_name in postfix postconf doveconf rspamadm clamd freshclam valkey-server nginx nft fail2ban-client psql s-nail; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf '%s\n' "A required mail command is missing: $command_name" >&2
+        exit 1
+    fi
+done
+
+rm -f -- /etc/mk8email/mail-stack-ready
+aide_state=$(systemctl show dailyaidecheck.service --property=ActiveState --value 2>/dev/null || true)
+case "$aide_state" in
+    active|activating|deactivating) aide_was_active=yes ;;
+    *) aide_was_active=no ;;
+esac
+systemctl stop mk8-mail-health.timer mk8-backup.timer dailyaidecheck.timer \
+    dailyaidecheck.service 2>/dev/null || true
+if [ "$aide_was_active" = yes ]; then
+    systemctl reset-failed dailyaidecheck.service
+fi
+systemctl stop mk8email-admin.service postfix.service dovecot.service rspamd.service \
+    clamav-freshclam.service clamav-daemon.service clamav-daemon.socket valkey-server.service 2>/dev/null || true
+systemctl disable mk8email.service 2>/dev/null || true
+rm -f -- /etc/systemd/system/mk8email.service
+ln -s /dev/null /etc/systemd/system/mk8email.service
+
+if getent group vmail >/dev/null; then
+    [ "$(getent group vmail | cut -d: -f3)" = 5000 ] || {
+        printf '%s\n' "The vmail group identifier is not 5000." >&2
+        exit 1
+    }
+else
+    groupadd --system --gid 5000 vmail
+fi
+
+if getent passwd vmail >/dev/null; then
+    if [ "$(id -u vmail)" != 5000 ] || [ "$(id -g vmail)" != 5000 ]; then
+        printf '%s\n' "The vmail user identifiers are not 5000." >&2
+        exit 1
+    fi
+else
+    useradd --system --uid 5000 --gid vmail --home-dir /var/vmail \
+        --no-create-home --shell /usr/sbin/nologin vmail
+fi
+
+getent group tlskeys >/dev/null || groupadd --system tlskeys
+getent group dkimkeys >/dev/null || groupadd --system dkimkeys
+usermod --append --groups tlskeys postfix
+usermod --append --groups dkimkeys,clamav _rspamd
+
+install -d -o root -g mk8email -m 0751 /etc/mk8email
+install -d -o root -g mk8email -m 0750 /etc/mk8email/secrets
+install -o root -g mk8email -m 0640 "$asset_root/deploy/native/mk8email.config.json" /etc/mk8email/mk8email.config.json
+
+install -d -o root -g root -m 0755 /etc/nftables.d
+if [ -L /etc/nftables.d/90-local-services.nft ] \
+    || { [ -e /etc/nftables.d/90-local-services.nft ] \
+        && [ ! -f /etc/nftables.d/90-local-services.nft ]; }; then
+    printf '%s\n' "The local firewall file is not safe." >&2
+    exit 1
+fi
+if [ ! -e /etc/nftables.d/90-local-services.nft ]; then
+    install -o root -g root -m 0600 /dev/null \
+        /etc/nftables.d/90-local-services.nft
+fi
+[ "$(stat -c '%U:%G %a %h' /etc/nftables.d/90-local-services.nft)" \
+    = "root:root 600 1" ] || {
+    printf '%s\n' "The local firewall file has unsafe metadata." >&2
+    exit 1
+}
+
+install -d -o root -g tlskeys -m 0751 /etc/mk8email/tls
+test -s /etc/mk8email/tls/fullchain.pem
+test -s /etc/mk8email/tls/privkey.pem
+chown root:tlskeys /etc/mk8email/tls/fullchain.pem /etc/mk8email/tls/privkey.pem
+chmod 0444 /etc/mk8email/tls/fullchain.pem
+chmod 0440 /etc/mk8email/tls/privkey.pem
+
+install -d -o root -g root -m 0750 /etc/mk8email/admin-tls
+test -s /etc/mk8email/admin-tls/fullchain.pem
+test -s /etc/mk8email/admin-tls/privkey.pem
+chown root:root /etc/mk8email/admin-tls/fullchain.pem /etc/mk8email/admin-tls/privkey.pem
+chmod 0444 /etc/mk8email/admin-tls/fullchain.pem
+chmod 0440 /etc/mk8email/admin-tls/privkey.pem
+
+install -d -o root -g dkimkeys -m 0751 /etc/mk8email/dkim
+test -s /etc/mk8email/dkim/s202609.private.pem
+chown root:dkimkeys /etc/mk8email/dkim/s202609.private.pem
+chmod 0640 /etc/mk8email/dkim/s202609.private.pem
+
+install -d -o root -g root -m 0755 /etc/postfix
+install -o root -g root -m 0644 "$asset_root/deploy/postfix/main.cf" /etc/postfix/main.cf
+install -o root -g root -m 0644 "$asset_root/deploy/postfix/master.cf" /etc/postfix/master.cf
+install -o root -g root -m 0644 "$asset_root/deploy/postfix/aliases" /etc/aliases
+for map_file in "$asset_root"/deploy/postfix/pgsql-*.cf; do
+    install -o root -g postfix -m 0640 "$map_file" "/etc/postfix/$(basename "$map_file")"
+done
+printf '%s\n' "mk8n.com" > /etc/mailname
+newaliases
+
+install -d -o root -g tlskeys -m 0751 /var/spool/postfix/etc/mk8email/tls
+install -o root -g tlskeys -m 0444 /etc/mk8email/tls/fullchain.pem /var/spool/postfix/etc/mk8email/tls/fullchain.pem
+install -o root -g tlskeys -m 0440 /etc/mk8email/tls/privkey.pem /var/spool/postfix/etc/mk8email/tls/privkey.pem
+
+install -d -o root -g root -m 0755 /etc/dovecot
+install -o root -g root -m 0644 "$asset_root/deploy/dovecot/dovecot.conf" /etc/dovecot/dovecot.conf
+
+install -d -o root -g root -m 0755 /etc/rspamd/local.d
+for rspamd_file in "$asset_root"/deploy/rspamd/local.d/*; do
+    install -o root -g root -m 0644 "$rspamd_file" "/etc/rspamd/local.d/$(basename "$rspamd_file")"
+done
+
+install -d -o clamav -g clamav -m 0750 /var/lib/clamav /var/log/clamav
+install -o root -g root -m 0644 "$asset_root/deploy/clamav/clamd.conf" /etc/clamav/clamd.conf
+install -o root -g root -m 0644 "$asset_root/deploy/clamav/freshclam.conf" /etc/clamav/freshclam.conf
+
+install -o root -g valkey -m 0640 "$asset_root/deploy/valkey/valkey.conf" /etc/valkey/valkey.conf
+
+install -d -o root -g root -m 0755 \
+    /etc/systemd/system/postfix@.service.d \
+    /etc/systemd/system/dovecot.service.d \
+    /etc/systemd/system/rspamd.service.d \
+    /etc/systemd/system/clamav-daemon.service.d \
+    /etc/systemd/system/clamav-daemon.socket.d \
+    /etc/systemd/system/clamav-freshclam.service.d \
+    /etc/systemd/system/valkey-server.service.d
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/postfix@.service.d/90-mk8-hardening.conf" /etc/systemd/system/postfix@.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/dovecot.service.d/90-mk8-hardening.conf" /etc/systemd/system/dovecot.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/rspamd.service.d/90-mk8-hardening.conf" /etc/systemd/system/rspamd.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/clamav-daemon.service.d/90-mk8-hardening.conf" /etc/systemd/system/clamav-daemon.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/clamav-daemon.socket.d/90-mk8-hardening.conf" /etc/systemd/system/clamav-daemon.socket.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/clamav-freshclam.service.d/90-mk8-hardening.conf" /etc/systemd/system/clamav-freshclam.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/valkey-server.service.d/90-mk8-hardening.conf" /etc/systemd/system/valkey-server.service.d/90-mk8-hardening.conf
+install -d -o root -g root -m 0755 /etc/systemd/system/dailyaidecheck.service.d
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/dailyaidecheck.service.d/90-mk8-hardening.conf" /etc/systemd/system/dailyaidecheck.service.d/90-mk8-hardening.conf
+install -d -o root -g root -m 0755 /etc/systemd/system/dailyaidecheck.timer.d
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/dailyaidecheck.timer.d/90-mk8-schedule.conf" /etc/systemd/system/dailyaidecheck.timer.d/90-mk8-schedule.conf
+install -o root -g root -m 0644 "$asset_root/deploy/aide/90_mk8_dynamic_data" /etc/aide/aide.conf.d/90_mk8_dynamic_data
+install -o root -g root -m 0644 "$asset_root/deploy/default/aide" /etc/default/aide
+install -d -o root -g root -m 0755 /etc/systemd/system/nginx.service.d
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/nginx.service.d/90-mk8-hardening.conf" /etc/systemd/system/nginx.service.d/90-mk8-hardening.conf
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8email-admin.service" /etc/systemd/system/mk8email-admin.service
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-mail-health.service" /etc/systemd/system/mk8-mail-health.service
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-mail-health.timer" /etc/systemd/system/mk8-mail-health.timer
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/var-vmail.mount" /etc/systemd/system/var-vmail.mount
+
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/configure-mail-database-access" /usr/local/sbin/configure-mail-database-access
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/configure-apt-sources" /usr/local/sbin/configure-apt-sources
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/activate-mail-stack" /usr/local/sbin/activate-mail-stack
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/deactivate-mail-stack" /usr/local/sbin/deactivate-mail-stack
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-mail-health" /usr/local/sbin/mk8-mail-health
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-backup" /usr/local/sbin/mk8-backup
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-export-backup" /usr/local/sbin/mk8-export-backup
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-mk8-certificate" /usr/local/sbin/deploy-mk8-certificate
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-admin-certificate" /usr/local/sbin/deploy-admin-certificate
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-mail-stack" /usr/local/sbin/install-mail-stack
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-native-release" /usr/local/sbin/install-native-release
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8email" /usr/local/sbin/mk8email
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/verify-host-prerequisites" /usr/local/sbin/verify-host-prerequisites
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/prune-native-releases" /usr/local/sbin/prune-native-releases
+install -d -o root -g root -m 0755 /usr/local/share/mk8email/prerequisites
+install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian-13-runtime.txt" \
+    /usr/local/share/mk8email/prerequisites/debian-13-runtime.txt
+install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian-13-sources.list" \
+    /usr/local/share/mk8email/prerequisites/debian-13-sources.list
+install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian.sources" \
+    /usr/local/share/mk8email/prerequisites/debian.sources
+
+install -d -o root -g root -m 0755 /usr/local/lib/mk8email/tests
+install -o root -g root -m 0755 "$asset_root/deploy/tests/backup_restore_smoke" /usr/local/lib/mk8email/tests/backup_restore_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/aide_alert_smoke" /usr/local/lib/mk8email/tests/aide_alert_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/apt_sources_smoke" /usr/local/lib/mk8email/tests/apt_sources_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/dashboard_smoke.py" /usr/local/lib/mk8email/tests/dashboard_smoke.py
+install -o root -g root -m 0755 "$asset_root/deploy/tests/certificate_deploy_smoke" /usr/local/lib/mk8email/tests/certificate_deploy_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/disruption_smoke" /usr/local/lib/mk8email/tests/disruption_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/host_hardening_smoke" /usr/local/lib/mk8email/tests/host_hardening_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/management_cli_smoke" /usr/local/lib/mk8email/tests/management_cli_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/mail_smoke.py" /usr/local/lib/mk8email/tests/mail_smoke.py
+install -o root -g root -m 0755 "$asset_root/deploy/tests/prerequisites_smoke" /usr/local/lib/mk8email/tests/prerequisites_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/release_retention_smoke" /usr/local/lib/mk8email/tests/release_retention_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/tls_smoke" /usr/local/lib/mk8email/tests/tls_smoke
+
+install -o root -g root -m 0644 "$asset_root/deploy/tmpfiles/mk8-mail.conf" /etc/tmpfiles.d/mk8-mail.conf
+install -o root -g root -m 0644 "$asset_root/deploy/logrotate/mk8-mail" /etc/logrotate.d/mk8-mail
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-backup.service" /etc/systemd/system/mk8-backup.service
+install -o root -g root -m 0644 "$asset_root/deploy/systemd/mk8-backup.timer" /etc/systemd/system/mk8-backup.timer
+systemd-tmpfiles --create /etc/tmpfiles.d/mk8-mail.conf
+
+install -o root -g root -m 0644 "$asset_root/deploy/nginx/00-mk8-security.conf" /etc/nginx/conf.d/00-mk8-security.conf
+install -o root -g root -m 0644 "$asset_root/deploy/nginx/mk8-admin.conf" /etc/nginx/sites-available/mk8-admin.conf
+install -o root -g root -m 0644 "$asset_root/deploy/nginx/mk8-services.conf" /etc/nginx/sites-available/mk8-services.conf
+ln -sfn /etc/nginx/sites-available/mk8-admin.conf /etc/nginx/sites-enabled/mk8-admin.conf
+ln -sfn /etc/nginx/sites-available/mk8-services.conf /etc/nginx/sites-enabled/mk8-services.conf
+install -d -o root -g root -m 0755 /var/www/autoconfig/mail /var/www/mta-sts/.well-known
+install -o root -g root -m 0644 "$asset_root/deploy/nginx/www/autoconfig/mail/config-v1.1.xml" /var/www/autoconfig/mail/config-v1.1.xml
+install -o root -g root -m 0644 "$asset_root/deploy/nginx/www/mta-sts/.well-known/mta-sts.txt" /var/www/mta-sts/.well-known/mta-sts.txt
+install -o root -g root -m 0644 "$asset_root/deploy/fail2ban/90-mk8-server.local" /etc/fail2ban/jail.d/90-mk8-server.local
+install -o root -g root -m 0755 "$asset_root/deploy/nftables/mk8-server.nft" /etc/nftables.conf
+
+postfix check
+doveconf -c /etc/dovecot/dovecot.conf -n >/dev/null
+rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict >/dev/null
+clamconf --config-dir=/etc/clamav --non-default >/dev/null
+nginx -t
+nft -c -f /etc/nftables.conf
+fail2ban-client -t
+aide --config=/etc/aide/aide.conf --config-check
+
+systemctl unmask postfix.service dovecot.service rspamd.service clamav-daemon.service \
+    clamav-daemon.socket clamav-freshclam.service valkey-server.service
+systemctl daemon-reload
+systemctl enable var-vmail.mount
+systemd-analyze verify mk8email-admin.service mk8-mail-health.service mk8-mail-health.timer \
+    dovecot.service rspamd.service clamav-daemon.service clamav-freshclam.service valkey-server.service \
+    var-vmail.mount dailyaidecheck.service dailyaidecheck.timer
+nft -f /etc/nftables.conf
+systemctl reload nginx.service
+systemctl restart fail2ban.service
+
+if runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --tuples-only --no-align \
+    --command="SELECT to_regclass('public.companies') IS NOT NULL" | grep -qx t; then
+    /usr/local/sbin/configure-mail-database-access
+fi
+
+printf '%s\n' "Mail stack assets are installed. The public mail services remain inactive."
