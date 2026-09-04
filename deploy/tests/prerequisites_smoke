@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 0 ]; then
+    printf '%s\n' "Run this test as root without arguments." >&2
+    exit 2
+fi
+
+verifier=/usr/local/sbin/verify-host-prerequisites
+installed_root=/usr/local/share/mk8email/prerequisites
+work_directory=$(mktemp -d /run/mk8-prerequisites-smoke.XXXXXX)
+
+cleanup() {
+    case "$work_directory" in
+        /run/mk8-prerequisites-smoke.*) rm -rf -- "$work_directory" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+test -x "$verifier"
+"$verifier" "$installed_root" >/dev/null
+
+test_root="$work_directory/test-root"
+install -d -o root -g root -m 0755 "$test_root"
+install -o root -g root -m 0644 \
+    "$installed_root/debian-13-sources.list" \
+    "$test_root/debian-13-sources.list"
+
+printf '%s\n' "mk8-package-that-must-not-exist" \
+    > "$test_root/debian-13-runtime.txt"
+if "$verifier" "$test_root" > "$work_directory/missing-package.log" 2>&1; then
+    printf '%s\n' "The verifier accepted a missing package." >&2
+    exit 1
+fi
+grep -Fq "A required production package is not installed" \
+    "$work_directory/missing-package.log"
+
+printf '%s\n' "invalid package name" > "$test_root/debian-13-runtime.txt"
+if "$verifier" "$test_root" > "$work_directory/invalid-package.log" 2>&1; then
+    printf '%s\n' "The verifier accepted an invalid package name." >&2
+    exit 1
+fi
+grep -Fq "The package manifest contains an invalid package name." \
+    "$work_directory/invalid-package.log"
+
+install -o root -g root -m 0644 \
+    "$installed_root/debian-13-runtime.txt" \
+    "$test_root/debian-13-runtime.txt"
+printf '%s\n' "deb https://invalid.example/debian trixie main" \
+    >> "$test_root/debian-13-sources.list"
+if "$verifier" "$test_root" > "$work_directory/source-drift.log" 2>&1; then
+    printf '%s\n' "The verifier accepted APT source drift." >&2
+    exit 1
+fi
+grep -Fq "The active APT sources differ from the reviewed source manifest." \
+    "$work_directory/source-drift.log"
+
+printf '%s\n' "Host prerequisite positive and negative tests passed."

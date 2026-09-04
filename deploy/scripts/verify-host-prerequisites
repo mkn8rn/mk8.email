@@ -1,0 +1,174 @@
+#!/bin/sh
+set -eu
+
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -gt 1 ]; then
+    printf '%s\n' "Usage: verify-host-prerequisites [PREREQUISITE_ROOT]" >&2
+    exit 2
+fi
+
+prerequisite_root=${1:-/usr/local/share/mk8email/prerequisites}
+package_manifest="$prerequisite_root/debian-13-runtime.txt"
+source_manifest="$prerequisite_root/debian-13-sources.list"
+work_directory=$(mktemp -d /run/mk8-prerequisites.XXXXXX)
+
+cleanup() {
+    case "$work_directory" in
+        /run/mk8-prerequisites.*) rm -rf -- "$work_directory" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+check_secure_file() {
+    checked_file=$1
+    [ -f "$checked_file" ] || fail "A required prerequisite file is missing."
+    [ ! -L "$checked_file" ] || fail "A prerequisite file must not be a symbolic link."
+    [ "$(stat -c '%U:%G' "$checked_file")" = root:root ] \
+        || fail "Root must own each prerequisite and APT source file."
+    if find "$checked_file" -prune -perm /022 -print -quit | grep -q .; then
+        fail "Another identity can write a prerequisite or APT source file: $checked_file"
+    fi
+}
+
+check_secure_file "$package_manifest"
+check_secure_file "$source_manifest"
+
+[ -r /etc/os-release ] || fail "The operating-system release file is missing."
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "${ID:-}" = debian ] || fail "The host is not Debian."
+[ "${VERSION_ID:-}" = 13 ] || fail "The host is not Debian 13."
+[ "$(dpkg --print-architecture)" = amd64 ] || fail "The host architecture is not amd64."
+
+source_files="$work_directory/source-files"
+actual_sources="$work_directory/actual-sources"
+expected_sources="$work_directory/expected-sources"
+find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -print \
+    | sort > "$source_files"
+[ -s "$source_files" ] || fail "The host has no APT source files."
+: > "$actual_sources"
+while IFS= read -r source_file; do
+    check_secure_file "$source_file"
+    sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$source_file" \
+        >> "$actual_sources"
+done < "$source_files"
+sort "$actual_sources" -o "$actual_sources"
+sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$source_manifest" \
+    | sort > "$expected_sources"
+cmp --silent "$expected_sources" "$actual_sources" \
+    || fail "The active APT sources differ from the reviewed source manifest."
+
+apt_config="$work_directory/apt-config"
+apt-config dump > "$apt_config"
+if grep -Eiq '^(APT::Get::AllowUnauthenticated|Acquire::AllowInsecureRepositories|Acquire::AllowDowngradeToInsecureRepositories)[[:space:]]+"(true|yes|1)"' "$apt_config"; then
+    fail "APT permits an insecure or unauthenticated repository."
+fi
+if grep -Eiq '^Acquire::https::Verify-(Peer|Host)(::[^[:space:]]+)?[[:space:]]+"(false|no|0)"' "$apt_config"; then
+    fail "APT disables HTTPS peer or host verification."
+fi
+
+for repository_file in \
+    /etc/apt/sources.list.d/microsoft-prod.list \
+    /etc/apt/sources.list.d/matrix-org.list \
+    /usr/share/keyrings/microsoft-prod.gpg \
+    /usr/share/keyrings/matrix-org-archive-keyring.gpg; do
+    check_secure_file "$repository_file"
+done
+
+debsums --silent debian-archive-keyring packages-microsoft-prod matrix-org-archive-keyring \
+    || fail "A repository package differs from its installed checksum."
+
+[ ! -e /etc/apt/trusted.gpg ] \
+    || fail "The legacy global APT keyring must not exist."
+trusted_key_files="$work_directory/trusted-key-files"
+find /etc/apt/trusted.gpg.d -maxdepth 1 -type f -print | sort > "$trusted_key_files"
+[ -s "$trusted_key_files" ] || fail "The Debian APT key directory is empty."
+while IFS= read -r trusted_key_file; do
+    check_secure_file "$trusted_key_file"
+    key_owner=$(dpkg-query -S "$trusted_key_file" 2>/dev/null \
+        | awk -F: 'NR == 1 { print $1 }')
+    [ "$key_owner" = debian-archive-keyring ] \
+        || fail "An unapproved key exists in the global APT key directory."
+done < "$trusted_key_files"
+
+gpg_home="$work_directory/gpg"
+install -d -o root -g root -m 0700 "$gpg_home"
+verify_key() {
+    key_file=$1
+    expected_fingerprint=$2
+    key_records="$work_directory/key-records"
+    GNUPGHOME="$gpg_home" gpg --batch --no-options --with-colons --show-keys \
+        "$key_file" > "$key_records" 2>/dev/null \
+        || fail "A repository signing key cannot be read."
+    actual_fingerprint=$(awk -F: '$1 == "fpr" { print $10; exit }' "$key_records")
+    [ "$actual_fingerprint" = "$expected_fingerprint" ] \
+        || fail "A repository signing-key fingerprint is not approved."
+    current_time=$(date +%s)
+    awk -F: -v now="$current_time" '
+        ($1 == "pub" || $1 == "sub") && $12 ~ /s/ && $7 != "" && $7 <= now {
+            expired = 1
+        }
+        END { exit expired ? 1 : 0 }
+    ' "$key_records" || fail "A repository signing key is expired."
+}
+
+verify_key /usr/share/keyrings/microsoft-prod.gpg \
+    AA86F75E427A19DD33346403EE4D7792F748182B
+verify_key /usr/share/keyrings/matrix-org-archive-keyring.gpg \
+    AAF9AE843A7584B5A3E4CD2BCF45A512DE2DA058
+
+packages="$work_directory/packages"
+sorted_packages="$work_directory/sorted-packages"
+sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' \
+    -e 's/[[:space:]]*$//' -e '/^$/d' "$package_manifest" > "$packages"
+[ -s "$packages" ] || fail "The package manifest is empty."
+if ! awk '/^[a-z0-9][a-z0-9+.-]*$/ { next } { exit 1 }' "$packages"; then
+    fail "The package manifest contains an invalid package name."
+fi
+sort "$packages" > "$sorted_packages"
+cmp --silent "$packages" "$sorted_packages" \
+    || fail "The package manifest must use sorted unique names."
+[ -z "$(uniq -d "$sorted_packages")" ] \
+    || fail "The package manifest contains a duplicate package name."
+
+while IFS= read -r package_name; do
+    package_status=$(dpkg-query -W -f='${Status}' "$package_name" 2>/dev/null || true)
+    [ "$package_status" = "install ok installed" ] \
+        || fail "A required production package is not installed: $package_name"
+    installed_version=$(dpkg-query -W -f='${Version}' "$package_name")
+    candidate_version=$(apt-cache policy "$package_name" \
+        | awk '$1 == "Candidate:" { print $2; exit }')
+    if [ -z "$candidate_version" ] || [ "$candidate_version" = "(none)" ]; then
+        fail "A required package has no repository candidate: $package_name"
+    fi
+    [ "$installed_version" = "$candidate_version" ] \
+        || fail "A required package needs an update: $package_name"
+done < "$packages"
+
+if [ -n "$(apt-mark showhold)" ]; then
+    fail "The host has one or more held packages."
+fi
+[ -z "$(dpkg --audit)" ] || fail "The package database has an incomplete operation."
+apt-get --simulate check >/dev/null \
+    || fail "APT reports an unsatisfied package dependency."
+
+dotnet --list-runtimes | grep -Eq '^Microsoft\.AspNetCore\.App 10\.[0-9]+\.[0-9]+ ' \
+    || fail "The ASP.NET Core 10 runtime is missing."
+dotnet --list-runtimes | grep -Eq '^Microsoft\.NETCore\.App 10\.[0-9]+\.[0-9]+ ' \
+    || fail "The .NET 10 runtime is missing."
+if dpkg-query -W -f='${Status}\n' 'dotnet-sdk-*' 2>/dev/null \
+    | grep -qx 'install ok installed'; then
+    fail "The production host must not contain a .NET SDK."
+fi
+psql --version | grep -Eq '^psql \(PostgreSQL\) 17\.[0-9]+' \
+    || fail "The PostgreSQL 17 client is missing."
+
+printf '%s\n' "Debian 13 repositories, keys, packages, and runtimes passed verification."

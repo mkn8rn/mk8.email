@@ -40,6 +40,10 @@ tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -F 'etc/apt/' >/dev/null
 tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
     | grep -Fx 'var/lib/aide/aide.db' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'usr/local/sbin/verify-host-prerequisites' >/dev/null
+tar --list --gzip --file="$backup_directory/configuration.tar.gz" \
+    | grep -Fx 'usr/local/share/mk8email/prerequisites/debian-13-runtime.txt' >/dev/null
 test -s "$backup_directory/debian-packages.tsv"
 test -s "$backup_directory/debian-manual-packages.txt"
 test -s "$backup_directory/os-release"

@@ -89,7 +89,11 @@ The service uses an eight-gigabyte memory threshold and a ten-gigabyte hard limi
 
 The `s-nail` command sends changed-file reports through local Postfix to `admin@mk8n.com`. Reports stay quiet when no change occurs.
 
-AIDE does not scan mutable mail, backup, Matrix media, health snapshot, or dashboard audit-log data. Service-specific rules handle other mutable system data.
+AIDE does not scan mutable mail, backup, Matrix media, health snapshot, or dashboard audit-log data.
+
+The policy also excludes runtime files, live database pages, mail queues, cache indexes, service state, antivirus signatures, and active logs.
+
+Separate service, database, package, log-retention, and backup controls apply to these mutable paths.
 
 Test the complete local alert path after a Postfix or AIDE change. The test removes its message after successful delivery.
 
@@ -178,6 +182,8 @@ Each snapshot contains both PostgreSQL databases, PostgreSQL roles, Maildir data
 
 Each snapshot also records installed packages, manual packages, the Debian release, the kernel, APT sources, and repository keys.
 
+The configuration archive contains the package manifest and its verifier. These files support a repeatable host rebuild.
+
 The configuration archive includes the reviewed AIDE baseline. This file supports integrity checks after a complete host restore.
 
 The configuration archive excludes `/etc/mk8email/bootstrap-secrets`. Remove temporary password files immediately after each account command.
@@ -252,6 +258,13 @@ apt-get update
 apt list --upgradable
 systemctl status unattended-upgrades
 test -e /var/run/reboot-required && cat /var/run/reboot-required
+```
+
+Install all reviewed updates before a deployment. Then run the prerequisite verifier and its negative-path test.
+
+```sh
+verify-host-prerequisites
+/usr/local/lib/mk8email/tests/prerequisites_smoke
 ```
 
 Do not add a compiler or Git checkout to the production host. Build signed source on the workstation or in CI.

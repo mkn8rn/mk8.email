@@ -91,7 +91,7 @@ try {
     $releaseMaterial = [Text.Encoding]::ASCII.GetBytes("$releaseDigest`n$assetDigest`n")
     $releaseId = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($releaseMaterial)).Substring(0, 16).ToLowerInvariant()
 
-    $remoteRoot = "/root/mk8email-deploy-$releaseId"
+    $remoteRoot = "/run/mk8email-deploy-$releaseId"
     $remoteScript = Join-Path $runRoot 'remote-install.sh'
     $activationRequested = if ($Activate) { 'true' } else { 'false' }
     $remoteScriptText = @"
@@ -130,12 +130,24 @@ finish() {
         set -e
     fi
     case "`$remote_root" in
-        /root/mk8email-deploy-*) rm -rf -- "`$remote_root" ;;
+        /run/mk8email-deploy-*) rm -rf -- "`$remote_root" ;;
     esac
     exit "`$deployment_status"
 }
 trap finish EXIT
 trap 'exit 130' HUP INT TERM
+
+install -d -o root -g root -m 0700 "`$remote_root/assets"
+tar --extract --gzip --file="`$remote_root/mk8email-assets.tar.gz" --directory="`$remote_root/assets"
+chown root:root \
+    "`$remote_root/assets/deploy/prerequisites/debian-13-runtime.txt" \
+    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list"
+chmod 0644 \
+    "`$remote_root/assets/deploy/prerequisites/debian-13-runtime.txt" \
+    "`$remote_root/assets/deploy/prerequisites/debian-13-sources.list"
+timeout 180s apt-get update
+sh "`$remote_root/assets/deploy/scripts/verify-host-prerequisites" \
+    "`$remote_root/assets/deploy/prerequisites"
 
 if [ -f /etc/mk8email/mail-stack-ready ]; then
     was_active=true
@@ -151,8 +163,6 @@ if [ -f /etc/mk8email/mail-stack-ready ]; then
     esac
 fi
 
-install -d -o root -g root -m 0700 "`$remote_root/assets"
-tar --extract --gzip --file="`$remote_root/mk8email-assets.tar.gz" --directory="`$remote_root/assets"
 if [ -n "`$backup_path" ] && [ -s /etc/mk8email/secrets/backup-age-recipient ]; then
     backup_name=`${backup_path##*/}
     encrypted_name="`$backup_name.tar.gz.age"

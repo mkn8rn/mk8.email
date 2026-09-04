@@ -12,6 +12,9 @@ if [ ! -d "$asset_root/deploy" ]; then
     exit 1
 fi
 
+sh "$asset_root/deploy/scripts/verify-host-prerequisites" \
+    "$asset_root/deploy/prerequisites"
+
 for command_name in postfix postconf doveconf rspamadm clamd freshclam valkey-server nginx nft fail2ban-client psql s-nail; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf '%s\n' "A required mail command is missing: $command_name" >&2
@@ -149,6 +152,12 @@ install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-mk8-certifica
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-admin-certificate" /usr/local/sbin/deploy-admin-certificate
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-mail-stack" /usr/local/sbin/install-mail-stack
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-native-release" /usr/local/sbin/install-native-release
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/verify-host-prerequisites" /usr/local/sbin/verify-host-prerequisites
+install -d -o root -g root -m 0755 /usr/local/share/mk8email/prerequisites
+install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian-13-runtime.txt" \
+    /usr/local/share/mk8email/prerequisites/debian-13-runtime.txt
+install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian-13-sources.list" \
+    /usr/local/share/mk8email/prerequisites/debian-13-sources.list
 
 install -d -o root -g root -m 0755 /usr/local/lib/mk8email/tests
 install -o root -g root -m 0755 "$asset_root/deploy/tests/backup_restore_smoke" /usr/local/lib/mk8email/tests/backup_restore_smoke
@@ -156,6 +165,7 @@ install -o root -g root -m 0755 "$asset_root/deploy/tests/aide_alert_smoke" /usr
 install -o root -g root -m 0755 "$asset_root/deploy/tests/dashboard_smoke.py" /usr/local/lib/mk8email/tests/dashboard_smoke.py
 install -o root -g root -m 0755 "$asset_root/deploy/tests/disruption_smoke" /usr/local/lib/mk8email/tests/disruption_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/mail_smoke.py" /usr/local/lib/mk8email/tests/mail_smoke.py
+install -o root -g root -m 0755 "$asset_root/deploy/tests/prerequisites_smoke" /usr/local/lib/mk8email/tests/prerequisites_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/tls_smoke" /usr/local/lib/mk8email/tests/tls_smoke
 
 install -o root -g root -m 0644 "$asset_root/deploy/tmpfiles/mk8-mail.conf" /etc/tmpfiles.d/mk8-mail.conf

@@ -62,6 +62,25 @@ The host also requires `s-nail` for local AIDE alert delivery. A deployment stop
 
 The host has no global IPv6 address. Do not publish an AAAA record before a complete IPv6 path passes tests.
 
+The prerequisite manifest records each required production package. The verifier accepts only Debian 13 on amd64.
+
+The verifier compares all active APT sources with the reviewed source manifest. It also checks repository package files and signing-key fingerprints.
+
+The [Microsoft Debian instructions](https://learn.microsoft.com/en-us/dotnet/core/install/linux-debian) define the .NET 10 feed and runtime package.
+
+The [Synapse installation guide](https://element-hq.github.io/synapse/latest/setup/installation.html) defines the Matrix package feed and published key fingerprint.
+
+The verifier rejects missing packages, held packages, incomplete package operations, and available package updates. It also rejects a .NET SDK on production.
+
+Run the installed verifier before controlled maintenance. Production deployment first refreshes signed APT metadata.
+
+Deployment runs the verifier before any backup, service, configuration, or release change.
+
+```sh
+sudo verify-host-prerequisites
+sudo /usr/local/lib/mk8email/tests/prerequisites_smoke
+```
+
 The database contains active `admin@mk8n.com` and `mk8n@mk8n.com` accounts. The `admin` account has the `SuperAdmin` role.
 
 The `mk8n.com` catch-all route sends undefined local addresses to `mk8n@mk8n.com`. An exact address always has priority.
@@ -160,7 +179,7 @@ Use the [RouterOS and DNS guide](routeros-and-dns.md) for the exact cutover orde
 
 ## Measured local evidence
 
-The release build completed with zero warnings and zero errors. Thirty-eight application and infrastructure tests passed.
+The release build completed with zero warnings and zero errors. Forty application and infrastructure tests passed.
 
 Live tests passed for exact delivery, catch-all delivery, authenticated submission, IMAPS retrieval, DKIM signing, and relay denial.
 

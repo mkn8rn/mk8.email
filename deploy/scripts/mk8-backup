@@ -159,7 +159,9 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     usr/local/sbin/mk8-backup \
     usr/local/sbin/mk8-export-backup \
     usr/local/sbin/mk8-mail-health \
-    usr/local/lib/mk8email/tests
+    usr/local/sbin/verify-host-prerequisites \
+    usr/local/lib/mk8email/tests \
+    usr/local/share/mk8email/prerequisites
 
 install -d -m 0700 "$stage/matrix-media"
 if [ -d /var/lib/matrix-synapse/media ]; then

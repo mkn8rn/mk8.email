@@ -1,0 +1,8 @@
+deb http://deb.debian.org/debian/ trixie main non-free-firmware
+deb http://deb.debian.org/debian/ trixie-updates main non-free-firmware
+deb http://security.debian.org/debian-security trixie-security main non-free-firmware
+deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/13/prod trixie main
+deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ trixie main
+deb-src http://deb.debian.org/debian/ trixie main non-free-firmware
+deb-src http://deb.debian.org/debian/ trixie-updates main non-free-firmware
+deb-src http://security.debian.org/debian-security trixie-security main non-free-firmware
