@@ -168,8 +168,10 @@ install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-backup" /usr/loc
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-export-backup" /usr/local/sbin/mk8-export-backup
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-mk8-certificate" /usr/local/sbin/deploy-mk8-certificate
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/deploy-admin-certificate" /usr/local/sbin/deploy-admin-certificate
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-build-environment" /usr/local/sbin/install-build-environment
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-mail-stack" /usr/local/sbin/install-mail-stack
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/install-native-release" /usr/local/sbin/install-native-release
+install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8-build" /usr/local/sbin/mk8-build
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/mk8email" /usr/local/sbin/mk8email
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/verify-host-prerequisites" /usr/local/sbin/verify-host-prerequisites
 install -o root -g root -m 0755 "$asset_root/deploy/scripts/prune-native-releases" /usr/local/sbin/prune-native-releases
@@ -183,6 +185,7 @@ install -o root -g root -m 0644 "$asset_root/deploy/prerequisites/debian.sources
 
 install -d -o root -g root -m 0755 /usr/local/lib/mk8email/tests
 install -o root -g root -m 0755 "$asset_root/deploy/tests/backup_restore_smoke" /usr/local/lib/mk8email/tests/backup_restore_smoke
+install -o root -g root -m 0755 "$asset_root/deploy/tests/build_environment_smoke" /usr/local/lib/mk8email/tests/build_environment_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/aide_alert_smoke" /usr/local/lib/mk8email/tests/aide_alert_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/apt_sources_smoke" /usr/local/lib/mk8email/tests/apt_sources_smoke
 install -o root -g root -m 0755 "$asset_root/deploy/tests/dashboard_smoke.py" /usr/local/lib/mk8email/tests/dashboard_smoke.py

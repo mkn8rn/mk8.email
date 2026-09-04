@@ -1,0 +1,227 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 1 ]; then
+    printf '%s\n' "Usage: mk8-build COMMIT" >&2
+    exit 2
+fi
+
+commit=$1
+if [ "${#commit}" -ne 40 ] \
+    || ! printf '%s\n' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+    printf '%s\n' "The commit must be a complete lowercase SHA-1 value." >&2
+    exit 2
+fi
+
+build_root=/var/lib/mk8email-build
+repository=$build_root/git/mk8.email.git
+sdk=/opt/mk8email-build/dotnet/dotnet
+repository_url=https://github.com/mkn8rn/mk8.email.git
+short_commit=$(printf '%s' "$commit" | cut -c1-12)
+run_root=
+completed=false
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$completed" != true ] && [ -n "$run_root" ]; then
+        resolved_run=$(realpath -m -- "$run_root")
+        case "$resolved_run" in
+            /var/lib/mk8email-build/runs/$short_commit-*)
+                rm -rf -- "$resolved_run"
+                ;;
+        esac
+    fi
+    exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+[ -x "$sdk" ] || fail "The isolated build SDK is not installed."
+if [ ! -d "$repository" ] || [ -L "$repository" ]; then
+    fail "The isolated build repository is not installed."
+fi
+[ "$(runuser -u mk8build -- git --git-dir="$repository" remote get-url origin)" \
+    = "$repository_url" ] || fail "The build repository has an unexpected remote."
+[ "$(runuser -u mk8build -- git --git-dir="$repository" config --get remote.origin.fetch)" \
+    = '+refs/heads/main:refs/remotes/origin/main' ] \
+    || fail "The build repository has an unsafe fetch rule."
+
+timeout 120s runuser -u mk8build -- env HOME="$build_root" \
+    git --git-dir="$repository" fetch --no-tags origin main
+
+remote_main=$(runuser -u mk8build -- git --git-dir="$repository" \
+    rev-parse refs/remotes/origin/main)
+[ "$remote_main" = "$commit" ] \
+    || fail "The requested commit is not the current remote main commit."
+
+unexpected_ref=$(runuser -u mk8build -- git --git-dir="$repository" \
+    for-each-ref --format='%(refname)' \
+    | grep -Fvx refs/remotes/origin/main || true)
+[ -z "$unexpected_ref" ] \
+    || fail "The build repository contains an unexpected Git reference."
+
+run_root=$build_root/runs/$short_commit-$(date -u +%Y%m%dT%H%M%SZ)-$$
+source_root=$run_root/source
+install -d -o mk8build -g mk8build -m 0700 \
+    "$run_root" "$source_root" "$run_root/home" "$run_root/tmp" \
+    "$run_root/artifacts" "$run_root/test-results" "$run_root/release"
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+runuser -u mk8build -- sh -eu -c \
+    'git --git-dir="$1" archive "$2" | tar --extract --directory="$3"' \
+    sh "$repository" "$commit" "$source_root"
+
+run_unit() {
+    unit_name=$1
+    private_network=$2
+    shift 2
+    systemd-run --quiet --wait --pipe --collect --service-type=exec \
+        --unit="$unit_name" \
+        --uid=mk8build --gid=mk8build \
+        --working-directory="$source_root" \
+        --property=NoNewPrivileges=yes \
+        --property=PrivateDevices=yes \
+        --property=PrivateTmp=yes \
+        --property="PrivateNetwork=$private_network" \
+        --property=ProtectClock=yes \
+        --property=ProtectControlGroups=yes \
+        --property=ProtectHome=yes \
+        --property=ProtectHostname=yes \
+        --property=ProtectKernelLogs=yes \
+        --property=ProtectKernelModules=yes \
+        --property=ProtectKernelTunables=yes \
+        --property=ProtectProc=invisible \
+        --property=ProtectSystem=strict \
+        --property=ProcSubset=pid \
+        --property=RestrictNamespaces=yes \
+        --property=RestrictRealtime=yes \
+        --property=RestrictSUIDSGID=yes \
+        --property=LockPersonality=yes \
+        --property=SystemCallArchitectures=native \
+        --property=UMask=0077 \
+        --property=TasksMax=1024 \
+        --property=MemoryMax=8G \
+        --property=RuntimeMaxSec=900 \
+        --property="ReadWritePaths=$run_root" \
+        --property="InaccessiblePaths=-/etc/letsencrypt -/etc/mk8email -/etc/ssh -/var/lib/postgresql -/var/vmail" \
+        --setenv="HOME=$run_root/home" \
+        --setenv="DOTNET_CLI_HOME=$run_root/home" \
+        --setenv="NUGET_PACKAGES=$run_root/packages" \
+        --setenv="TMPDIR=$run_root/tmp" \
+        --setenv=DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+        --setenv=DOTNET_NOLOGO=1 \
+        --setenv=DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+        --setenv=DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=1 \
+        --setenv=MSBUILDDISABLENODEREUSE=1 \
+        "$@"
+}
+
+run_unit "mk8-restore-$short_commit-$$" no \
+    "$sdk" restore mk8.email.slnx --locked-mode \
+    --artifacts-path "$run_root/artifacts"
+
+# The child shell expands its positional parameters.
+# shellcheck disable=SC2016
+run_unit "mk8-build-$short_commit-$$" yes /bin/sh -eu -c '
+    sdk=$1
+    run_root=$2
+    test ! -r /etc/mk8email/secrets/database_password
+    test ! -r /etc/ssh/ssh_host_ed25519_key
+    test ! -r /var/vmail
+    test ! -w /opt/mk8email-build/sdk
+    "$sdk" build mk8.email.slnx --configuration Release --no-restore \
+        --artifacts-path "$run_root/artifacts" \
+        --property:TreatWarningsAsErrors=true \
+        --property:ContinuousIntegrationBuild=true \
+        --property:UseSharedCompilation=false
+    "$sdk" test mk8.email.Application.Tests/mk8.email.Application.Tests.csproj \
+        --configuration Release --no-build \
+        --artifacts-path "$run_root/artifacts" \
+        --logger "trx;LogFileName=application.trx" \
+        --results-directory "$run_root/test-results"
+    "$sdk" test mk8.email.Infrastructure.Tests/mk8.email.Infrastructure.Tests.csproj \
+        --configuration Release --no-build \
+        --artifacts-path "$run_root/artifacts" \
+        --logger "trx;LogFileName=infrastructure.trx" \
+        --results-directory "$run_root/test-results"
+    shellcheck \
+        deploy/scripts/activate-mail-stack \
+        deploy/scripts/configure-apt-sources \
+        deploy/scripts/configure-mail-database-access \
+        deploy/scripts/deactivate-mail-stack \
+        deploy/scripts/deploy-admin-certificate \
+        deploy/scripts/deploy-mk8-certificate \
+        deploy/scripts/initialize-postgresql \
+        deploy/scripts/install-build-environment \
+        deploy/scripts/install-host-hardening \
+        deploy/scripts/install-mail-stack \
+        deploy/scripts/install-native-release \
+        deploy/scripts/mk8-build \
+        deploy/scripts/mk8email \
+        deploy/scripts/mk8-backup \
+        deploy/scripts/mk8-export-backup \
+        deploy/scripts/mk8-mail-health \
+        deploy/scripts/prune-native-releases \
+        deploy/scripts/verify-host-prerequisites \
+        deploy/tests/aide_alert_smoke \
+        deploy/tests/apt_sources_smoke \
+        deploy/tests/backup_restore_smoke \
+        deploy/tests/build_environment_smoke \
+        deploy/tests/certificate_deploy_smoke \
+        deploy/tests/disruption_smoke \
+        deploy/tests/host_hardening_smoke \
+        deploy/tests/management_cli_smoke \
+        deploy/tests/prerequisites_smoke \
+        deploy/tests/release_retention_smoke \
+        deploy/tests/tls_smoke
+    PYTHONPYCACHEPREFIX="$run_root/pycache" \
+        python3 -m py_compile \
+        deploy/tests/dashboard_smoke.py deploy/tests/mail_smoke.py
+    "$sdk" publish mk8.email.CLI/mk8.email.Application.CLI.csproj \
+        --configuration Release --no-build \
+        --artifacts-path "$run_root/artifacts" \
+        --output "$run_root/release/cli" --property:UseAppHost=false
+    "$sdk" publish mk8.email.PublicAPI/mk8.email.PublicAPI.csproj \
+        --configuration Release --no-build \
+        --artifacts-path "$run_root/artifacts" \
+        --output "$run_root/release/admin" --property:UseAppHost=false
+    tar --create --gzip --file="$run_root/mk8email-linux-x64.tar.gz" \
+        --directory="$run_root/release" cli admin
+    sha256sum "$run_root/mk8email-linux-x64.tar.gz" \
+        > "$run_root/mk8email-linux-x64.tar.gz.sha256"
+' sh "$sdk" "$run_root"
+
+printf 'commit=%s\nsdk=%s\nartifact_sha256=%s\n' \
+    "$commit" "$($sdk --version)" \
+    "$(cut -d' ' -f1 "$run_root/mk8email-linux-x64.tar.gz.sha256")" \
+    > "$run_root/evidence.txt"
+chown mk8build:mk8build "$run_root/evidence.txt"
+chmod 0600 "$run_root/evidence.txt"
+
+prune_list=$run_root/prune-list
+find "$build_root/runs" -mindepth 1 -maxdepth 1 -type d \
+    -printf '%T@ %f\n' \
+    | sort -nr \
+    | awk 'NR > 3 { print $2 }' > "$prune_list"
+while IFS= read -r run_name; do
+    [ -n "$run_name" ] || continue
+    printf '%s\n' "$run_name" \
+        | grep -Eq '^[0-9a-f]{12}-[0-9]{8}T[0-9]{6}Z-[0-9]+$' \
+        || fail "A retained build path has an unexpected name."
+    old_run=$build_root/runs/$run_name
+    resolved_old_run=$(realpath -e -- "$old_run")
+    [ "$(dirname -- "$resolved_old_run")" = "$build_root/runs" ] \
+        || fail "A retained build path leaves the build root."
+    rm -rf -- "$resolved_old_run"
+done < "$prune_list"
+rm -f -- "$prune_list"
+completed=true
+
+printf 'BUILD_RUN=%s\n' "$run_root"
+printf 'ARTIFACT_SHA256=%s\n' \
+    "$(cut -d' ' -f1 "$run_root/mk8email-linux-x64.tar.gz.sha256")"

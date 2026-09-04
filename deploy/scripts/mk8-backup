@@ -160,8 +160,10 @@ tar --create --gzip --file="$stage/configuration.tar.gz" --directory=/ \
     usr/local/sbin/deactivate-mail-stack \
     usr/local/sbin/deploy-admin-certificate \
     usr/local/sbin/deploy-mk8-certificate \
+    usr/local/sbin/install-build-environment \
     usr/local/sbin/install-mail-stack \
     usr/local/sbin/install-native-release \
+    usr/local/sbin/mk8-build \
     usr/local/sbin/mk8email \
     usr/local/sbin/mk8-backup \
     usr/local/sbin/mk8-export-backup \

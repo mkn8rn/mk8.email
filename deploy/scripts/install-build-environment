@@ -1,0 +1,160 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 0 ]; then
+    printf '%s\n' "Usage: install-build-environment" >&2
+    exit 2
+fi
+
+sdk_version=10.0.400
+sdk_url=https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.400/dotnet-sdk-10.0.400-linux-x64.tar.gz
+sdk_sha512=1033977dd837150e0814cf0c5d5b17ceb63925fda7ba2158b47258a4bd7c048cf82eac3bc1166f3146f53124a3f5fba09db1de1260d2ce96399860303b404b48
+repository_url=https://github.com/mkn8rn/mk8.email.git
+build_root=/var/lib/mk8email-build
+sdk_root=/opt/mk8email-build/sdk
+sdk_target=$sdk_root/$sdk_version
+repository=$build_root/git/mk8.email.git
+archive=
+sdk_stage=
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+require_directory_or_absent() {
+    checked_path=$1
+    if [ -L "$checked_path" ] \
+        || { [ -e "$checked_path" ] && [ ! -d "$checked_path" ]; }; then
+        fail "A build environment path is not a safe directory: $checked_path"
+    fi
+}
+
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$archive" ]; then
+        case "$archive" in
+            /run/mk8email-sdk.*.tar.gz) rm -f -- "$archive" ;;
+        esac
+    fi
+    if [ -n "$sdk_stage" ]; then
+        case "$sdk_stage" in
+            /opt/mk8email-build/sdk/.10.0.400.new.*)
+                resolved_stage=$(realpath -m -- "$sdk_stage")
+                case "$resolved_stage" in
+                    /opt/mk8email-build/sdk/.10.0.400.new.*)
+                        rm -rf -- "$resolved_stage"
+                        ;;
+                esac
+                ;;
+        esac
+    fi
+    exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+require_directory_or_absent /opt/mk8email-build
+require_directory_or_absent /opt/mk8email-build/sdk
+require_directory_or_absent "$build_root"
+require_directory_or_absent "$build_root/git"
+require_directory_or_absent "$build_root/runs"
+
+if getent passwd mk8build >/dev/null; then
+    [ "$(getent passwd mk8build | cut -d: -f6)" = "$build_root" ] \
+        || fail "The build account has an unexpected home directory."
+    [ "$(getent passwd mk8build | cut -d: -f7)" = /usr/sbin/nologin ] \
+        || fail "The build account has an interactive shell."
+    [ "$(id -Gn mk8build)" = mk8build ] \
+        || fail "The build account has an unexpected group."
+else
+    useradd --system --user-group --home-dir "$build_root" \
+        --create-home --shell /usr/sbin/nologin mk8build
+fi
+
+install -d -o root -g mk8build -m 0750 /opt/mk8email-build "$sdk_root"
+install -d -o mk8build -g mk8build -m 0700 \
+    "$build_root" "$build_root/git" "$build_root/runs"
+
+if [ -e "$sdk_target" ]; then
+    if [ -L "$sdk_target" ] || [ ! -d "$sdk_target" ]; then
+        fail "The installed build SDK path is unsafe."
+    fi
+    [ "$(stat -c '%U:%G %a' "$sdk_target")" = "root:mk8build 750" ] \
+        || fail "The installed build SDK has unsafe metadata."
+    [ -x "$sdk_target/dotnet" ] \
+        || fail "The installed build SDK is incomplete."
+    [ "$($sdk_target/dotnet --version)" = "$sdk_version" ] \
+        || fail "The installed build SDK has an unexpected version."
+else
+    archive=$(mktemp /run/mk8email-sdk.XXXXXX.tar.gz)
+    sdk_stage=$sdk_root/.10.0.400.new.$$
+    install -d -o root -g mk8build -m 0750 "$sdk_stage"
+    timeout 300s curl --silent --show-error --fail --location \
+        --proto '=https' --tlsv1.2 --output "$archive" "$sdk_url"
+    printf '%s  %s\n' "$sdk_sha512" "$archive" \
+        | sha512sum --check --strict
+    tar --extract --gzip --file="$archive" --directory="$sdk_stage" \
+        --no-same-owner
+    [ -x "$sdk_stage/dotnet" ] \
+        || fail "The verified build SDK archive is incomplete."
+    chown -R root:mk8build "$sdk_stage"
+    chmod -R g-w,o-rwx "$sdk_stage"
+    [ "$($sdk_stage/dotnet --version)" = "$sdk_version" ] \
+        || fail "The verified build SDK has an unexpected version."
+    mv -- "$sdk_stage" "$sdk_target"
+    sdk_stage=
+fi
+
+checksum_file=$sdk_target/SHA256SUMS
+if [ ! -s "$checksum_file" ]; then
+    checksum_stage=$(mktemp "$sdk_root/.SHA256SUMS.XXXXXX")
+    (
+        cd "$sdk_target"
+        find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum
+    ) > "$checksum_stage"
+    install -o root -g mk8build -m 0640 "$checksum_stage" "$checksum_file"
+    rm -f -- "$checksum_stage"
+fi
+
+ln -sfnT "$sdk_target" /opt/mk8email-build/dotnet
+chown -h root:mk8build /opt/mk8email-build/dotnet
+
+if [ -e "$repository" ]; then
+    if [ -L "$repository" ] || [ ! -d "$repository" ]; then
+        fail "The build repository path is unsafe."
+    fi
+    [ "$(stat -c '%U:%G %a' "$repository")" = "mk8build:mk8build 750" ] \
+        || fail "The build repository has unsafe metadata."
+else
+    runuser -u mk8build -- env HOME="$build_root" \
+        git init --bare --initial-branch=main "$repository" >/dev/null
+    runuser -u mk8build -- env HOME="$build_root" \
+        git --git-dir="$repository" remote add origin "$repository_url"
+    runuser -u mk8build -- env HOME="$build_root" \
+        git --git-dir="$repository" config remote.origin.fetch \
+        '+refs/heads/main:refs/remotes/origin/main'
+    runuser -u mk8build -- env HOME="$build_root" \
+        git --git-dir="$repository" config transfer.fsckObjects true
+    runuser -u mk8build -- env HOME="$build_root" \
+        git --git-dir="$repository" config fetch.fsckObjects true
+fi
+
+[ "$(runuser -u mk8build -- git --git-dir="$repository" remote get-url origin)" \
+    = "$repository_url" ] || fail "The build repository has an unexpected remote."
+[ "$(runuser -u mk8build -- git --git-dir="$repository" config --get remote.origin.fetch)" \
+    = '+refs/heads/main:refs/remotes/origin/main' ] \
+    || fail "The build repository has an unsafe fetch rule."
+
+timeout 120s runuser -u mk8build -- env HOME="$build_root" \
+    git --git-dir="$repository" fetch --no-tags origin main
+
+unexpected_ref=$(runuser -u mk8build -- git --git-dir="$repository" \
+    for-each-ref --format='%(refname)' \
+    | grep -Fvx refs/remotes/origin/main || true)
+[ -z "$unexpected_ref" ] \
+    || fail "The build repository contains an unexpected Git reference."
+
+printf '%s\n' "The isolated mk8.email build environment is ready."

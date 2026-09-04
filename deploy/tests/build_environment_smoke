@@ -1,0 +1,45 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ] || [ "$#" -ne 0 ]; then
+    printf '%s\n' "Usage: build_environment_smoke" >&2
+    exit 2
+fi
+
+build_root=/var/lib/mk8email-build
+sdk_target=/opt/mk8email-build/sdk/10.0.400
+repository=$build_root/git/mk8.email.git
+
+getent passwd mk8build >/dev/null
+[ "$(getent passwd mk8build | cut -d: -f6)" = "$build_root" ]
+[ "$(getent passwd mk8build | cut -d: -f7)" = /usr/sbin/nologin ]
+[ "$(id -Gn mk8build)" = mk8build ]
+[ "$(stat -c '%U:%G %a' /opt/mk8email-build)" = "root:mk8build 750" ]
+[ "$(stat -c '%U:%G %a' /opt/mk8email-build/sdk)" = "root:mk8build 750" ]
+[ "$(stat -c '%U:%G %a' "$sdk_target")" = "root:mk8build 750" ]
+[ "$(stat -c '%U:%G %a' "$build_root")" = "mk8build:mk8build 700" ]
+[ -L /opt/mk8email-build/dotnet ]
+[ "$(readlink -f /opt/mk8email-build/dotnet)" = "$sdk_target" ]
+[ "$(/opt/mk8email-build/dotnet/dotnet --version)" = 10.0.400 ]
+(
+    cd "$sdk_target"
+    sha256sum --check --strict SHA256SUMS >/dev/null
+)
+[ -z "$(/usr/bin/dotnet --list-sdks)" ]
+
+[ "$(stat -c '%U:%G %a' "$repository")" = "mk8build:mk8build 750" ]
+[ "$(runuser -u mk8build -- git --git-dir="$repository" remote get-url origin)" \
+    = https://github.com/mkn8rn/mk8.email.git ]
+[ "$(runuser -u mk8build -- git --git-dir="$repository" config --get remote.origin.fetch)" \
+    = '+refs/heads/main:refs/remotes/origin/main' ]
+[ "$(runuser -u mk8build -- git --git-dir="$repository" \
+    for-each-ref --format='%(refname)' | wc -l)" -eq 1 ]
+runuser -u mk8build -- git --git-dir="$repository" \
+    show-ref --verify --quiet refs/remotes/origin/main
+
+runuser -u mk8build -- test ! -r /etc/mk8email/secrets/database_password
+runuser -u mk8build -- test ! -r /etc/ssh/ssh_host_ed25519_key
+runuser -u mk8build -- test ! -r /var/vmail
+runuser -u mk8build -- test ! -w /opt/mk8email-build/sdk
+
+printf '%s\n' "The isolated build environment passed its safety checks."

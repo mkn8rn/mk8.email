@@ -39,4 +39,5 @@
 -/var/backups/mk8
 -/var/backups/mk8-export
 -/var/lib/mk8-mail-health
+-/var/lib/mk8email-build
 -/var/log/mk8email-admin

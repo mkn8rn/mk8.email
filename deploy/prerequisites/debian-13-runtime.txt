@@ -23,6 +23,7 @@ dovecot-lmtpd
 dovecot-pgsql
 dovecot-sieve
 fail2ban
+git
 gnupg
 jq
 libcap2-bin
@@ -45,6 +46,7 @@ python3
 rspamd
 rsync
 s-nail
+shellcheck
 sudo
 swaks
 sysstat
