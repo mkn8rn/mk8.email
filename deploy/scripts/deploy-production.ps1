@@ -362,7 +362,8 @@ if [ -f /etc/mk8email/mail-stack-ready ]; then
 elif [ -x /usr/local/sbin/verify-host-prerequisites ] \
     && [ -d /usr/local/share/mk8email/prerequisites ]; then
     timeout 180s apt-get update
-    /usr/local/sbin/verify-host-prerequisites
+    sh "`$remote_root/assets/deploy/scripts/verify-host-prerequisites" \
+        "`$remote_root/assets/deploy/prerequisites"
 fi
 
 apt_source_backup="`$remote_root/apt-source-backup"
