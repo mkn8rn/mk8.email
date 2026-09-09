@@ -39,6 +39,11 @@ def tls_context() -> ssl.SSLContext:
     return context
 
 
+def contains_marker(raw: bytes, marker: str) -> bool:
+    expected = f"X-Mk8-Test: {marker}".encode("ascii")
+    return expected.lower() in raw.lower()
+
+
 def message(recipient: str, marker: str, body: str = "Local production smoke test.") -> EmailMessage:
     value = EmailMessage()
     value["From"] = "probe@debian.org"
@@ -99,6 +104,10 @@ def wait_for_message(
                 status, content = client.uid("FETCH", identifier, "(BODY.PEEK[])")
                 require(status == "OK", f"IMAP fetch failed for {account}.")
                 raw = next(item[1] for item in content if isinstance(item, tuple))
+                require(
+                    contains_marker(raw, marker),
+                    "IMAP header search returned an unrelated message.",
+                )
                 if delete:
                     client.uid("STORE", identifier, "+FLAGS.SILENT", "(\\Deleted)")
                     client.expunge()
@@ -112,7 +121,17 @@ def require_absent(account: str, password: str, marker: str) -> None:
         client.login(account, password)
         client.select("INBOX")
         status, data = client.uid("SEARCH", None, "HEADER", "X-Mk8-Test", marker)
-        require(status == "OK" and not data[0].split(), "A rejected message reached a mailbox.")
+        require(status == "OK", f"IMAP search failed for {account}.")
+        identifiers = data[0].split()
+        for identifier in identifiers:
+            status, content = client.uid("FETCH", identifier, "(BODY.PEEK[])")
+            require(status == "OK", f"IMAP fetch failed for {account}.")
+            raw = next(item[1] for item in content if isinstance(item, tuple))
+            require(
+                not contains_marker(raw, marker),
+                "A rejected message reached a mailbox.",
+            )
+        require(not identifiers, "IMAP header search returned an unrelated message.")
 
 
 def queue_status(marker: str) -> tuple[str, int]:

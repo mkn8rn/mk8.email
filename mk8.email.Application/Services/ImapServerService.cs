@@ -1287,9 +1287,11 @@ ILogger<ImapServerService> logger) : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
         var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        query = ApplySearchCriteria(query, searchCriteria.Trim().ToUpperInvariant());
-
-        var emails = await query.OrderBy(e => e.ReceivedAt).Select(e => e.Id).ToListAsync(ct);
+        var matches = await FindSearchCandidatesAsync(
+            query,
+            searchCriteria.Trim().ToUpperInvariant(),
+            ct);
+        var emails = matches.Select(item => item.Id).ToList();
 
         var allEmails = await db.Emails
             .Where(e => e.FolderId == session.SelectedFolderId!.Value)
@@ -1557,9 +1559,11 @@ ILogger<ImapServerService> logger) : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
         var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        query = ApplySearchCriteria(query, searchCriteria.Trim().ToUpperInvariant());
-
-        var uids = await query.OrderBy(e => e.ReceivedAt).Select(e => e.Uid).ToListAsync(ct);
+        var matches = await FindSearchCandidatesAsync(
+            query,
+            searchCriteria.Trim().ToUpperInvariant(),
+            ct);
+        var uids = matches.Select(item => item.Uid).ToList();
 
         if (returnOpts is not null)
         {
@@ -2604,7 +2608,83 @@ ILogger<ImapServerService> logger) : BackgroundService
         return sb.ToString();
     }
 
-    private static IQueryable<EmailDB> ApplySearchCriteria(IQueryable<EmailDB> query, string criteria)
+    private sealed record SearchCandidate(Guid Id, int Uid, string? RawHeaders);
+
+    private sealed record HeaderSearchCriterion(string Name, string Value);
+
+    private static async Task<List<SearchCandidate>> FindSearchCandidatesAsync(
+        IQueryable<EmailDB> query,
+        string criteria,
+        CancellationToken cancellationToken)
+    {
+        var headerCriteria = new List<HeaderSearchCriterion>();
+        query = ApplySearchCriteria(query, criteria, headerCriteria);
+
+        if (headerCriteria.Count == 0)
+        {
+            return await query
+                .OrderBy(email => email.ReceivedAt)
+                .ThenBy(email => email.Uid)
+                .Select(email => new SearchCandidate(email.Id, email.Uid, null))
+                .ToListAsync(cancellationToken);
+        }
+
+        var candidates = await query
+            .OrderBy(email => email.ReceivedAt)
+            .ThenBy(email => email.Uid)
+            .Select(email => new SearchCandidate(email.Id, email.Uid, email.RawHeaders))
+            .ToListAsync(cancellationToken);
+        return candidates
+            .Where(candidate => headerCriteria.All(
+                criterion => HeaderContains(candidate.RawHeaders, criterion)))
+            .ToList();
+    }
+
+    private static bool HeaderContains(string? rawHeaders, HeaderSearchCriterion criterion)
+    {
+        if (string.IsNullOrEmpty(rawHeaders))
+            return false;
+
+        using var reader = new StringReader(rawHeaders);
+        string? currentName = null;
+        var currentValue = new StringBuilder();
+
+        bool CurrentHeaderMatches() => currentName is not null
+            && currentName.Equals(criterion.Name, StringComparison.OrdinalIgnoreCase)
+            && currentValue.ToString().Contains(
+                criterion.Value,
+                StringComparison.OrdinalIgnoreCase);
+
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t'))
+            {
+                if (currentName is not null)
+                    currentValue.Append(' ').Append(line.Trim());
+                continue;
+            }
+
+            if (CurrentHeaderMatches())
+                return true;
+
+            currentName = null;
+            currentValue.Clear();
+            var separator = line.IndexOf(':');
+            if (separator <= 0)
+                continue;
+
+            currentName = line[..separator].Trim();
+            currentValue.Append(line[(separator + 1)..].Trim());
+        }
+
+        return CurrentHeaderMatches();
+    }
+
+    private static IQueryable<EmailDB> ApplySearchCriteria(
+        IQueryable<EmailDB> query,
+        string criteria,
+        ICollection<HeaderSearchCriterion>? headerCriteria = null)
     {
         var cleaned = criteria.Replace("(", " ").Replace(")", " ");
         var tokens = cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -2659,51 +2739,62 @@ ILogger<ImapServerService> logger) : BackgroundService
                 case "SUBJECT" when i + 1 < tokens.Length:
                     i++;
                     var subj = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Subject.Contains(subj));
+                    query = query.Where(e => e.Subject.ToUpper().Contains(subj));
                     break;
                 case "FROM" when i + 1 < tokens.Length:
                     i++;
                     var from = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Sender.Contains(from));
+                    query = query.Where(e => e.Sender.ToUpper().Contains(from));
                     break;
                 case "TO" when i + 1 < tokens.Length:
                     i++;
                     var to = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Recipient.Contains(to));
+                    query = query.Where(e => e.Recipient.ToUpper().Contains(to));
                     break;
                 case "CC" when i + 1 < tokens.Length:
                     i++;
                     var ccVal = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Cc != null && e.Cc.Contains(ccVal));
+                    query = query.Where(e => e.Cc != null && e.Cc.ToUpper().Contains(ccVal));
                     break;
                 case "BODY" when i + 1 < tokens.Length:
                     i++;
                     var bodyText = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Body.Contains(bodyText));
+                    query = query.Where(e => e.Body.ToUpper().Contains(bodyText));
                     break;
                 case "TEXT" when i + 1 < tokens.Length:
                     i++;
                     var text = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Subject.Contains(text)
-                                           || e.Sender.Contains(text)
-                                           || e.Recipient.Contains(text)
-                                           || e.Body.Contains(text)
-                                           || (e.Cc != null && e.Cc.Contains(text)));
+                    query = query.Where(e => e.Subject.ToUpper().Contains(text)
+                                           || e.Sender.ToUpper().Contains(text)
+                                           || e.Recipient.ToUpper().Contains(text)
+                                           || e.Body.ToUpper().Contains(text)
+                                           || (e.Cc != null && e.Cc.ToUpper().Contains(text)));
                     break;
                 case "HEADER" when i + 2 < tokens.Length:
                     i++;
                     var headerName = tokens[i].ToUpperInvariant();
                     i++;
                     var headerVal = UnquoteSearchArg(ref i, tokens);
+                    if (headerCriteria is not null
+                        && headerName is not "FROM" and not "TO" and not "CC"
+                            and not "SUBJECT" and not "MESSAGE-ID" and not "IN-REPLY-TO")
+                    {
+                        headerCriteria.Add(new HeaderSearchCriterion(headerName, headerVal));
+                        break;
+                    }
+
                     query = headerName switch
                     {
-                        "FROM" => query.Where(e => e.Sender.Contains(headerVal)),
-                        "TO" => query.Where(e => e.Recipient.Contains(headerVal)),
-                        "CC" => query.Where(e => e.Cc != null && e.Cc.Contains(headerVal)),
-                        "SUBJECT" => query.Where(e => e.Subject.Contains(headerVal)),
-                        "MESSAGE-ID" => query.Where(e => e.MessageId != null && e.MessageId.Contains(headerVal)),
-                        "IN-REPLY-TO" => query.Where(e => e.InReplyTo != null && e.InReplyTo.Contains(headerVal)),
-                        _ => query,
+                        "FROM" => query.Where(e => e.Sender.ToUpper().Contains(headerVal)),
+                        "TO" => query.Where(e => e.Recipient.ToUpper().Contains(headerVal)),
+                        "CC" => query.Where(e => e.Cc != null && e.Cc.ToUpper().Contains(headerVal)),
+                        "SUBJECT" => query.Where(e => e.Subject.ToUpper().Contains(headerVal)),
+                        "MESSAGE-ID" => query.Where(e => e.MessageId != null && e.MessageId.ToUpper().Contains(headerVal)),
+                        "IN-REPLY-TO" => query.Where(e => e.InReplyTo != null && e.InReplyTo.ToUpper().Contains(headerVal)),
+                        _ => query.Where(e => e.RawHeaders != null
+                            && (e.RawHeaders.ToUpper().StartsWith(headerName + ":")
+                                || e.RawHeaders.ToUpper().Contains("\n" + headerName + ":"))
+                            && e.RawHeaders.ToUpper().Contains(headerVal)),
                     };
                     break;
                 case "SINCE" when i + 1 < tokens.Length:

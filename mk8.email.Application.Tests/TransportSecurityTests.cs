@@ -449,6 +449,44 @@ public sealed class TransportSecurityTests
 
     [TestMethod]
     [Timeout(10_000)]
+    public async Task ImapSearchMatchesOnlyTheRequestedHeaderValue()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedInboxMessagesForSearchAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT INBOX");
+
+        string response;
+        do
+        {
+            response = await connection.ReadLineAsync();
+        }
+        while (!response.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a4 UID SEARCH HEADER X-Mk8-Test mixedmarker42");
+        Assert.AreEqual("* SEARCH 1", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a5 UID SEARCH SUBJECT mixedcasesubject");
+        Assert.AreEqual("* SEARCH 1", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a6 UID SEARCH HEADER X-Mk8-Test absent-marker");
+        Assert.AreEqual("* SEARCH", (await connection.ReadLineAsync()).TrimEnd());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 OK", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
     public async Task ImapAppendPreservesLiteralOctetsAndLeadingBodyLines()
     {
         var port = ReservePort();
@@ -757,6 +795,53 @@ public sealed class TransportSecurityTests
             database.Emails.AddRange(
                 CreateStoredEmail(folder.Id, uid: 1, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc)),
                 CreateStoredEmail(folder.Id, uid: 2, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc)));
+            folder.NextUid = 3;
+            await database.SaveChangesAsync();
+        }
+
+        public async Task SeedInboxMessagesForSearchAsync()
+        {
+            using var scope = services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+            var folder = await database.Folders.SingleAsync(item => item.Name == DefaultFolders.Inbox);
+            database.Emails.AddRange(
+                new EmailDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Sender = "sender@example.net",
+                    Recipient = TestUsername,
+                    Subject = "MixedCaseSubject",
+                    Body = "first body\r\n",
+                    RawHeaders =
+                        "From: sender@example.net\r\n" +
+                        $"To: {TestUsername}\r\n" +
+                        "Subject: MixedCaseSubject\r\n" +
+                        "X-Mk8-Test: prefix\r\n\tMiXeDMarker42",
+                    SizeBytes = 180,
+                    Uid = 1,
+                    ModSeq = 1,
+                    FolderId = folder.Id,
+                    ReceivedAt = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+                },
+                new EmailDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Sender = "sender@example.net",
+                    Recipient = TestUsername,
+                    Subject = "Other subject",
+                    Body = "second body\r\n",
+                    RawHeaders =
+                        "From: sender@example.net\r\n" +
+                        $"To: {TestUsername}\r\n" +
+                        "Subject: Other subject\r\n" +
+                        "X-Mk8-Test: another value\r\n" +
+                        "X-Unrelated: MiXeDMarker42",
+                    SizeBytes = 190,
+                    Uid = 2,
+                    ModSeq = 2,
+                    FolderId = folder.Id,
+                    ReceivedAt = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc),
+                });
             folder.NextUid = 3;
             await database.SaveChangesAsync();
         }
