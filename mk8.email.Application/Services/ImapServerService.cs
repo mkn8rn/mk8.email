@@ -29,6 +29,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     private const int MaximumAuthenticationLineCharacters = 4096;
     private const int MaximumConcurrentConnections = 256;
     private const int MaximumConcurrentAppendTransactions = 2;
+    private const int MaximumConcurrentFetchCommands = 4;
     private const int MaximumMultiAppendMessages = 20;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
@@ -59,6 +60,9 @@ ILogger<ImapServerService> logger) : BackgroundService
     private readonly SemaphoreSlim _appendTransactionLimiter = new(
         MaximumConcurrentAppendTransactions,
         MaximumConcurrentAppendTransactions);
+    private readonly SemaphoreSlim _fetchCommandLimiter = new(
+        MaximumConcurrentFetchCommands,
+        MaximumConcurrentFetchCommands);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -1162,6 +1166,41 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private async Task HandleFetchAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
+        await HandleFetchWithLimitAsync(writer, tag, args, session, useUid: false, ct);
+    }
+
+    private async Task HandleFetchWithLimitAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
+    {
+        if (!_fetchCommandLimiter.Wait(0))
+        {
+            await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent FETCH commands");
+            return;
+        }
+
+        try
+        {
+            await HandleFetchCoreAsync(writer, tag, args, session, useUid, ct);
+        }
+        finally
+        {
+            _fetchCommandLimiter.Release();
+        }
+    }
+
+    private async Task HandleFetchCoreAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
+    {
         var spaceIdx = args.IndexOf(' ');
         if (spaceIdx <= 0)
         {
@@ -1169,7 +1208,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var sequenceSet = args[..spaceIdx];
+        var messageSet = args[..spaceIdx];
         var fetchItems = args[(spaceIdx + 1)..].Trim().TrimStart('(').TrimEnd(')');
         var implicitSeen = ShouldSetSeen(fetchItems);
 
@@ -1178,40 +1217,54 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        var folderId = session.SelectedFolderId!.Value;
+        var messageQuery = db.Emails.AsNoTracking().Where(email => email.FolderId == folderId);
+        var maximumIdentifier = useUid
+            ? await messageQuery.MaxAsync(email => (int?)email.Uid, ct) ?? 0
+            : await messageQuery.CountAsync(ct);
+        var includeStoredContent = FetchNeedsStoredContent(fetchItems);
+        var fetchQuery = CreateFetchQuery(messageQuery, includeStoredContent);
+        var seenUpdates = new List<EmailDB>();
+        var folder = implicitSeen && !session.SelectedReadOnly
+            ? await db.Folders.FindAsync([folderId], ct)
+            : null;
+        var sequenceNumber = 0;
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var selected = ResolveSequenceSet(sequenceSet, emails.Count);
-        var needsSave = false;
-        FolderDB? folder = null;
-
-        foreach (var seqNum in selected)
+        await foreach (var email in fetchQuery.AsAsyncEnumerable().WithCancellation(ct))
         {
-            if (seqNum < 1 || seqNum > emails.Count) continue;
-            var email = emails[seqNum - 1];
+            sequenceNumber++;
+            var identifier = useUid ? email.Uid : sequenceNumber;
+            if (!UidMatchesSet(identifier, messageSet, maximumIdentifier))
+                continue;
 
-            if (implicitSeen && !email.IsRead && !session.SelectedReadOnly)
+            if (implicitSeen && !email.IsRead && folder is not null)
             {
-                var tracked = await db.Emails.FindAsync([email.Id], ct);
-                if (tracked is not null)
+                email.IsRead = true;
+                email.ModSeq = ++folder.HighestModSeq;
+                seenUpdates.Add(new EmailDB
                 {
-                    folder ??= await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
-                    var newModSeq = ++folder!.HighestModSeq;
-                    tracked.IsRead = true;
-                    tracked.ModSeq = newModSeq;
-                    email.IsRead = true;
-                    email.ModSeq = newModSeq;
-                    needsSave = true;
-                }
+                    Id = email.Id,
+                    IsRead = true,
+                    ModSeq = email.ModSeq,
+                });
             }
 
-            var response = BuildFetchResponse(seqNum, email, fetchItems, useUid: false);
+            var response = BuildFetchResponse(sequenceNumber, email, fetchItems, useUid);
             await writer.WriteLineAsync(response);
         }
 
-        if (needsSave)
+        foreach (var update in seenUpdates)
+        {
+            db.Emails.Attach(update);
+            db.Entry(update).Property(email => email.IsRead).IsModified = true;
+            db.Entry(update).Property(email => email.ModSeq).IsModified = true;
+        }
+
+        if (seenUpdates.Count > 0)
             await db.SaveChangesAsync(ct);
 
-        await writer.WriteLineAsync($"{tag} OK FETCH completed");
+        var commandName = useUid ? "UID FETCH" : "FETCH";
+        await writer.WriteLineAsync($"{tag} OK {commandName} completed");
     }
 
     private async Task HandleStoreAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
@@ -1504,57 +1557,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private async Task HandleUidFetchAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
-        var spaceIdx = args.IndexOf(' ');
-        if (spaceIdx <= 0)
-        {
-            await writer.WriteLineAsync($"{tag} BAD Syntax error");
-            return;
-        }
-
-        var uidSet = args[..spaceIdx];
-        var fetchItems = args[(spaceIdx + 1)..].Trim().TrimStart('(').TrimEnd(')');
-        var implicitSeen = ShouldSetSeen(fetchItems);
-
-        if (fetchItems.Contains("MODSEQ", StringComparison.OrdinalIgnoreCase))
-            session.CondstoreEnabled = true;
-
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
-        var needsSave = false;
-        FolderDB? folder = null;
-
-        for (var i = 0; i < emails.Count; i++)
-        {
-            var email = emails[i];
-            if (!UidMatchesSet(email.Uid, uidSet, maxUid)) continue;
-
-            if (implicitSeen && !email.IsRead && !session.SelectedReadOnly)
-            {
-                var tracked = await db.Emails.FindAsync([email.Id], ct);
-                if (tracked is not null)
-                {
-                    folder ??= await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
-                    var newModSeq = ++folder!.HighestModSeq;
-                    tracked.IsRead = true;
-                    tracked.ModSeq = newModSeq;
-                    email.IsRead = true;
-                    email.ModSeq = newModSeq;
-                    needsSave = true;
-                }
-            }
-
-            var seqNum = i + 1;
-            var response = BuildFetchResponse(seqNum, email, fetchItems, useUid: true);
-            await writer.WriteLineAsync(response);
-        }
-
-        if (needsSave)
-            await db.SaveChangesAsync(ct);
-
-        await writer.WriteLineAsync($"{tag} OK UID FETCH completed");
+        await HandleFetchWithLimitAsync(writer, tag, args, session, useUid: true, ct);
     }
 
     private async Task HandleUidSearchAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
@@ -1968,6 +1971,56 @@ ILogger<ImapServerService> logger) : BackgroundService
         if (upper.Contains("BODY[HEADER"))
             return false;
         return true;
+    }
+
+    private static bool FetchNeedsStoredContent(string fetchItems)
+    {
+        var normalized = fetchItems
+            .ToUpperInvariant()
+            .Replace("BODY.PEEK[", "BODY[");
+        return normalized.Contains("BODY[", StringComparison.Ordinal)
+            || normalized.Contains("BODYSTRUCTURE", StringComparison.Ordinal)
+            || BodyStandaloneRegex().IsMatch(normalized)
+            || IsFetchMacro(normalized, "RFC822")
+            || normalized.Contains("RFC822.HEADER", StringComparison.Ordinal)
+            || normalized.Contains("RFC822.TEXT", StringComparison.Ordinal)
+            || BinaryFetchRegex().IsMatch(normalized)
+            || BinarySizeRegex().IsMatch(normalized);
+    }
+
+    private static IQueryable<EmailDB> CreateFetchQuery(
+        IQueryable<EmailDB> messageQuery,
+        bool includeStoredContent)
+    {
+        if (includeStoredContent)
+            return messageQuery.OrderBy(email => email.Uid);
+
+        return messageQuery
+            .Select(email => new EmailDB
+            {
+                Id = email.Id,
+                Sender = email.Sender,
+                Recipient = email.Recipient,
+                Subject = email.Subject,
+                Body = email.SizeBytes > 0 ? string.Empty : email.Body,
+                IsRead = email.IsRead,
+                IsDeleted = email.IsDeleted,
+                IsFlagged = email.IsFlagged,
+                IsDraft = email.IsDraft,
+                IsAnswered = email.IsAnswered,
+                ModSeq = email.ModSeq,
+                Uid = email.Uid,
+                EmailObjectId = email.EmailObjectId,
+                ThreadObjectId = email.ThreadObjectId,
+                SizeBytes = email.SizeBytes,
+                RawHeaders = email.SizeBytes > 0 ? null : email.RawHeaders,
+                MessageId = email.MessageId,
+                InReplyTo = email.InReplyTo,
+                Cc = email.Cc,
+                ReceivedAt = email.ReceivedAt,
+                FolderId = email.FolderId,
+            })
+            .OrderBy(email => email.Uid);
     }
 
     private static bool IsFetchMacro(string items, string macro) =>

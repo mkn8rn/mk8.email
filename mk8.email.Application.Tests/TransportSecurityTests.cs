@@ -684,6 +684,57 @@ public sealed class TransportSecurityTests
         Assert.IsTrue(responses[^1].StartsWith("a4 OK", StringComparison.Ordinal));
     }
 
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapFetchStreamsSelectedBodyAndPersistsSeenFlag()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedSentMessagesWithReverseDatesAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT Sent");
+
+        string line;
+        do
+        {
+            line = await connection.ReadLineAsync();
+        }
+        while (!line.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a4 UID FETCH 2 (UID BODY.PEEK[TEXT])");
+        var peekResponse = new List<string>();
+        do
+        {
+            line = await connection.ReadLineAsync();
+            peekResponse.Add(line);
+        }
+        while (!line.StartsWith("a4 ", StringComparison.Ordinal));
+
+        Assert.IsTrue(peekResponse[0].StartsWith("* 2 FETCH", StringComparison.Ordinal));
+        Assert.IsTrue(peekResponse.Any(value => value.Contains("BODY[TEXT] {6}", StringComparison.Ordinal)));
+        Assert.IsTrue(peekResponse.Any(value => value == "body"));
+        Assert.IsFalse((await server.GetStoredEmailByUidAsync(2)).IsRead);
+
+        await connection.WriteLineAsync("a5 UID FETCH 2 (UID BODY[TEXT] MODSEQ)");
+        do
+        {
+            line = await connection.ReadLineAsync();
+        }
+        while (!line.StartsWith("a5 ", StringComparison.Ordinal));
+
+        var stored = await server.GetStoredEmailByUidAsync(2);
+        Assert.IsTrue(stored.IsRead);
+        Assert.AreEqual(3, stored.ModSeq);
+    }
+
     private EnvironmentConfig CreateEnvironment(
         int? smtpPort = null,
         int? submissionPort = null,
@@ -934,6 +985,15 @@ public sealed class TransportSecurityTests
                 .SingleAsync(email => email.Folder.Name == folderName);
         }
 
+        public async Task<EmailDB> GetStoredEmailByUidAsync(int uid)
+        {
+            using var scope = services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+            return await database.Emails
+                .AsNoTracking()
+                .SingleAsync(email => email.Uid == uid);
+        }
+
         public async Task SeedSentMessagesWithReverseDatesAsync()
         {
             using var scope = services.CreateScope();
@@ -943,6 +1003,7 @@ public sealed class TransportSecurityTests
                 CreateStoredEmail(folder.Id, uid: 1, new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc)),
                 CreateStoredEmail(folder.Id, uid: 2, new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc)));
             folder.NextUid = 3;
+            folder.HighestModSeq = 2;
             await database.SaveChangesAsync();
         }
 
