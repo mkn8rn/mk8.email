@@ -179,8 +179,9 @@ snapshot_file "$destination/fullchain.pem" fullchain
 snapshot_file "$destination/privkey.pem" private
 for pending_path in "$certificate_new" "$private_new" \
     "$certificate_rollback" "$private_rollback"; do
-    [ ! -e "$pending_path" ] && [ ! -L "$pending_path" ] \
-        || fail "A stale certificate transaction file exists."
+    if [ -e "$pending_path" ] || [ -L "$pending_path" ]; then
+        fail "A stale certificate transaction file exists."
+    fi
 done
 
 changed=true

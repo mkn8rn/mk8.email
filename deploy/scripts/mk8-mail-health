@@ -156,28 +156,26 @@ queue_stats=$(runuser -u postgres -- psql --dbname=mk8email --no-psqlrc \
     record_error "The native mail queue is not available."
 }
 if [ -n "$queue_stats" ]; then
-    queue_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 1)
-    oldest_age=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 2)
-    quarantine_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 3)
-    dead_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 4)
-    case "$queue_count:$oldest_age:$quarantine_count:$dead_count" in
-        *[!0-9:null]*|*:*:*:*:*)
-            queue_count=0
-            oldest_age=null
-            record_error "The native mail queue returned invalid health data."
-            ;;
-        *)
-            [ "$queue_count" -le 100 ] \
-                || record_error "The native queue contains more than 100 active messages."
-            if [ "$oldest_age" != null ] && [ "$oldest_age" -gt 86400 ]; then
-                record_error "The native queue contains an active message older than one day."
-            fi
-            [ "$quarantine_count" -eq 0 ] \
-                || record_error "The native queue contains quarantined messages."
-            [ "$dead_count" -eq 0 ] \
-                || record_error "The native queue contains dead messages."
-            ;;
-    esac
+    if ! printf '%s\n' "$queue_stats" \
+        | grep -Eq '^[0-9]+\|(null|[0-9]+)\|[0-9]+\|[0-9]+$'; then
+        queue_count=0
+        oldest_age=null
+        record_error "The native mail queue returned invalid health data."
+    else
+        queue_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 1)
+        oldest_age=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 2)
+        quarantine_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 3)
+        dead_count=$(printf '%s\n' "$queue_stats" | cut -d '|' -f 4)
+        [ "$queue_count" -le 100 ] \
+            || record_error "The native queue contains more than 100 active messages."
+        if [ "$oldest_age" != null ] && [ "$oldest_age" -gt 86400 ]; then
+            record_error "The native queue contains an active message older than one day."
+        fi
+        [ "$quarantine_count" -eq 0 ] \
+            || record_error "The native queue contains quarantined messages."
+        [ "$dead_count" -eq 0 ] \
+            || record_error "The native queue contains dead messages."
+    fi
 fi
 
 used_percent=$(df -P /var/lib/postgresql | awk 'NR == 2 { gsub(/%/, "", $5); print $5 }')
