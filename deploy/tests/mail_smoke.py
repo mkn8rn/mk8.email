@@ -7,7 +7,9 @@ import ssl
 import subprocess
 import time
 import uuid
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
 from pathlib import Path
 
 
@@ -114,6 +116,29 @@ def wait_for_message(
                 return raw
         time.sleep(1)
     raise RuntimeError(f"The expected message did not reach {account}.")
+
+
+def wait_for_subject(account: str, password: str, subject: str) -> None:
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=15) as client:
+            client.login(account, password)
+            status, _ = client.select("INBOX")
+            require(status == "OK", f"IMAP could not select INBOX for {account}.")
+            status, data = client.uid("SEARCH", None, "HEADER", "Subject", subject)
+            require(status == "OK", f"IMAP subject search failed for {account}.")
+            for identifier in reversed(data[0].split()):
+                status, content = client.uid("FETCH", identifier, "(BODY.PEEK[])")
+                require(status == "OK", f"IMAP fetch failed for {account}.")
+                raw = next(item[1] for item in content if isinstance(item, tuple))
+                parsed = BytesParser(policy=policy.default).parsebytes(raw)
+                if str(parsed.get("Subject", "")).casefold() != subject.casefold():
+                    continue
+                client.uid("STORE", identifier, "+FLAGS.SILENT", "(\\Deleted)")
+                client.expunge()
+                return
+        time.sleep(1)
+    raise RuntimeError(f"The message with the expected subject did not reach {account}.")
 
 
 def require_absent(account: str, password: str, marker: str) -> None:
@@ -318,10 +343,15 @@ def receive_queue_probe(admin_password: str, marker: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("baseline", "unsafe", "scanner-down", "queue-send", "queue-receive"))
+    parser.add_argument(
+        "mode",
+        choices=("baseline", "unsafe", "scanner-down", "queue-send", "queue-receive", "subject-receive"),
+    )
     parser.add_argument("--admin-password-file", default="/etc/mk8email/bootstrap-secrets/admin.password")
     parser.add_argument("--primary-password-file", default="/etc/mk8email/bootstrap-secrets/mk8n.password")
+    parser.add_argument("--account")
     parser.add_argument("--marker")
+    parser.add_argument("--subject")
     arguments = parser.parse_args()
 
     if arguments.mode == "baseline":
@@ -335,6 +365,12 @@ def main() -> None:
         scanner_unavailable()
     elif arguments.mode == "queue-send":
         send_queue_probe()
+    elif arguments.mode == "subject-receive":
+        require(arguments.account is not None, "The account is required.")
+        require(arguments.subject is not None, "The subject is required.")
+        admin_password = Path(arguments.admin_password_file).read_text(encoding="ascii")
+        wait_for_subject(arguments.account, admin_password, arguments.subject)
+        print("The message was delivered and removed through native IMAP.")
     else:
         require(arguments.marker is not None, "The queue marker is required.")
         admin_password = Path(arguments.admin_password_file).read_text(encoding="ascii")

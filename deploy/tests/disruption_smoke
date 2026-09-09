@@ -11,12 +11,13 @@ case "$1" in
         admin_password_file=$2
         test -s "$admin_password_file"
         restore_scanner() {
-            systemctl start clamav-daemon.socket clamav-daemon.service
+            systemctl start clamav-daemon.socket clamav-daemon.service mk8email.service
         }
 
         trap restore_scanner EXIT HUP INT TERM
         systemctl stop clamav-daemon.service clamav-daemon.socket
         ! systemctl is-active --quiet clamav-daemon.service
+        systemctl is-active --quiet mk8email.service
         marker=$("$test_root/mail_smoke.py" scanner-down)
         restore_scanner
         runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --quiet \
@@ -35,6 +36,7 @@ case "$1" in
 
         trap restore_delivery EXIT HUP INT TERM
         systemctl stop clamav-daemon.service clamav-daemon.socket
+        systemctl is-active --quiet mk8email.service
         marker=$("$test_root/mail_smoke.py" scanner-down)
         systemctl stop mk8email.service
         systemctl start clamav-daemon.socket clamav-daemon.service mk8email.service

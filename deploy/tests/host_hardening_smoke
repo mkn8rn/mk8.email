@@ -54,6 +54,25 @@ done
 if pgrep -x master >/dev/null || pgrep -x dovecot >/dev/null; then
     fail "A forbidden mail process is running."
 fi
+
+mail_required_units=$(systemctl show --property=Requires --value mk8email.service)
+case " $mail_required_units " in
+    *" postgresql.service "*) ;;
+    *) fail "The mail service does not require PostgreSQL." ;;
+esac
+for scanner_unit in rspamd.service clamav-daemon.service; do
+    case " $mail_required_units " in
+        *" $scanner_unit "*) fail "The mail service requires $scanner_unit." ;;
+    esac
+done
+mail_wanted_units=$(systemctl show --property=Wants --value mk8email.service)
+for wanted_unit in rspamd.service clamav-daemon.service valkey-server.service; do
+    case " $mail_wanted_units " in
+        *" $wanted_unit "*) ;;
+        *) fail "The mail service does not request $wanted_unit." ;;
+    esac
+done
+
 test -f /etc/fail2ban/filter.d/mk8email-auth.conf \
     || fail "The native mail authentication filter is not installed."
 fail2ban-client status mk8email-auth >/dev/null \

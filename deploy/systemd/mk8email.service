@@ -1,9 +1,9 @@
 [Unit]
 Description=mk8.email mail service
 Documentation=https://github.com/mkn8rn/mk8.email
-Requires=postgresql.service rspamd.service clamav-daemon.service
+Requires=postgresql.service
 After=network-online.target postgresql.service rspamd.service clamav-daemon.service
-Wants=network-online.target valkey-server.service
+Wants=network-online.target rspamd.service clamav-daemon.service valkey-server.service
 ConditionPathExists=/etc/mk8email/schema-ready
 
 [Service]
