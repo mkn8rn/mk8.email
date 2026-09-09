@@ -220,6 +220,7 @@ public class EmailService(EmailDbContext db) : IEmailService
             .Select(inbox => new TargetInbox(
                 inbox.Id,
                 inbox.Address.Domain,
+                inbox.OwnerId,
                 inbox.Owner.QuotaBytes))
             .SingleOrDefaultAsync(cancellationToken);
     }
@@ -234,7 +235,7 @@ public class EmailService(EmailDbContext db) : IEmailService
 
         var usedBytes = await db.Emails
             .AsNoTracking()
-            .Where(message => message.Folder.InboxId == target.Id)
+            .Where(message => message.Folder.Inbox.OwnerId == target.OwnerId)
             .SumAsync(message => (long?)message.SizeBytes, cancellationToken)
             ?? 0;
         return usedBytes < target.QuotaBytes
@@ -273,6 +274,6 @@ public class EmailService(EmailDbContext db) : IEmailService
     private static ParsedMailMessage ParseMessage(string rawMessage) =>
         MailMessageParser.Parse(rawMessage);
 
-    private sealed record TargetInbox(Guid Id, string Domain, long QuotaBytes);
+    private sealed record TargetInbox(Guid Id, string Domain, Guid OwnerId, long QuotaBytes);
 
 }

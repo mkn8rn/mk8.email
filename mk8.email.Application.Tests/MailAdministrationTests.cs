@@ -4,6 +4,7 @@ using mk8.email.Application.Interfaces;
 using mk8.email.Application.Services;
 using mk8.email.Contracts.Enums;
 using mk8.email.Infrastructure.Data;
+using mk8.email.Infrastructure.Models;
 
 namespace mk8.email.Application.Tests;
 
@@ -132,6 +133,69 @@ public sealed class MailAdministrationTests
         Assert.IsTrue((await administration.SetDomainActiveAsync("example.com", false)).Succeeded);
         Assert.IsFalse(await mail.CanReceiveAsync("postmaster@example.com"));
         Assert.IsTrue(await mail.CanReceiveAsync("postmaster@example.net"));
+    }
+
+    [TestMethod]
+    public async Task UserQuotaIncludesEveryOwnedInbox()
+    {
+        await using var database = CreateDatabase();
+        var administration = new MailAdministrationService(database);
+        await administration.EnsureDomainAsync("Test Company", "mk8n.com");
+        await administration.EnsureDomainAsync("Test Company", "example.com");
+        await administration.CreateAccountAsync(
+            "user@mk8n.com",
+            "mailbox-password-value",
+            UserRole.User);
+        await administration.SetDomainActiveAsync("mk8n.com", true);
+        await administration.SetDomainActiveAsync("example.com", true);
+
+        var user = await database.Users.SingleAsync();
+        var secondAddress = await database.Addresses.SingleAsync(item => item.Domain == "example.com");
+        var primaryFolder = await database.Folders.SingleAsync(item => item.Name == DefaultFolders.Inbox);
+        var secondInbox = new InboxDB
+        {
+            Id = Guid.CreateVersion7(),
+            Name = "user",
+            AddressId = secondAddress.Id,
+            OwnerId = user.Id,
+        };
+        database.Inboxes.Add(secondInbox);
+        database.Folders.Add(new FolderDB
+        {
+            Id = Guid.CreateVersion7(),
+            Name = DefaultFolders.Inbox,
+            Inbox = secondInbox,
+        });
+
+        const string rawMessage =
+            "From: sender@example.net\r\n" +
+            "To: user@example.com\r\n" +
+            "Subject: quota test\r\n\r\n" +
+            "body\r\n";
+        user.QuotaBytes = rawMessage.Length + 50;
+        primaryFolder.NextUid = 2;
+        primaryFolder.HighestModSeq = 1;
+        database.Emails.Add(new EmailDB
+        {
+            Id = Guid.CreateVersion7(),
+            Sender = "sender@example.net",
+            Recipient = "user@mk8n.com",
+            Subject = "existing message",
+            Body = "body\r\n",
+            RawHeaders = "From: sender@example.net\r\nTo: user@mk8n.com\r\nSubject: existing message",
+            SizeBytes = 100,
+            Uid = 1,
+            ModSeq = 1,
+            FolderId = primaryFolder.Id,
+        });
+        await database.SaveChangesAsync();
+
+        var mail = new EmailService(database);
+        Assert.IsFalse(await mail.DeliverAsync(
+            "sender@example.net",
+            "user@example.com",
+            rawMessage));
+        Assert.AreEqual(1, await database.Emails.CountAsync());
     }
 
     private static EmailDbContext CreateDatabase()

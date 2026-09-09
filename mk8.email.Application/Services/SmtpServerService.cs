@@ -21,7 +21,8 @@ public class SmtpServerService(
 {
     private const int MaximumCommandLineCharacters = 4096;
     private const int MaximumDataLineCharacters = 998;
-    private const int MaximumConcurrentConnections = 1000;
+    private const int MaximumConcurrentConnections = 256;
+    private const int MaximumConcurrentDataTransactions = 4;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
     private enum ListenerMode { Smtp, Submission, ImplicitTls }
@@ -43,9 +44,23 @@ public class SmtpServerService(
         public string? DataFailureResponse { get; set; }
         public bool InDataMode { get; set; }
         public int AuthenticationFailures { get; set; }
+        private SemaphoreSlim? DataSemaphore { get; set; }
+
+        public bool TryEnterDataMode(SemaphoreSlim dataSemaphore)
+        {
+            if (!dataSemaphore.Wait(0))
+                return false;
+
+            DataSemaphore = dataSemaphore;
+            InDataMode = true;
+            return true;
+        }
 
         public void Reset()
         {
+            var dataSemaphore = DataSemaphore;
+            DataSemaphore = null;
+            dataSemaphore?.Release();
             Sender = null;
             HasMailFrom = false;
             Recipients.Clear();
@@ -60,6 +75,9 @@ public class SmtpServerService(
     }
 
     private readonly ConnectionLimiter _connectionLimiter = new(MaximumConcurrentConnections);
+    private readonly SemaphoreSlim _dataTransactionLimiter = new(
+        MaximumConcurrentDataTransactions,
+        MaximumConcurrentDataTransactions);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -162,20 +180,27 @@ public class SmtpServerService(
                     Mode = mode,
                     IsSecure = mode == ListenerMode.ImplicitTls,
                 };
-                await writer.WriteLineAsync($"220 {config.SmtpHostname} ESMTP mk8.email");
+                try
+                {
+                    await writer.WriteLineAsync($"220 {config.SmtpHostname} ESMTP mk8.email");
 
-                await RunSmtpSessionAsync(
-                    reader,
-                    writer,
-                    session,
-                    emailService,
-                    submissionQueue,
-                    senderAuthorization,
-                    mailAuthenticator,
-                    config,
-                    timeout,
-                    stream,
-                    remoteIp.ToString());
+                    await RunSmtpSessionAsync(
+                        reader,
+                        writer,
+                        session,
+                        emailService,
+                        submissionQueue,
+                        senderAuthorization,
+                        mailAuthenticator,
+                        config,
+                        timeout,
+                        stream,
+                        remoteIp.ToString());
+                }
+                finally
+                {
+                    session.Reset();
+                }
             }
         }
         catch (OperationCanceledException)
@@ -453,9 +478,12 @@ public class SmtpServerService(
                     {
                         await writer.WriteLineAsync("503 5.5.1 No valid recipients");
                     }
+                    else if (!session.TryEnterDataMode(_dataTransactionLimiter))
+                    {
+                        await writer.WriteLineAsync("452 4.3.2 Too many concurrent message transfers");
+                    }
                     else
                     {
-                        session.InDataMode = true;
                         await writer.WriteLineAsync("354 Start mail input; end with <CRLF>.<CRLF>");
                     }
                     break;

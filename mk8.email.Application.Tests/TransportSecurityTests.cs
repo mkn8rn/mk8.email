@@ -140,6 +140,45 @@ public sealed class TransportSecurityTests
     }
 
     [TestMethod]
+    [Timeout(15_000)]
+    public async Task SmtpBoundsConcurrentDataBuffers()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        var connections = new List<ProtocolConnection>();
+
+        try
+        {
+            for (var index = 0; index < 5; index++)
+            {
+                var connection = await ProtocolConnection.ConnectAsync(port);
+                connections.Add(connection);
+                await connection.ReadLineAsync();
+                await BeginInboundEnvelopeAsync(connection);
+                await connection.WriteLineAsync("DATA");
+
+                var response = await connection.ReadLineAsync();
+                if (index < 4)
+                    Assert.IsTrue(response.StartsWith("354 ", StringComparison.Ordinal));
+                else
+                    Assert.IsTrue(response.StartsWith("452 4.3.2", StringComparison.Ordinal));
+            }
+
+            await connections[0].WriteLineAsync(".");
+            Assert.IsTrue((await connections[0].ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+
+            await connections[4].WriteLineAsync("DATA");
+            Assert.IsTrue((await connections[4].ReadLineAsync()).StartsWith("354 ", StringComparison.Ordinal));
+        }
+        finally
+        {
+            foreach (var connection in connections)
+                await connection.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
     [Timeout(10_000)]
     public async Task SmtpRejectsLongDataAndPreservesEightBitData()
     {
@@ -521,6 +560,93 @@ public sealed class TransportSecurityTests
 
     [TestMethod]
     [Timeout(10_000)]
+    public async Task ImapAppendChecksQuotaBeforeReadingTheLiteral()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        const string message =
+            "From: user@mk8n.com\r\n" +
+            "To: user@mk8n.com\r\n" +
+            "Subject: quota\r\n" +
+            "\r\n" +
+            "body\r\n";
+        await server.SetUserQuotaAsync(message.Length - 1);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync($"a3 APPEND \"Sent\" {{{message.Length}}}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a3 NO [OVERQUOTA]", StringComparison.Ordinal));
+        Assert.AreEqual(0, await server.CountStoredEmailsAsync());
+
+        await server.SetUserQuotaAsync(message.Length);
+        await connection.WriteLineAsync($"a4 APPEND \"Sent\" {{{message.Length}}}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+        await connection.WriteRawAsync(message);
+        await connection.WriteLineAsync(string.Empty);
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK [APPENDUID", StringComparison.Ordinal));
+        Assert.AreEqual(1, await server.CountStoredEmailsAsync());
+    }
+
+    [TestMethod]
+    [Timeout(15_000)]
+    public async Task ImapBoundsConcurrentAppendBuffers()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        const string message =
+            "From: user@mk8n.com\r\n" +
+            "To: user@mk8n.com\r\n" +
+            "Subject: bounded append\r\n\r\n" +
+            "body\r\n";
+        var connections = new List<ProtocolConnection>();
+
+        try
+        {
+            for (var index = 0; index < 3; index++)
+            {
+                var connection = await ProtocolConnection.ConnectAsync(port);
+                connections.Add(connection);
+                await connection.ReadLineAsync();
+                await connection.WriteLineAsync("a1 STARTTLS");
+                Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+                await connection.UpgradeToTlsAsync("email.mk8n.com");
+                await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+                Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+            }
+
+            for (var index = 0; index < 2; index++)
+            {
+                await connections[index].WriteLineAsync($"a3 APPEND \"Sent\" {{{message.Length}}}");
+                Assert.IsTrue((await connections[index].ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+            }
+
+            await connections[2].WriteLineAsync($"a3 APPEND \"Sent\" {{{message.Length}}}");
+            Assert.IsTrue((await connections[2].ReadLineAsync()).StartsWith("a3 NO [UNAVAILABLE]", StringComparison.Ordinal));
+
+            await connections[0].WriteRawAsync(message);
+            await connections[0].WriteLineAsync(string.Empty);
+            Assert.IsTrue((await connections[0].ReadLineAsync()).StartsWith("a3 OK [APPENDUID", StringComparison.Ordinal));
+
+            await connections[2].WriteLineAsync($"a4 APPEND \"Sent\" {{{message.Length}}}");
+            Assert.IsTrue((await connections[2].ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+        }
+        finally
+        {
+            foreach (var connection in connections)
+                await connection.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
     public async Task ImapSequenceNumbersFollowUidOrder()
     {
         var port = ReservePort();
@@ -618,14 +744,19 @@ public sealed class TransportSecurityTests
 
     private static async Task BeginInboundMessageAsync(ProtocolConnection connection)
     {
+        await BeginInboundEnvelopeAsync(connection);
+        await connection.WriteLineAsync("DATA");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("354 ", StringComparison.Ordinal));
+    }
+
+    private static async Task BeginInboundEnvelopeAsync(ProtocolConnection connection)
+    {
         await connection.WriteLineAsync("EHLO client.example");
         await connection.ReadSmtpResponseAsync();
         await connection.WriteLineAsync("MAIL FROM:<sender@example.com>");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
         await connection.WriteLineAsync("RCPT TO:<postmaster@mk8n.com>");
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
-        await connection.WriteLineAsync("DATA");
-        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("354 ", StringComparison.Ordinal));
     }
 
     private static async Task UpgradeSmtpToTlsAsync(ProtocolConnection connection)
@@ -687,6 +818,22 @@ public sealed class TransportSecurityTests
             var address = await database.Addresses.SingleAsync(item => item.Domain == "mk8n.com");
             address.IsActive = false;
             await database.SaveChangesAsync();
+        }
+
+        public async Task SetUserQuotaAsync(long quotaBytes)
+        {
+            using var scope = services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+            var user = await database.Users.SingleAsync(item => item.Username == TestUsername);
+            user.QuotaBytes = quotaBytes;
+            await database.SaveChangesAsync();
+        }
+
+        public async Task<int> CountStoredEmailsAsync()
+        {
+            using var scope = services.CreateScope();
+            var database = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+            return await database.Emails.CountAsync();
         }
 
         private static (

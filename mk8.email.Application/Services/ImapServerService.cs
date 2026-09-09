@@ -1,3 +1,4 @@
+using System.Data;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Security;
@@ -26,7 +27,9 @@ ILogger<ImapServerService> logger) : BackgroundService
 {
     private const int MaximumCommandLineCharacters = 16 * 1024;
     private const int MaximumAuthenticationLineCharacters = 4096;
-    private const int MaximumConcurrentConnections = 1000;
+    private const int MaximumConcurrentConnections = 256;
+    private const int MaximumConcurrentAppendTransactions = 2;
+    private const int MaximumMultiAppendMessages = 20;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
     private enum ListenerMode { Imap, ImplicitTls }
@@ -53,6 +56,9 @@ ILogger<ImapServerService> logger) : BackgroundService
     private enum SessionUpgrade { None, StartTls, Compress }
 
     private readonly ConnectionLimiter _connectionLimiter = new(MaximumConcurrentConnections);
+    private readonly SemaphoreSlim _appendTransactionLimiter = new(
+        MaximumConcurrentAppendTransactions,
+        MaximumConcurrentAppendTransactions);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -3419,14 +3425,54 @@ ILogger<ImapServerService> logger) : BackgroundService
         int maximumMessageSize,
         CancellationToken ct)
     {
+        if (!_appendTransactionLimiter.Wait(0))
+        {
+            if (NonSynchronizingLiteralRegex().IsMatch(args))
+            {
+                await writer.WriteLineAsync("* BYE Too many concurrent APPEND commands");
+                session.State = ImapState.Logout;
+            }
+            else
+            {
+                await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent APPEND commands");
+            }
+
+            return;
+        }
+
+        try
+        {
+            await HandleAppendCoreAsync(
+                reader,
+                writer,
+                tag,
+                args,
+                session,
+                maximumMessageSize,
+                ct);
+        }
+        finally
+        {
+            _appendTransactionLimiter.Release();
+        }
+    }
+
+    private async Task HandleAppendCoreAsync(
+        BoundedLineReader reader,
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        int maximumMessageSize,
+        CancellationToken ct)
+    {
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        // MULTIAPPEND (RFC 3502): parse first message from args, then loop for subsequent literals
         var remaining = args;
-        var allUids = new List<int>();
-        FolderDB? folder = null;
-        int uidValidity = 0;
+        var pendingMessages = new List<EmailDB>();
+        string? targetMailbox = null;
+        long pendingBytes = 0;
 
         while (true)
         {
@@ -3434,7 +3480,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
             if (mailboxName is null || literalSize is null)
             {
-                if (allUids.Count == 0)
+                if (pendingMessages.Count == 0)
                 {
                     await writer.WriteLineAsync($"{tag} BAD Syntax error");
                     return;
@@ -3442,31 +3488,55 @@ ILogger<ImapServerService> logger) : BackgroundService
                 break;
             }
 
-            if (folder is null)
+            if (targetMailbox is null)
             {
-                folder = await ResolveFolderAsync(db, session.UserId, mailboxName, ct);
-                if (folder is null)
+                var targetFolder = await ResolveFolderAsync(db, session.UserId, mailboxName, ct);
+                if (targetFolder is null)
                 {
                     await writer.WriteLineAsync($"{tag} NO [TRYCREATE] Mailbox not found");
                     return;
                 }
-                uidValidity = folder.UidValidity;
+
+                targetMailbox = mailboxName;
             }
 
             var isLiteralPlus = remaining.Contains("{" + literalSize + "+}");
-            if (literalSize < 0 || literalSize > maximumMessageSize)
+            if (pendingMessages.Count >= MaximumMultiAppendMessages)
             {
-                if (isLiteralPlus)
-                {
-                    await writer.WriteLineAsync("* BYE APPEND literal exceeds the message limit");
-                    session.State = ImapState.Logout;
-                }
-                else
-                {
-                    await writer.WriteLineAsync($"{tag} NO [TOOBIG] APPEND literal exceeds the message limit");
-                }
+                await RejectAppendBeforeLiteralAsync(
+                    writer,
+                    tag,
+                    session,
+                    isLiteralPlus,
+                    "[LIMIT] APPEND contains too many messages");
                 return;
             }
+
+            if (literalSize < 0
+                || literalSize > maximumMessageSize
+                || literalSize > maximumMessageSize - pendingBytes)
+            {
+                await RejectAppendBeforeLiteralAsync(
+                    writer,
+                    tag,
+                    session,
+                    isLiteralPlus,
+                    "[TOOBIG] APPEND exceeds the command size limit");
+                return;
+            }
+
+            var nextPendingBytes = pendingBytes + literalSize.Value;
+            if (!await HasUserQuotaCapacityAsync(db, session.UserId, nextPendingBytes, ct))
+            {
+                await RejectAppendBeforeLiteralAsync(
+                    writer,
+                    tag,
+                    session,
+                    isLiteralPlus,
+                    "[OVERQUOTA] APPEND exceeds the mailbox quota");
+                return;
+            }
+
             if (!isLiteralPlus)
                 await writer.WriteLineAsync("+ Ready for literal data");
 
@@ -3508,9 +3578,6 @@ ILogger<ImapServerService> logger) : BackgroundService
                 Cc = MailMessageParser.ExtractHeaderValue(headers, "Cc"),
                 EmailObjectId = Guid.CreateVersion7().ToString("N"),
                 ThreadObjectId = GenerateThreadObjectId(inReplyTo, msgId),
-                Uid = folder.NextUid++,
-                ModSeq = ++folder.HighestModSeq,
-                FolderId = folder.Id,
                 ReceivedAt = internalDate ?? DateTime.UtcNow,
             };
 
@@ -3526,10 +3593,9 @@ ILogger<ImapServerService> logger) : BackgroundService
                 }
             }
 
-            db.Emails.Add(email);
-            allUids.Add(email.Uid);
+            pendingMessages.Add(email);
+            pendingBytes = nextPendingBytes;
 
-            // Read the next line — could be empty (single APPEND) or contain another message spec (MULTIAPPEND)
             var nextLineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
             if (nextLineResult.IsTooLong)
             {
@@ -3540,14 +3606,89 @@ ILogger<ImapServerService> logger) : BackgroundService
             if (nextLine is null || nextLine.Length == 0 || !nextLine.TrimStart().StartsWith('(') && !nextLine.TrimStart().StartsWith('{'))
                 break;
 
-            remaining = mailboxName + " " + nextLine.Trim();
+            remaining = $"\"{EscapeImapString(targetMailbox)}\" {nextLine.Trim()}";
         }
 
+        db.ChangeTracker.Clear();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct)
+            : null;
+
+        var folder = await ResolveFolderAsync(db, session.UserId, targetMailbox!, ct);
+        if (folder is null)
+        {
+            await writer.WriteLineAsync($"{tag} NO [TRYCREATE] Mailbox not found");
+            return;
+        }
+
+        if (!await HasUserQuotaCapacityAsync(db, session.UserId, pendingBytes, ct))
+        {
+            await writer.WriteLineAsync($"{tag} NO [OVERQUOTA] APPEND exceeds the mailbox quota");
+            return;
+        }
+
+        var allUids = new List<int>(pendingMessages.Count);
+        foreach (var email in pendingMessages)
+        {
+            email.Uid = folder.NextUid++;
+            email.ModSeq = ++folder.HighestModSeq;
+            email.FolderId = folder.Id;
+            allUids.Add(email.Uid);
+        }
+
+        db.Emails.AddRange(pendingMessages);
         await db.SaveChangesAsync(ct);
+        if (transaction is not null)
+            await transaction.CommitAsync(ct);
 
         var uidSetStr = FormatUidRange(allUids);
-        await writer.WriteLineAsync($"{tag} OK [APPENDUID {uidValidity} {uidSetStr}] APPEND completed");
+        await writer.WriteLineAsync($"{tag} OK [APPENDUID {folder.UidValidity} {uidSetStr}] APPEND completed");
     }
+
+    private static async Task RejectAppendBeforeLiteralAsync(
+        StreamWriter writer,
+        string tag,
+        ImapSession session,
+        bool isLiteralPlus,
+        string response)
+    {
+        if (isLiteralPlus)
+        {
+            await writer.WriteLineAsync($"* BYE {response}");
+            session.State = ImapState.Logout;
+            return;
+        }
+
+        await writer.WriteLineAsync($"{tag} NO {response}");
+    }
+
+    private static async Task<bool> HasUserQuotaCapacityAsync(
+        EmailDbContext db,
+        Guid userId,
+        long addedBytes,
+        CancellationToken ct)
+    {
+        var quotaBytes = await db.Users
+            .AsNoTracking()
+            .Where(user => user.Id == userId)
+            .Select(user => (long?)user.QuotaBytes)
+            .SingleOrDefaultAsync(ct);
+        if (quotaBytes is null)
+            return false;
+        if (quotaBytes <= 0)
+            return true;
+
+        var usedBytes = await db.Emails
+            .AsNoTracking()
+            .Where(email => email.Folder.Inbox.OwnerId == userId)
+            .SumAsync(email => (long?)email.SizeBytes, ct)
+            ?? 0;
+        return usedBytes < quotaBytes
+            && addedBytes <= quotaBytes - usedBytes;
+    }
+
+    [GeneratedRegex(@"\{\d+\+\}\s*$")]
+    private static partial Regex NonSynchronizingLiteralRegex();
 
     private static (string? mailboxName, List<string> flags, DateTime? internalDate, int? literalSize) ParseAppendArgs(string args)
     {

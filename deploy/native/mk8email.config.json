@@ -54,7 +54,7 @@
     "MaxMessageSizeBytes": 26214400,
     "MaxRecipientsPerMessage": 100,
     "ConnectionTimeoutSeconds": 300,
-    "MaxConnectionsPerIp": 20
+    "MaxConnectionsPerIp": 10
   },
   "General": {
     "AllowRegistration": false
