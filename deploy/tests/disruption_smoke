@@ -5,6 +5,21 @@ test "$#" -ge 1
 
 test_root=/usr/local/lib/mk8email/tests
 
+wait_for_mail_recovery() {
+    attempt=0
+    while [ "$attempt" -lt 30 ]; do
+        if systemctl is-active --quiet mk8email.service rspamd.service \
+            && clamdscan --config-file=/etc/clamav/clamd.conf --ping 1 >/dev/null 2>&1 \
+            && /usr/local/sbin/mk8email --healthcheck >/dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    printf '%s\n' "The recovered mail services did not become ready." >&2
+    return 1
+}
+
 case "$1" in
     scanner-down)
         test "$#" -eq 2
@@ -20,6 +35,7 @@ case "$1" in
         systemctl is-active --quiet mk8email.service
         marker=$("$test_root/mail_smoke.py" scanner-down)
         restore_scanner
+        wait_for_mail_recovery
         runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --quiet \
             --command="UPDATE mail_queue_messages SET next_attempt_at = CURRENT_TIMESTAMP WHERE raw_message LIKE '%$marker%'"
         "$test_root/mail_smoke.py" queue-receive \
@@ -40,6 +56,7 @@ case "$1" in
         marker=$("$test_root/mail_smoke.py" scanner-down)
         systemctl stop mk8email.service
         systemctl start clamav-daemon.socket clamav-daemon.service mk8email.service
+        wait_for_mail_recovery
         runuser -u postgres -- psql --dbname=mk8email --no-psqlrc --quiet \
             --command="UPDATE mail_queue_messages SET next_attempt_at = CURRENT_TIMESTAMP WHERE raw_message LIKE '%$marker%'"
         "$test_root/mail_smoke.py" queue-receive \
