@@ -51,6 +51,26 @@ systemctl mask postfix.service dovecot.service
 timeout 300s env DEBIAN_FRONTEND=noninteractive apt-get purge --yes \
     postfix postfix-pcre postfix-pgsql \
     dovecot-core dovecot-imapd dovecot-lmtpd dovecot-pgsql dovecot-sieve
+
+if [ -L /var/vmail ] \
+    || { [ -e /var/vmail ] && [ ! -d /var/vmail ]; }; then
+    printf '%s\n' "The legacy mail storage path is unsafe." >&2
+    exit 1
+fi
+if [ -d /var/vmail ] \
+    && find /var/vmail -mindepth 1 -print -quit | grep -q .; then
+    printf '%s\n' "The legacy mail storage is not empty." >&2
+    exit 1
+fi
+if findmnt --mountpoint /var/vmail >/dev/null 2>&1; then
+    systemctl stop var-vmail.mount
+fi
+systemctl disable var-vmail.mount 2>/dev/null || true
+if findmnt --mountpoint /var/vmail >/dev/null 2>&1; then
+    printf '%s\n' "The legacy mail storage mount did not stop." >&2
+    exit 1
+fi
+
 rm -rf -- /etc/postfix /etc/dovecot /var/spool/postfix /var/lib/dovecot /var/vmail
 rm -f -- /etc/systemd/system/var-vmail.mount /etc/mailname
 rm -rf -- /etc/systemd/system/postfix@.service.d \
