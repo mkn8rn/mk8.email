@@ -308,6 +308,8 @@ case "$current_release" in
 esac
 
 if [ "$deep" = true ]; then
+    logrotate --debug /etc/logrotate.conf >/dev/null 2>&1 \
+        || record_error "The log rotation configuration is not valid."
     rspamadm configtest --config=/etc/rspamd/rspamd.conf --strict --quiet >/dev/null 2>&1 \
         || record_error "The Rspamd configuration is not valid."
     clamconf --config-dir=/etc/clamav --non-default >/dev/null 2>&1 \

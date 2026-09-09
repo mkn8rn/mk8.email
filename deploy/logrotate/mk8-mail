@@ -8,15 +8,3 @@
     su mk8email mk8email
     create 0600 mk8email mk8email
 }
-
-/var/log/clamav/clamav.log /var/log/clamav/freshclam.log {
-    weekly
-    rotate 12
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    su clamav clamav
-    create 0640 clamav adm
-}
