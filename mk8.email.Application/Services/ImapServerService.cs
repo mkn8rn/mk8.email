@@ -894,7 +894,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         {
             var allIds = await db.Emails
                 .Where(e => e.FolderId == folder.Id)
-                .OrderBy(e => e.ReceivedAt)
+                .OrderBy(e => e.Uid)
                 .Select(e => new { e.Id, e.IsRead })
                 .ToListAsync(ct);
 
@@ -921,14 +921,14 @@ ILogger<ImapServerService> logger) : BackgroundService
             }
 
             // Report changed messages since qresyncModSeq
-            var changed = await db.Emails
-                .Where(e => e.FolderId == folder.Id && e.ModSeq > qresyncModSeq.Value)
-                .OrderBy(e => e.ReceivedAt)
+            var changed = await SelectEmailMetadata(
+                    db.Emails.Where(e => e.FolderId == folder.Id && e.ModSeq > qresyncModSeq.Value))
+                .OrderBy(e => e.Uid)
                 .ToListAsync(ct);
 
             var allEmailIds = await db.Emails
                 .Where(e => e.FolderId == folder.Id)
-                .OrderBy(e => e.ReceivedAt)
+                .OrderBy(e => e.Uid)
                 .Select(e => e.Id)
                 .ToListAsync(ct);
 
@@ -1288,7 +1288,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var selected = ResolveSequenceSet(sequenceSet, emails.Count);
         var flagsList = flagsRaw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var isSilent = action.Contains(".SILENT");
@@ -1309,11 +1309,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 continue;
             }
 
-            var tracked = await db.Emails.FindAsync([email.Id], ct);
-            if (tracked is null) continue;
-
-            ApplyFlags(tracked, action, flagsList);
-            tracked.ModSeq = newModSeq;
+            var tracked = AttachFlagUpdate(db, email, action, flagsList, newModSeq);
 
             if (!isSilent)
             {
@@ -1354,7 +1350,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         var allEmails = await db.Emails
             .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-            .OrderBy(e => e.ReceivedAt)
+            .OrderBy(e => e.Uid)
             .Select(e => e.Id)
             .ToListAsync(ct);
 
@@ -1384,10 +1380,10 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        var emails = await db.Emails
-            .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-            .OrderBy(e => e.ReceivedAt)
-            .ToListAsync(ct);
+        var emails = await GetEmailMetadataInFolderAsync(
+            db,
+            session.SelectedFolderId!.Value,
+            ct);
 
         var folder = await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
         var expunged = 0;
@@ -1417,7 +1413,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                     FolderId = session.SelectedFolderId!.Value,
                 });
 
-                db.Emails.Remove(emails[i]);
+                AttachDelete(db, emails[i]);
                 expunged++;
             }
         }
@@ -1454,7 +1450,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetFullEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var selected = ResolveSequenceSet(sequenceSet, emails.Count);
 
         var srcUids = new List<int>();
@@ -1610,7 +1606,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
         var isSilent = action.Contains(".SILENT");
 
@@ -1630,11 +1626,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 continue;
             }
 
-            var tracked = await db.Emails.FindAsync([email.Id], ct);
-            if (tracked is null) continue;
-
-            ApplyFlags(tracked, action, flagsList);
-            tracked.ModSeq = newModSeq;
+            var tracked = AttachFlagUpdate(db, email, action, flagsList, newModSeq);
 
             if (!isSilent)
             {
@@ -1682,7 +1674,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetFullEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
 
         var srcUids = new List<int>();
@@ -1853,12 +1845,104 @@ ILogger<ImapServerService> logger) : BackgroundService
                                    && f.Name == folderName, ct);
     }
 
-    private static async Task<List<EmailDB>> GetEmailsInFolderAsync(EmailDbContext db, Guid folderId, CancellationToken ct)
+    private static IQueryable<EmailDB> SelectEmailMetadata(IQueryable<EmailDB> query) =>
+        query
+            .AsNoTracking()
+            .Select(email => new EmailDB
+            {
+                Id = email.Id,
+                IsRead = email.IsRead,
+                IsDeleted = email.IsDeleted,
+                IsFlagged = email.IsFlagged,
+                IsDraft = email.IsDraft,
+                IsAnswered = email.IsAnswered,
+                ModSeq = email.ModSeq,
+                Uid = email.Uid,
+                SizeBytes = email.SizeBytes,
+                FolderId = email.FolderId,
+            });
+
+    private static async Task<List<EmailDB>> GetEmailMetadataInFolderAsync(
+        EmailDbContext db,
+        Guid folderId,
+        CancellationToken ct)
+    {
+        return await SelectEmailMetadata(db.Emails.Where(email => email.FolderId == folderId))
+            .OrderBy(email => email.Uid)
+            .ToListAsync(ct);
+    }
+
+    private static async Task<List<EmailDB>> GetFullEmailsInFolderAsync(
+        EmailDbContext db,
+        Guid folderId,
+        CancellationToken ct)
     {
         return await db.Emails
-            .Where(e => e.FolderId == folderId)
-            .OrderBy(e => e.Uid)
+            .AsNoTracking()
+            .Where(email => email.FolderId == folderId)
+            .OrderBy(email => email.Uid)
             .ToListAsync(ct);
+    }
+
+    private static EmailDB AttachFlagUpdate(
+        EmailDbContext db,
+        EmailDB metadata,
+        string action,
+        string[] flags,
+        long modSeq)
+    {
+        var update = new EmailDB
+        {
+            Id = metadata.Id,
+            IsRead = metadata.IsRead,
+            IsDeleted = metadata.IsDeleted,
+            IsFlagged = metadata.IsFlagged,
+            IsDraft = metadata.IsDraft,
+            IsAnswered = metadata.IsAnswered,
+            ModSeq = modSeq,
+        };
+        ApplyFlags(update, action, flags);
+        db.Emails.Attach(update);
+        var entry = db.Entry(update);
+        entry.Property(email => email.IsRead).IsModified = true;
+        entry.Property(email => email.IsDeleted).IsModified = true;
+        entry.Property(email => email.IsFlagged).IsModified = true;
+        entry.Property(email => email.IsDraft).IsModified = true;
+        entry.Property(email => email.IsAnswered).IsModified = true;
+        entry.Property(email => email.ModSeq).IsModified = true;
+        return update;
+    }
+
+    private static EmailDB AttachMoveUpdate(
+        EmailDbContext db,
+        EmailDB metadata,
+        Guid destinationFolderId,
+        int destinationUid,
+        long destinationModSeq)
+    {
+        var update = new EmailDB
+        {
+            Id = metadata.Id,
+            FolderId = metadata.FolderId,
+            Uid = metadata.Uid,
+            ModSeq = metadata.ModSeq,
+        };
+        db.Emails.Attach(update);
+        update.FolderId = destinationFolderId;
+        update.Uid = destinationUid;
+        update.ModSeq = destinationModSeq;
+        var entry = db.Entry(update);
+        entry.Property(email => email.FolderId).IsModified = true;
+        entry.Property(email => email.Uid).IsModified = true;
+        entry.Property(email => email.ModSeq).IsModified = true;
+        return update;
+    }
+
+    private static void AttachDelete(EmailDbContext db, EmailDB metadata)
+    {
+        var update = new EmailDB { Id = metadata.Id };
+        db.Emails.Attach(update);
+        db.Emails.Remove(update);
     }
 
     private async Task ExpungeDeletedAsync(ImapSession session, CancellationToken ct)
@@ -1866,9 +1950,10 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        var deleted = await db.Emails
-            .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-            .ToListAsync(ct);
+        var deleted = await GetEmailMetadataInFolderAsync(
+            db,
+            session.SelectedFolderId!.Value,
+            ct);
 
         var toRemove = deleted.Where(IsMarkedDeleted).ToList();
         if (toRemove.Count > 0)
@@ -1885,7 +1970,8 @@ ILogger<ImapServerService> logger) : BackgroundService
                     FolderId = session.SelectedFolderId!.Value,
                 });
             }
-            db.Emails.RemoveRange(toRemove);
+            foreach (var email in toRemove)
+                AttachDelete(db, email);
         }
         await db.SaveChangesAsync(ct);
     }
@@ -3079,7 +3165,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             var sortedIds = await query.Select(e => e.Id).ToListAsync(ct);
             var allEmails = await db.Emails
                 .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-                .OrderBy(e => e.ReceivedAt)
+                .OrderBy(e => e.Uid)
                 .Select(e => e.Id)
                 .ToListAsync(ct);
 
@@ -3211,7 +3297,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
             allIds ??= db.Emails
                 .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-                .OrderBy(e => e.ReceivedAt)
+                .OrderBy(e => e.Uid)
                 .Select(e => e.Id)
                 .ToList();
 
@@ -3323,10 +3409,10 @@ ILogger<ImapServerService> logger) : BackgroundService
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
-        var emails = await db.Emails
-            .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-            .OrderBy(e => e.ReceivedAt)
-            .ToListAsync(ct);
+        var emails = await GetEmailMetadataInFolderAsync(
+            db,
+            session.SelectedFolderId!.Value,
+            ct);
 
         var folder = await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
@@ -3359,7 +3445,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 FolderId = session.SelectedFolderId!.Value,
             });
 
-            db.Emails.Remove(email);
+            AttachDelete(db, email);
             expunged++;
         }
 
@@ -3395,7 +3481,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var selected = ResolveSequenceSet(sequenceSet, emails.Count);
 
         var srcUids = new List<int>();
@@ -3407,10 +3493,10 @@ ILogger<ImapServerService> logger) : BackgroundService
             var email = emails[seqNum - 1];
 
             srcUids.Add(email.Uid);
-            email.FolderId = destFolder.Id;
-            email.Uid = destFolder.NextUid++;
-            email.ModSeq = ++destFolder.HighestModSeq;
-            dstUids.Add(email.Uid);
+            var destinationUid = destFolder.NextUid++;
+            var destinationModSeq = ++destFolder.HighestModSeq;
+            AttachMoveUpdate(db, email, destFolder.Id, destinationUid, destinationModSeq);
+            dstUids.Add(destinationUid);
 
             var adjustedSeq = seqNum - expunged;
             await writer.WriteLineAsync($"* {adjustedSeq} EXPUNGE");
@@ -3443,7 +3529,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var emails = await GetEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
 
         var srcUids = new List<int>();
@@ -3455,10 +3541,10 @@ ILogger<ImapServerService> logger) : BackgroundService
             if (!UidMatchesSet(email.Uid, uidSet, maxUid)) continue;
 
             srcUids.Add(email.Uid);
-            email.FolderId = destFolder.Id;
-            email.Uid = destFolder.NextUid++;
-            email.ModSeq = ++destFolder.HighestModSeq;
-            dstUids.Add(email.Uid);
+            var destinationUid = destFolder.NextUid++;
+            var destinationModSeq = ++destFolder.HighestModSeq;
+            AttachMoveUpdate(db, email, destFolder.Id, destinationUid, destinationModSeq);
+            dstUids.Add(destinationUid);
 
             var adjustedSeq = i + 1 - expunged;
             await writer.WriteLineAsync($"* {adjustedSeq} EXPUNGE");
@@ -3870,16 +3956,17 @@ ILogger<ImapServerService> logger) : BackgroundService
                     if (currentModSeq > lastKnownModSeq)
                     {
                         // Notify about changed flags since last check
-                        var changed = await pollDb.Emails
-                            .Where(e => e.FolderId == session.SelectedFolderId.Value && e.ModSeq > lastKnownModSeq)
-                            .OrderBy(e => e.ReceivedAt)
+                        var changed = await SelectEmailMetadata(
+                                pollDb.Emails.Where(e => e.FolderId == session.SelectedFolderId.Value
+                                    && e.ModSeq > lastKnownModSeq))
+                            .OrderBy(e => e.Uid)
                             .ToListAsync(timeout.Token);
 
                         if (changed.Count > 0)
                         {
                             var allIds = await pollDb.Emails
                                 .Where(e => e.FolderId == session.SelectedFolderId.Value)
-                                .OrderBy(e => e.ReceivedAt)
+                                .OrderBy(e => e.Uid)
                                 .Select(e => e.Id)
                                 .ToListAsync(timeout.Token);
 

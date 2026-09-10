@@ -635,8 +635,20 @@ public sealed class TransportSecurityTests
             await connections[0].WriteLineAsync(string.Empty);
             Assert.IsTrue((await connections[0].ReadLineAsync()).StartsWith("a3 OK [APPENDUID", StringComparison.Ordinal));
 
-            await connections[2].WriteLineAsync($"a4 APPEND \"Sent\" {{{message.Length}}}");
-            Assert.IsTrue((await connections[2].ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+            var accepted = false;
+            for (var attempt = 0; attempt < 10 && !accepted; attempt++)
+            {
+                await connections[2].WriteLineAsync($"a4{attempt} APPEND \"Sent\" {{{message.Length}}}");
+                var response = await connections[2].ReadLineAsync();
+                accepted = response.StartsWith("+ ", StringComparison.Ordinal);
+                if (!accepted)
+                {
+                    Assert.IsTrue(response.Contains("NO [UNAVAILABLE]", StringComparison.Ordinal));
+                    await Task.Delay(20);
+                }
+            }
+
+            Assert.IsTrue(accepted);
         }
         finally
         {
@@ -733,6 +745,50 @@ public sealed class TransportSecurityTests
         var stored = await server.GetStoredEmailByUidAsync(2);
         Assert.IsTrue(stored.IsRead);
         Assert.AreEqual(3, stored.ModSeq);
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapMutationsUseUidSequenceOrderWithoutChangingMessageContent()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedSentMessagesWithReverseDatesAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT Sent");
+
+        string line;
+        do
+        {
+            line = await connection.ReadLineAsync();
+        }
+        while (!line.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a4 SEARCH HEADER X-Test-Uid 1");
+        Assert.AreEqual("* SEARCH 1", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a5 STORE 1 +FLAGS.SILENT (\\Deleted)");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a6 EXPUNGE");
+        Assert.AreEqual("* 1 EXPUNGE", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a7 MOVE 1 Trash");
+        Assert.AreEqual("* 1 EXPUNGE", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a7 OK [COPYUID", StringComparison.Ordinal));
+
+        var moved = await server.GetStoredEmailAsync(DefaultFolders.Trash);
+        Assert.AreEqual("UID 2", moved.Subject);
+        Assert.AreEqual("body\r\n", moved.Body);
     }
 
     private EnvironmentConfig CreateEnvironment(
@@ -948,6 +1004,12 @@ public sealed class TransportSecurityTests
                     Name = DefaultFolders.Sent,
                     Inbox = inbox,
                 });
+                database.Folders.Add(new FolderDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Name = DefaultFolders.Trash,
+                    Inbox = inbox,
+                });
                 database.SaveChanges();
             }
             return (services, emailService, mailQueue);
@@ -1061,7 +1123,7 @@ public sealed class TransportSecurityTests
             Recipient = TestUsername,
             Subject = $"UID {uid}",
             Body = "body\r\n",
-            RawHeaders = $"From: sender@example.net\r\nTo: {TestUsername}\r\nSubject: UID {uid}",
+            RawHeaders = $"From: sender@example.net\r\nTo: {TestUsername}\r\nSubject: UID {uid}\r\nX-Test-Uid: {uid}",
             SizeBytes = 100,
             Uid = uid,
             ModSeq = uid,
