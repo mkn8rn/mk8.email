@@ -854,6 +854,114 @@ public sealed class TransportSecurityTests
         Assert.AreEqual(4, await server.CountStoredEmailsAsync());
     }
 
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapMovePersistsQresyncTombstones()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedSentMessagesWithReverseDatesAsync();
+
+        await using (var connection = await ProtocolConnection.ConnectAsync(port))
+        {
+            await connection.ReadLineAsync();
+            await connection.WriteLineAsync("a1 STARTTLS");
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+            await connection.UpgradeToTlsAsync("email.mk8n.com");
+            await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+            await connection.WriteLineAsync("a3 ENABLE QRESYNC");
+            Assert.AreEqual("* ENABLED QRESYNC", await connection.ReadLineAsync());
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a3 OK", StringComparison.Ordinal));
+            await connection.WriteLineAsync("a4 SELECT Sent");
+            await ReadUntilTaggedResponseAsync(connection, "a4");
+
+            await connection.WriteLineAsync("a5 MOVE 1 Trash");
+            Assert.AreEqual("* VANISHED 1", await connection.ReadLineAsync());
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 OK [COPYUID", StringComparison.Ordinal));
+
+            await connection.WriteLineAsync("a6 UID MOVE 2 Trash");
+            Assert.AreEqual("* VANISHED 2", await connection.ReadLineAsync());
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 OK [COPYUID", StringComparison.Ordinal));
+        }
+
+        await using var reconnect = await ProtocolConnection.ConnectAsync(port);
+        await reconnect.ReadLineAsync();
+        await reconnect.WriteLineAsync("b1 STARTTLS");
+        Assert.IsTrue((await reconnect.ReadLineAsync()).StartsWith("b1 OK", StringComparison.Ordinal));
+        await reconnect.UpgradeToTlsAsync("email.mk8n.com");
+        await reconnect.WriteLineAsync($"b2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await reconnect.ReadLineAsync()).StartsWith("b2 OK", StringComparison.Ordinal));
+        await reconnect.WriteLineAsync("b3 ENABLE QRESYNC");
+        Assert.AreEqual("* ENABLED QRESYNC", await reconnect.ReadLineAsync());
+        Assert.IsTrue((await reconnect.ReadLineAsync()).StartsWith("b3 OK", StringComparison.Ordinal));
+        await reconnect.WriteLineAsync("b4 SELECT Sent (QRESYNC (1 2 1:2))");
+        var responses = await ReadUntilTaggedResponseAsync(reconnect, "b4");
+
+        Assert.IsTrue(responses.Contains("* VANISHED (EARLIER) 1:2"));
+        Assert.IsTrue(responses.Contains("* OK [HIGHESTMODSEQ 4]"));
+        Assert.AreEqual(2, (await server.GetStoredEmailsAsync(DefaultFolders.Trash)).Count);
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapRejectsMalformedMessageSetsWithoutDisconnecting()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedSentMessagesWithReverseDatesAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT Sent");
+        await ReadUntilTaggedResponseAsync(connection, "a3");
+
+        var malformedCommands = new[]
+        {
+            "a4 FETCH 1:x (UID)",
+            "a5 STORE 1::2 +FLAGS.SILENT (\\Seen)",
+            "a6 UID COPY +1 Trash",
+            "a7 MOVE 0 Trash",
+            "a8 UID EXPUNGE 1:",
+        };
+        foreach (var command in malformedCommands)
+        {
+            await connection.WriteLineAsync(command);
+            var tag = command[..command.IndexOf(' ')];
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith($"{tag} BAD", StringComparison.Ordinal));
+        }
+
+        await connection.WriteLineAsync("a9 STORE 1:2147483647 +FLAGS.SILENT (\\Seen)");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a9 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a10 NOOP");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a10 OK", StringComparison.Ordinal));
+        Assert.AreEqual(2, await server.CountStoredEmailsAsync());
+        Assert.AreEqual(0, (await server.GetStoredEmailsAsync(DefaultFolders.Trash)).Count);
+    }
+
+    private static async Task<List<string>> ReadUntilTaggedResponseAsync(
+        ProtocolConnection connection,
+        string tag)
+    {
+        var responses = new List<string>();
+        string response;
+        do
+        {
+            response = await connection.ReadLineAsync();
+            responses.Add(response);
+        }
+        while (!response.StartsWith($"{tag} ", StringComparison.Ordinal));
+
+        return responses;
+    }
+
     private EnvironmentConfig CreateEnvironment(
         int? smtpPort = null,
         int? submissionPort = null,

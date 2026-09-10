@@ -218,6 +218,68 @@ def test_copy_quota(account: str, password: str) -> None:
         delete_marker(account, password, "INBOX", marker)
 
 
+def move_state(account: str, source_uid: int) -> tuple[int, int]:
+    require(
+        re.fullmatch(r"[a-z0-9][a-z0-9@._-]*", account) is not None,
+        "The MOVE test account is not safe.",
+    )
+    require(source_uid > 0, "The source UID is not valid.")
+    value = database_value(
+        "SELECT f.highest_mod_seq || '|' || "
+        "COALESCE((SELECT MAX(eu.mod_seq) FROM expunged_uids eu "
+        f"WHERE eu.folder_id = f.id AND eu.uid = {source_uid}), 0) "
+        "FROM folders f JOIN inboxes i ON i.id = f.inbox_id "
+        "JOIN users u ON u.id = i.owner_id "
+        f"WHERE u.username = '{account}' AND f.name = 'Inbox'"
+    )
+    parts = value.split("|")
+    require(
+        len(parts) == 2 and all(part.isdecimal() for part in parts),
+        "The MOVE state is not valid.",
+    )
+    return int(parts[0]), int(parts[1])
+
+
+def test_move_tombstone(account: str, password: str) -> None:
+    marker = uuid.uuid4().hex
+    try:
+        send_inbound(new_message("probe@debian.org", account, marker))
+        source_content = wait_for_message(account, password, marker, delete=False)
+
+        with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
+            client.login(account, password)
+            require(client.select("INBOX")[0] == "OK", "IMAP could not select the MOVE source.")
+            source_identifiers = find_message_identifiers(client, marker)
+            require(len(source_identifiers) == 1, "The MOVE source is not unique.")
+            source_identifier = source_identifiers[0]
+            source_uid = int(source_identifier.decode("ascii"))
+            before_mod_seq, before_tombstone = move_state(account, source_uid)
+            require(before_tombstone == 0, "The MOVE source UID already has a tombstone.")
+
+            status, _ = client.uid("MOVE", source_identifier, "Trash")
+            require(status == "OK", "UID MOVE failed.")
+
+            after_mod_seq, tombstone_mod_seq = move_state(account, source_uid)
+            require(after_mod_seq > before_mod_seq, "UID MOVE did not change the source state.")
+            require(
+                tombstone_mod_seq == after_mod_seq,
+                "UID MOVE did not store the source tombstone.",
+            )
+
+            require(client.select("Trash")[0] == "OK", "IMAP could not select the MOVE target.")
+            destination_identifiers = find_message_identifiers(client, marker)
+            require(len(destination_identifiers) == 1, "The moved message is not unique.")
+            status, content = client.uid(
+                "FETCH", destination_identifiers[0], "(BODY.PEEK[])"
+            )
+            require(status == "OK", "The moved message could not be fetched.")
+            moved_content = next(item[1] for item in content if isinstance(item, tuple))
+            require(moved_content == source_content, "UID MOVE changed the message content.")
+    finally:
+        delete_marker(account, password, "Trash", marker)
+        delete_marker(account, password, "INBOX", marker)
+
+
 def require_sender_mismatch_rejected(account: str, password: str) -> None:
     with smtplib.SMTP(LOCAL_HOST, 587, timeout=30) as client:
         client.ehlo("probe.debian.org")
@@ -255,6 +317,7 @@ def test_active(domain: str, account: str, password: str, selector: str) -> None
     )
     require_sender_mismatch_rejected(account, password)
     test_copy_quota(account, password)
+    test_move_tombstone(account, password)
 
 
 def main() -> None:
@@ -276,7 +339,7 @@ def main() -> None:
 
     require(arguments.selector is not None, "The active test requires a DKIM selector.")
     test_active(arguments.domain, arguments.account, password, arguments.selector)
-    print("The second domain passed delivery, catch-all, login, sender, DKIM, and COPY tests.")
+    print("The second domain passed delivery, catch-all, login, sender, DKIM, COPY, and MOVE tests.")
 
 
 if __name__ == "__main__":

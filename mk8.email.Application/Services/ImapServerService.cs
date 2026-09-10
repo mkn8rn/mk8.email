@@ -56,6 +56,8 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private enum SessionUpgrade { None, StartTls, Compress }
 
+    private readonly record struct MessageSetRange(int Start, int End);
+
     private readonly ConnectionLimiter _connectionLimiter = new(MaximumConcurrentConnections);
     private readonly SemaphoreSlim _messageWriteCommandLimiter = new(
         MaximumConcurrentMessageWriteCommands,
@@ -1222,6 +1224,12 @@ ILogger<ImapServerService> logger) : BackgroundService
         var maximumIdentifier = useUid
             ? await messageQuery.MaxAsync(email => (int?)email.Uid, ct) ?? 0
             : await messageQuery.CountAsync(ct);
+        if (!TryParseMessageSet(messageSet, maximumIdentifier, out var parsedMessageSet))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
+        }
+
         var includeStoredContent = FetchNeedsStoredContent(fetchItems);
         var fetchQuery = CreateFetchQuery(messageQuery, includeStoredContent);
         var seenUpdates = new List<EmailDB>();
@@ -1234,7 +1242,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         {
             sequenceNumber++;
             var identifier = useUid ? email.Uid : sequenceNumber;
-            if (!UidMatchesSet(identifier, messageSet, maximumIdentifier))
+            if (!MessageSetContains(parsedMessageSet, identifier))
                 continue;
 
             if (implicitSeen && !email.IsRead && folder is not null)
@@ -1289,7 +1297,16 @@ ILogger<ImapServerService> logger) : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
         var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var selected = ResolveSequenceSet(sequenceSet, emails.Count);
+        if (!TryParseMessageSet(sequenceSet, emails.Count, out var parsedMessageSet))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
+        }
+
+        var selected = emails
+            .Select((email, index) => (Email: email, SequenceNumber: index + 1))
+            .Where(item => MessageSetContains(parsedMessageSet, item.SequenceNumber))
+            .ToList();
         var flagsList = flagsRaw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var isSilent = action.Contains(".SILENT");
 
@@ -1298,10 +1315,10 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         var modified = new List<int>();
 
-        foreach (var seqNum in selected)
+        foreach (var item in selected)
         {
-            if (seqNum < 1 || seqNum > emails.Count) continue;
-            var email = emails[seqNum - 1];
+            var email = item.Email;
+            var seqNum = item.SequenceNumber;
 
             if (unchangedSince is not null && email.ModSeq > unchangedSince.Value)
             {
@@ -1494,21 +1511,20 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
 
         var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        List<EmailDB> selected;
-        if (useUid)
+        var maximumIdentifier = useUid
+            ? (emails.Count > 0 ? emails[^1].Uid : 0)
+            : emails.Count;
+        if (!TryParseMessageSet(messageSet, maximumIdentifier, out var parsedMessageSet))
         {
-            var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
-            selected = emails
-                .Where(email => UidMatchesSet(email.Uid, messageSet, maxUid))
-                .ToList();
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
         }
-        else
-        {
-            var sequenceNumbers = ResolveSequenceSet(messageSet, emails.Count).ToHashSet();
-            selected = emails
-                .Where((_, index) => sequenceNumbers.Contains(index + 1))
-                .ToList();
-        }
+
+        var selected = emails
+            .Where((email, index) => MessageSetContains(
+                parsedMessageSet,
+                useUid ? email.Uid : index + 1))
+            .ToList();
 
         if (!TryGetTotalStoredSize(selected, out var addedBytes))
         {
@@ -1644,6 +1660,12 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
+        if (!TryParseMessageSet(storeUidSet, maxUid, out var parsedMessageSet))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
+        }
+
         var isSilent = action.Contains(".SILENT");
 
         var folder = await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
@@ -1654,7 +1676,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         for (var i = 0; i < emails.Count; i++)
         {
             var email = emails[i];
-            if (!UidMatchesSet(email.Uid, storeUidSet, maxUid)) continue;
+            if (!MessageSetContains(parsedMessageSet, email.Uid)) continue;
 
             if (unchangedSince is not null && email.ModSeq > unchangedSince.Value)
             {
@@ -2465,54 +2487,124 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private static bool IsMarkedDeleted(EmailDB email) => email.IsDeleted;
 
-    private static bool UidMatchesSet(int uid, string uidSet, int total)
+    private static bool TryParseMessageSet(
+        string value,
+        int maximumIdentifier,
+        out List<MessageSetRange> ranges)
     {
-        foreach (var part in uidSet.Split(','))
+        ranges = [];
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        var parsedRanges = new List<MessageSetRange>();
+        foreach (var part in value.Split(','))
         {
-            if (part.Contains(':'))
+            if (part.Length == 0)
+                return false;
+
+            var separator = part.IndexOf(':');
+            int start;
+            int end;
+            if (separator >= 0)
             {
-                var range = part.Split(':', 2);
-                var start = range[0] == "*" ? total : int.Parse(range[0]);
-                var end = range[1] == "*" ? total : int.Parse(range[1]);
-                if (start > end) (start, end) = (end, start);
-                if (uid >= start && uid <= end) return true;
+                if (separator == 0
+                    || separator == part.Length - 1
+                    || part.IndexOf(':', separator + 1) >= 0
+                    || !TryParseMessageSetEndpoint(part[..separator], maximumIdentifier, out start)
+                    || !TryParseMessageSetEndpoint(part[(separator + 1)..], maximumIdentifier, out end))
+                {
+                    return false;
+                }
             }
-            else if (part == "*")
+            else if (TryParseMessageSetEndpoint(part, maximumIdentifier, out start))
             {
-                if (uid == total) return true;
+                end = start;
             }
             else
             {
-                if (int.TryParse(part, out var num) && uid == num) return true;
+                return false;
+            }
+
+            if (start > end)
+                (start, end) = (end, start);
+            parsedRanges.Add(new MessageSetRange(start, end));
+        }
+
+        parsedRanges.Sort(static (left, right) =>
+        {
+            var startComparison = left.Start.CompareTo(right.Start);
+            return startComparison != 0 ? startComparison : left.End.CompareTo(right.End);
+        });
+
+        foreach (var range in parsedRanges)
+        {
+            if (ranges.Count == 0)
+            {
+                ranges.Add(range);
+                continue;
+            }
+
+            var previous = ranges[^1];
+            var adjacent = previous.End < int.MaxValue && range.Start == previous.End + 1;
+            if (range.Start <= previous.End || adjacent)
+            {
+                ranges[^1] = new MessageSetRange(previous.Start, Math.Max(previous.End, range.End));
+            }
+            else
+            {
+                ranges.Add(range);
             }
         }
-        return false;
+
+        return true;
     }
 
-    private static List<int> ResolveSequenceSet(string set, int total)
+    private static bool TryParseMessageSetEndpoint(
+        string value,
+        int maximumIdentifier,
+        out int identifier)
     {
-        var result = new List<int>();
-        foreach (var part in set.Split(','))
+        if (value == "*")
         {
-            if (part.Contains(':'))
+            identifier = maximumIdentifier;
+            return true;
+        }
+
+        foreach (var character in value)
+        {
+            if (character is < '0' or > '9')
             {
-                var range = part.Split(':', 2);
-                var start = range[0] == "*" ? total : int.Parse(range[0]);
-                var end = range[1] == "*" ? total : int.Parse(range[1]);
-                if (start > end) (start, end) = (end, start);
-                for (var i = start; i <= end; i++)
-                    result.Add(i);
-            }
-            else if (part == "*")
-            {
-                result.Add(total);
-            }
-            else if (int.TryParse(part, out var num))
-            {
-                result.Add(num);
+                identifier = 0;
+                return false;
             }
         }
-        return result;
+
+        return int.TryParse(value, out identifier) && identifier > 0;
+    }
+
+    private static bool MessageSetContains(IReadOnlyList<MessageSetRange> ranges, int identifier)
+    {
+        var low = 0;
+        var high = ranges.Count - 1;
+        while (low <= high)
+        {
+            var middle = low + (high - low) / 2;
+            var range = ranges[middle];
+            if (identifier < range.Start)
+            {
+                high = middle - 1;
+            }
+            else if (identifier > range.End)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static (string? username, string? password) ParseLoginArgs(string args)
@@ -3451,6 +3543,12 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         var folder = await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
         var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
+        if (!TryParseMessageSet(uidSetArg, maxUid, out var parsedMessageSet))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
+        }
+
         var expunged = 0;
         var vanishedUids = new List<int>();
 
@@ -3458,7 +3556,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         {
             var email = emails[i];
             if (!IsMarkedDeleted(email)) continue;
-            if (!UidMatchesSet(email.Uid, uidSetArg, maxUid)) continue;
+            if (!MessageSetContains(parsedMessageSet, email.Uid)) continue;
 
             var expungeModSeq = ++folder!.HighestModSeq;
 
@@ -3494,55 +3592,33 @@ ILogger<ImapServerService> logger) : BackgroundService
         await writer.WriteLineAsync($"{tag} OK UID EXPUNGE completed");
     }
 
-    private async Task HandleMoveAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+    private async Task HandleMoveAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        CancellationToken ct)
     {
-        var spaceIdx = args.IndexOf(' ');
-        if (spaceIdx <= 0)
-        {
-            await writer.WriteLineAsync($"{tag} BAD Syntax error");
-            return;
-        }
-
-        var sequenceSet = args[..spaceIdx];
-        var destMailbox = UnquoteArg(args[(spaceIdx + 1)..].Trim());
-
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-
-        var destFolder = await ResolveFolderAsync(db, session.UserId, destMailbox, ct);
-        if (destFolder is null)
-        {
-            await writer.WriteLineAsync($"{tag} NO [TRYCREATE] Destination mailbox not found");
-            return;
-        }
-
-        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var selected = ResolveSequenceSet(sequenceSet, emails.Count);
-
-        var srcUids = new List<int>();
-        var dstUids = new List<int>();
-        var expunged = 0;
-        foreach (var seqNum in selected.OrderBy(s => s))
-        {
-            if (seqNum < 1 || seqNum > emails.Count) continue;
-            var email = emails[seqNum - 1];
-
-            srcUids.Add(email.Uid);
-            var destinationUid = destFolder.NextUid++;
-            var destinationModSeq = ++destFolder.HighestModSeq;
-            AttachMoveUpdate(db, email, destFolder.Id, destinationUid, destinationModSeq);
-            dstUids.Add(destinationUid);
-
-            var adjustedSeq = seqNum - expunged;
-            await writer.WriteLineAsync($"* {adjustedSeq} EXPUNGE");
-            expunged++;
-        }
-
-        await db.SaveChangesAsync(ct);
-        await writer.WriteLineAsync($"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] MOVE completed");
+        await HandleMoveCoreAsync(writer, tag, args, session, useUid: false, ct);
     }
 
-    private async Task HandleUidMoveAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+    private async Task HandleUidMoveAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        CancellationToken ct)
+    {
+        await HandleMoveCoreAsync(writer, tag, args, session, useUid: true, ct);
+    }
+
+    private async Task HandleMoveCoreAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
     {
         var spaceIdx = args.IndexOf(' ');
         if (spaceIdx <= 0)
@@ -3551,11 +3627,21 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var uidSet = args[..spaceIdx];
+        var messageSet = args[..spaceIdx];
         var destMailbox = UnquoteArg(args[(spaceIdx + 1)..].Trim());
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct)
+            : null;
+
+        var sourceFolder = await db.Folders.FindAsync([session.SelectedFolderId!.Value], ct);
+        if (sourceFolder is null)
+        {
+            await writer.WriteLineAsync($"{tag} NO Selected mailbox not found");
+            return;
+        }
 
         var destFolder = await ResolveFolderAsync(db, session.UserId, destMailbox, ct);
         if (destFolder is null)
@@ -3565,29 +3651,66 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
 
         var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
-
-        var srcUids = new List<int>();
-        var dstUids = new List<int>();
-        var expunged = 0;
-        for (var i = 0; i < emails.Count; i++)
+        var maximumIdentifier = useUid
+            ? (emails.Count > 0 ? emails[^1].Uid : 0)
+            : emails.Count;
+        if (!TryParseMessageSet(messageSet, maximumIdentifier, out var parsedMessageSet))
         {
-            var email = emails[i];
-            if (!UidMatchesSet(email.Uid, uidSet, maxUid)) continue;
+            await writer.WriteLineAsync($"{tag} BAD Invalid message set");
+            return;
+        }
 
-            srcUids.Add(email.Uid);
+        var selected = emails
+            .Select((email, index) => (Email: email, SequenceNumber: index + 1))
+            .Where(item => MessageSetContains(
+                parsedMessageSet,
+                useUid ? item.Email.Uid : item.SequenceNumber))
+            .ToList();
+
+        var srcUids = new List<int>(selected.Count);
+        var dstUids = new List<int>(selected.Count);
+        var expungeSequenceNumbers = new List<int>(selected.Count);
+        var expunged = 0;
+        foreach (var item in selected)
+        {
+            var email = item.Email;
+            var sourceUid = email.Uid;
+            var sourceModSeq = ++sourceFolder.HighestModSeq;
+            db.ExpungedUids.Add(new ExpungedUidDB
+            {
+                Id = Guid.CreateVersion7(),
+                Uid = sourceUid,
+                ModSeq = sourceModSeq,
+                FolderId = sourceFolder.Id,
+            });
+
+            srcUids.Add(sourceUid);
             var destinationUid = destFolder.NextUid++;
             var destinationModSeq = ++destFolder.HighestModSeq;
             AttachMoveUpdate(db, email, destFolder.Id, destinationUid, destinationModSeq);
             dstUids.Add(destinationUid);
 
-            var adjustedSeq = i + 1 - expunged;
-            await writer.WriteLineAsync($"* {adjustedSeq} EXPUNGE");
+            expungeSequenceNumbers.Add(item.SequenceNumber - expunged);
             expunged++;
         }
 
         await db.SaveChangesAsync(ct);
-        await writer.WriteLineAsync($"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] UID MOVE completed");
+        if (transaction is not null)
+            await transaction.CommitAsync(ct);
+
+        if (session.QresyncEnabled && srcUids.Count > 0)
+        {
+            await writer.WriteLineAsync($"* VANISHED {FormatUidRange(srcUids)}");
+        }
+        else
+        {
+            foreach (var sequenceNumber in expungeSequenceNumbers)
+                await writer.WriteLineAsync($"* {sequenceNumber} EXPUNGE");
+        }
+
+        var commandName = useUid ? "UID MOVE" : "MOVE";
+        await writer.WriteLineAsync(
+            $"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] {commandName} completed");
     }
 
     private async Task HandleAppendAsync(
