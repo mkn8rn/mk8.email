@@ -7,9 +7,11 @@ import ssl
 import subprocess
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.policy import default
+from email.utils import format_datetime
 from pathlib import Path
 
 
@@ -305,6 +307,8 @@ def test_search(account: str, password: str) -> None:
     first_subject = f"subject{uuid.uuid4().hex}"
     second_subject = f"subject{uuid.uuid4().hex}"
     body_token = f"body{uuid.uuid4().hex}"
+    first_sent_date = datetime.now(timezone.utc) - timedelta(days=3)
+    second_sent_date = first_sent_date + timedelta(days=1)
     try:
         send_inbound(
             new_search_message(
@@ -313,7 +317,7 @@ def test_search(account: str, password: str) -> None:
                 first_marker,
                 first_subject,
                 body_token,
-                "Mon, 2 Feb 2037 23:30:00 +1400",
+                format_datetime(first_sent_date),
             )
         )
         send_inbound(
@@ -323,7 +327,7 @@ def test_search(account: str, password: str) -> None:
                 second_marker,
                 second_subject,
                 "otherbody",
-                "Tue, 3 Feb 2037 00:30:00 +0000",
+                format_datetime(second_sent_date),
             )
         )
         wait_for_message(account, password, first_marker, delete=False)
@@ -368,7 +372,9 @@ def test_search(account: str, password: str) -> None:
                 "TEXT did not find only the selected message header.",
             )
 
-            status, data = client.uid("SEARCH", None, "SENTON", "2-Feb-2037")
+            status, data = client.uid(
+                "SEARCH", None, "SENTON", first_sent_date.strftime("%d-%b-%Y")
+            )
             require(status == "OK", "The sent-date UID SEARCH failed.")
             require(
                 data[0].split() == first_identifiers,
