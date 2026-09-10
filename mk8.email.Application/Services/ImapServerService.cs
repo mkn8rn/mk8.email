@@ -30,6 +30,9 @@ ILogger<ImapServerService> logger) : BackgroundService
     private const int MaximumConcurrentConnections = 256;
     private const int MaximumConcurrentMessageWriteCommands = 2;
     private const int MaximumConcurrentFetchCommands = 4;
+    private const int MaximumConcurrentSearchCommands = 4;
+    private const int MaximumSearchTokens = 4096;
+    private const int MaximumSearchNestingDepth = 64;
     private const int MaximumMultiAppendMessages = 20;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
@@ -65,6 +68,9 @@ ILogger<ImapServerService> logger) : BackgroundService
     private readonly SemaphoreSlim _fetchCommandLimiter = new(
         MaximumConcurrentFetchCommands,
         MaximumConcurrentFetchCommands);
+    private readonly SemaphoreSlim _searchCommandLimiter = new(
+        MaximumConcurrentSearchCommands,
+        MaximumConcurrentSearchCommands);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -1353,43 +1359,76 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private async Task HandleSearchAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
-        var (returnOpts, searchCriteria) = ParseEsearchReturn(args);
+        await HandleSearchWithLimitAsync(writer, tag, args, session, useUid: false, ct);
+    }
 
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-
-        var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        var matches = await FindSearchCandidatesAsync(
-            query,
-            searchCriteria.Trim().ToUpperInvariant(),
-            ct);
-        var emails = matches.Select(item => item.Id).ToList();
-
-        var allEmails = await db.Emails
-            .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-            .OrderBy(e => e.Uid)
-            .Select(e => e.Id)
-            .ToListAsync(ct);
-
-        var seqNums = new List<int>();
-        foreach (var id in emails)
+    private async Task HandleSearchWithLimitAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
+    {
+        if (!_searchCommandLimiter.Wait(0))
         {
-            var idx = allEmails.IndexOf(id);
-            if (idx >= 0)
-                seqNums.Add(idx + 1);
+            await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent SEARCH commands");
+            return;
         }
 
-        if (returnOpts is not null)
+        try
         {
-            var esearchResult = BuildEsearchResult(returnOpts, seqNums, useUid: false);
-            await writer.WriteLineAsync($"* ESEARCH (TAG \"{tag}\") {esearchResult}");
+            await HandleSearchCoreAsync(writer, tag, args, session, useUid, ct);
+        }
+        finally
+        {
+            _searchCommandLimiter.Release();
+        }
+    }
+
+    private async Task HandleSearchCoreAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
+    {
+        var (returnOptions, searchCriteria) = ParseEsearchReturn(args);
+        using var scope = scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
+            : null;
+        var query = db.Emails
+            .AsNoTracking()
+            .Where(email => email.FolderId == session.SelectedFolderId!.Value);
+        var searchResult = await FindSearchCandidatesAsync(query, searchCriteria.Trim(), ct);
+        if (searchResult.FailureResponse is not null)
+        {
+            await writer.WriteLineAsync($"{tag} {searchResult.FailureResponse}");
+            return;
+        }
+
+        var numbers = searchResult.Matches
+            .Select(candidate => useUid ? candidate.Uid : candidate.SequenceNumber)
+            .ToList();
+        if (transaction is not null)
+            await transaction.CommitAsync(ct);
+
+        if (returnOptions is not null)
+        {
+            var result = BuildEsearchResult(returnOptions, numbers);
+            var uidMarker = useUid ? " UID" : string.Empty;
+            await writer.WriteLineAsync($"* ESEARCH (TAG \"{tag}\"){uidMarker} {result}");
         }
         else
         {
-            var result = string.Join(' ', seqNums);
-            await writer.WriteLineAsync($"* SEARCH {result}");
+            await writer.WriteLineAsync($"* SEARCH {string.Join(' ', numbers)}");
         }
-        await writer.WriteLineAsync($"{tag} OK SEARCH completed");
+
+        var commandName = useUid ? "UID SEARCH" : "SEARCH";
+        await writer.WriteLineAsync($"{tag} OK {commandName} completed");
     }
 
     private async Task HandleExpungeAsync(StreamWriter writer, string tag, ImapSession session, CancellationToken ct)
@@ -1610,29 +1649,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     private async Task HandleUidSearchAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
     {
-        var (returnOpts, searchCriteria) = ParseEsearchReturn(args);
-
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-
-        var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        var matches = await FindSearchCandidatesAsync(
-            query,
-            searchCriteria.Trim().ToUpperInvariant(),
-            ct);
-        var uids = matches.Select(item => item.Uid).ToList();
-
-        if (returnOpts is not null)
-        {
-            var esearchResult = BuildEsearchResult(returnOpts, uids, useUid: true);
-            await writer.WriteLineAsync($"* ESEARCH (TAG \"{tag}\") UID {esearchResult}");
-        }
-        else
-        {
-            var result = string.Join(' ', uids);
-            await writer.WriteLineAsync($"* SEARCH {result}");
-        }
-        await writer.WriteLineAsync($"{tag} OK UID SEARCH completed");
+        await HandleSearchWithLimitAsync(writer, tag, args, session, useUid: true, ct);
     }
 
     private async Task HandleUidStoreAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
@@ -2880,39 +2897,797 @@ ILogger<ImapServerService> logger) : BackgroundService
         return sb.ToString();
     }
 
-    private sealed record SearchCandidate(Guid Id, int Uid, string? RawHeaders);
+    [Flags]
+    private enum SearchDataRequirements
+    {
+        None = 0,
+        Body = 1,
+        RawHeaders = 2,
+    }
 
-    private sealed record HeaderSearchCriterion(string Name, string Value);
+    private enum SearchTokenKind
+    {
+        Atom,
+        OpenParenthesis,
+        CloseParenthesis,
+    }
 
-    private static async Task<List<SearchCandidate>> FindSearchCandidatesAsync(
+    private readonly record struct SearchToken(SearchTokenKind Kind, string Value);
+
+    private sealed record SearchStoredMessage(
+        Guid Id,
+        int Uid,
+        string Sender,
+        string Recipient,
+        string Subject,
+        string Body,
+        bool IsRead,
+        bool IsDeleted,
+        bool IsFlagged,
+        bool IsDraft,
+        bool IsAnswered,
+        long ModSeq,
+        int SizeBytes,
+        string? RawHeaders,
+        string? MessageId,
+        string? InReplyTo,
+        string? Cc,
+        DateTime ReceivedAt);
+
+    private sealed record SearchCandidate(Guid Id, int Uid, int SequenceNumber);
+
+    private sealed record SearchExecutionResult(
+        IReadOnlyList<SearchCandidate> Matches,
+        string? FailureResponse);
+
+    private sealed record SearchPredicate(
+        SearchDataRequirements Requirements,
+        Func<SearchStoredMessage, int, bool> IsMatch);
+
+    private sealed class SearchParser(
+        IReadOnlyList<SearchToken> tokens,
+        int maximumSequenceNumber,
+        int maximumUid)
+    {
+        private int _index;
+        private string _failureResponse = "BAD Invalid search criteria";
+
+        public bool TryParse(out SearchPredicate predicate, out string failureResponse)
+        {
+            predicate = MatchNothing();
+
+            if (tokens.Count == 0)
+            {
+                failureResponse = _failureResponse;
+                return false;
+            }
+
+            if (CurrentAtomEquals("CHARSET"))
+            {
+                _index++;
+                if (!TryReadValue(out var charset))
+                {
+                    failureResponse = _failureResponse;
+                    return false;
+                }
+
+                if (!charset.Equals("US-ASCII", StringComparison.OrdinalIgnoreCase))
+                {
+                    failureResponse = "NO [BADCHARSET (US-ASCII)] Unsupported search charset";
+                    return false;
+                }
+            }
+
+            if (_index >= tokens.Count
+                || !TryParseConjunction(stopAtCloseParenthesis: false, depth: 0, out predicate)
+                || _index != tokens.Count)
+            {
+                failureResponse = _failureResponse;
+                return false;
+            }
+
+            failureResponse = string.Empty;
+            return true;
+        }
+
+        private bool TryParseConjunction(
+            bool stopAtCloseParenthesis,
+            int depth,
+            out SearchPredicate predicate)
+        {
+            predicate = MatchNothing();
+            if (depth > MaximumSearchNestingDepth)
+                return false;
+
+            var predicates = new List<SearchPredicate>();
+            while (_index < tokens.Count
+                   && tokens[_index].Kind != SearchTokenKind.CloseParenthesis)
+            {
+                if (!TryParseKey(depth, out var item))
+                    return false;
+                predicates.Add(item);
+            }
+
+            if (predicates.Count == 0)
+                return false;
+
+            if (stopAtCloseParenthesis)
+            {
+                if (_index >= tokens.Count
+                    || tokens[_index].Kind != SearchTokenKind.CloseParenthesis)
+                {
+                    return false;
+                }
+
+                _index++;
+            }
+            else if (_index < tokens.Count)
+            {
+                return false;
+            }
+
+            predicate = CombineAnd(predicates);
+            return true;
+        }
+
+        private bool TryParseKey(int depth, out SearchPredicate predicate)
+        {
+            predicate = MatchNothing();
+            if (depth > MaximumSearchNestingDepth || _index >= tokens.Count)
+                return false;
+
+            var token = tokens[_index++];
+            if (token.Kind == SearchTokenKind.OpenParenthesis)
+            {
+                return TryParseConjunction(
+                    stopAtCloseParenthesis: true,
+                    depth + 1,
+                    out predicate);
+            }
+
+            if (token.Kind != SearchTokenKind.Atom)
+                return false;
+
+            if (LooksLikeMessageSet(token.Value))
+            {
+                if (!TryParseMessageSet(
+                        token.Value,
+                        maximumSequenceNumber,
+                        out var sequenceRanges))
+                {
+                    return false;
+                }
+
+                predicate = new SearchPredicate(
+                    SearchDataRequirements.None,
+                    (_, sequenceNumber) => MessageSetContains(sequenceRanges, sequenceNumber));
+                return true;
+            }
+
+            switch (token.Value.ToUpperInvariant())
+            {
+                case "ALL":
+                    predicate = MatchEverything();
+                    return true;
+                case "ANSWERED":
+                    predicate = Flag(static message => message.IsAnswered);
+                    return true;
+                case "UNANSWERED":
+                    predicate = Flag(static message => !message.IsAnswered);
+                    return true;
+                case "DELETED":
+                    predicate = Flag(static message => message.IsDeleted);
+                    return true;
+                case "UNDELETED":
+                    predicate = Flag(static message => !message.IsDeleted);
+                    return true;
+                case "DRAFT":
+                    predicate = Flag(static message => message.IsDraft);
+                    return true;
+                case "UNDRAFT":
+                    predicate = Flag(static message => !message.IsDraft);
+                    return true;
+                case "FLAGGED":
+                    predicate = Flag(static message => message.IsFlagged);
+                    return true;
+                case "UNFLAGGED":
+                    predicate = Flag(static message => !message.IsFlagged);
+                    return true;
+                case "SEEN":
+                    predicate = Flag(static message => message.IsRead);
+                    return true;
+                case "UNSEEN":
+                    predicate = Flag(static message => !message.IsRead);
+                    return true;
+                case "NEW":
+                case "RECENT":
+                    predicate = MatchNothing();
+                    return true;
+                case "OLD":
+                    predicate = MatchEverything();
+                    return true;
+                case "NOT":
+                    if (!TryParseKey(depth + 1, out var negated))
+                        return false;
+                    predicate = new SearchPredicate(
+                        negated.Requirements,
+                        (message, sequenceNumber) => !negated.IsMatch(message, sequenceNumber));
+                    return true;
+                case "OR":
+                    if (!TryParseKey(depth + 1, out var left)
+                        || !TryParseKey(depth + 1, out var right))
+                    {
+                        return false;
+                    }
+
+                    predicate = new SearchPredicate(
+                        left.Requirements | right.Requirements,
+                        (message, sequenceNumber) => left.IsMatch(message, sequenceNumber)
+                            || right.IsMatch(message, sequenceNumber));
+                    return true;
+                case "BCC":
+                    return TryParseHeaderValue("Bcc", out predicate);
+                case "CC":
+                    return TryParseHeaderValue("Cc", out predicate);
+                case "FROM":
+                    return TryParseHeaderValue("From", out predicate);
+                case "SUBJECT":
+                    if (!TryReadValue(out var subject))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => ContainsSearchText(message.Subject, subject));
+                    return true;
+                case "TO":
+                    return TryParseHeaderValue("To", out predicate);
+                case "BODY":
+                    if (!TryReadValue(out var bodyText))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.Body,
+                        (message, _) => ContainsSearchText(message.Body, bodyText));
+                    return true;
+                case "TEXT":
+                    if (!TryReadValue(out var text))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.Body | SearchDataRequirements.RawHeaders,
+                        (message, _) => MessageTextContains(message, text));
+                    return true;
+                case "HEADER":
+                    if (!TryReadValue(out var headerName)
+                        || headerName.Length == 0
+                        || !TryReadValue(out var headerValue))
+                    {
+                        return false;
+                    }
+
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.RawHeaders,
+                        (message, _) => HeaderContains(
+                            message.RawHeaders,
+                            headerName,
+                            headerValue));
+                    return true;
+                case "BEFORE":
+                    return TryParseReceivedDate(
+                        static (messageDate, searchDate) => messageDate < searchDate,
+                        out predicate);
+                case "ON":
+                    return TryParseReceivedDate(
+                        static (messageDate, searchDate) => messageDate == searchDate,
+                        out predicate);
+                case "SINCE":
+                    return TryParseReceivedDate(
+                        static (messageDate, searchDate) => messageDate >= searchDate,
+                        out predicate);
+                case "SENTBEFORE":
+                    return TryParseSentDate(
+                        static (messageDate, searchDate) => messageDate < searchDate,
+                        out predicate);
+                case "SENTON":
+                    return TryParseSentDate(
+                        static (messageDate, searchDate) => messageDate == searchDate,
+                        out predicate);
+                case "SENTSINCE":
+                    return TryParseSentDate(
+                        static (messageDate, searchDate) => messageDate >= searchDate,
+                        out predicate);
+                case "LARGER":
+                    if (!TryReadUnsignedNumber(out var larger))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => message.SizeBytes > larger);
+                    return true;
+                case "SMALLER":
+                    if (!TryReadUnsignedNumber(out var smaller))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => message.SizeBytes < smaller);
+                    return true;
+                case "UID":
+                    if (!TryReadValue(out var uidSet)
+                        || !TryParseMessageSet(uidSet, maximumUid, out var uidRanges))
+                    {
+                        return false;
+                    }
+
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => MessageSetContains(uidRanges, message.Uid));
+                    return true;
+                case "KEYWORD":
+                    if (!TryReadValue(out var keyword))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => HasKeyword(message, keyword));
+                    return true;
+                case "UNKEYWORD":
+                    if (!TryReadValue(out var absentKeyword))
+                        return false;
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => !HasKeyword(message, absentKeyword));
+                    return true;
+                case "MODSEQ":
+                    if (!TryReadValue(out var modSequenceText)
+                        || !long.TryParse(
+                            modSequenceText,
+                            System.Globalization.NumberStyles.None,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out var modSequence)
+                        || modSequence <= 0)
+                    {
+                        return false;
+                    }
+
+                    predicate = new SearchPredicate(
+                        SearchDataRequirements.None,
+                        (message, _) => message.ModSeq >= modSequence);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private bool TryParseHeaderValue(string headerName, out SearchPredicate predicate)
+        {
+            predicate = MatchNothing();
+            if (!TryReadValue(out var value))
+                return false;
+
+            predicate = new SearchPredicate(
+                SearchDataRequirements.RawHeaders,
+                (message, _) => HeaderContains(message.RawHeaders, headerName, value));
+            return true;
+        }
+
+        private bool TryParseReceivedDate(
+            Func<DateOnly, DateOnly, bool> comparison,
+            out SearchPredicate predicate)
+        {
+            predicate = MatchNothing();
+            if (!TryReadValue(out var value)
+                || !TryParseImapDate(value, out var parsedDate))
+            {
+                return false;
+            }
+
+            var searchDate = DateOnly.FromDateTime(parsedDate);
+            predicate = new SearchPredicate(
+                SearchDataRequirements.None,
+                (message, _) => comparison(
+                    DateOnly.FromDateTime(message.ReceivedAt),
+                    searchDate));
+            return true;
+        }
+
+        private bool TryParseSentDate(
+            Func<DateOnly, DateOnly, bool> comparison,
+            out SearchPredicate predicate)
+        {
+            predicate = MatchNothing();
+            if (!TryReadValue(out var value)
+                || !TryParseImapDate(value, out var parsedDate))
+            {
+                return false;
+            }
+
+            var searchDate = DateOnly.FromDateTime(parsedDate);
+            predicate = new SearchPredicate(
+                SearchDataRequirements.RawHeaders,
+                (message, _) => TryGetSentDate(message.RawHeaders, out var sentDate)
+                    && comparison(sentDate, searchDate));
+            return true;
+        }
+
+        private bool TryReadUnsignedNumber(out long value)
+        {
+            value = 0;
+            return TryReadValue(out var text)
+                && long.TryParse(
+                    text,
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out value)
+                && value >= 0
+                && value <= uint.MaxValue;
+        }
+
+        private bool TryReadValue(out string value)
+        {
+            value = string.Empty;
+            if (_index >= tokens.Count || tokens[_index].Kind != SearchTokenKind.Atom)
+                return false;
+
+            value = tokens[_index++].Value;
+            return true;
+        }
+
+        private bool CurrentAtomEquals(string value) =>
+            _index < tokens.Count
+            && tokens[_index].Kind == SearchTokenKind.Atom
+            && tokens[_index].Value.Equals(value, StringComparison.OrdinalIgnoreCase);
+
+        private static SearchPredicate CombineAnd(IReadOnlyList<SearchPredicate> predicates)
+        {
+            if (predicates.Count == 1)
+                return predicates[0];
+
+            var requirements = SearchDataRequirements.None;
+            foreach (var predicate in predicates)
+                requirements |= predicate.Requirements;
+
+            return new SearchPredicate(
+                requirements,
+                (message, sequenceNumber) =>
+                {
+                    foreach (var predicate in predicates)
+                    {
+                        if (!predicate.IsMatch(message, sequenceNumber))
+                            return false;
+                    }
+
+                    return true;
+                });
+        }
+
+        private static SearchPredicate Flag(Func<SearchStoredMessage, bool> predicate) =>
+            new(SearchDataRequirements.None, (message, _) => predicate(message));
+
+        private static SearchPredicate MatchEverything() =>
+            new(SearchDataRequirements.None, static (_, _) => true);
+
+        private static SearchPredicate MatchNothing() =>
+            new(SearchDataRequirements.None, static (_, _) => false);
+    }
+
+    private static async Task<SearchExecutionResult> FindSearchCandidatesAsync(
         IQueryable<EmailDB> query,
         string criteria,
         CancellationToken cancellationToken)
     {
-        var headerCriteria = new List<HeaderSearchCriterion>();
-        query = ApplySearchCriteria(query, criteria, headerCriteria);
+        var bounds = await query
+            .GroupBy(_ => 1)
+            .Select(group => new
+            {
+                Count = group.Count(),
+                MaximumUid = group.Max(message => message.Uid),
+            })
+            .SingleOrDefaultAsync(cancellationToken);
+        var maximumSequenceNumber = bounds?.Count ?? 0;
+        var maximumUid = bounds?.MaximumUid ?? 0;
 
-        if (headerCriteria.Count == 0)
+        if (!TryTokenizeSearchCriteria(criteria, out var tokens))
         {
-            return await query
-                .OrderBy(email => email.ReceivedAt)
-                .ThenBy(email => email.Uid)
-                .Select(email => new SearchCandidate(email.Id, email.Uid, null))
-                .ToListAsync(cancellationToken);
+            return new SearchExecutionResult(
+                [],
+                "BAD Invalid search criteria");
         }
 
-        var candidates = await query
-            .OrderBy(email => email.ReceivedAt)
-            .ThenBy(email => email.Uid)
-            .Select(email => new SearchCandidate(email.Id, email.Uid, email.RawHeaders))
-            .ToListAsync(cancellationToken);
-        return candidates
-            .Where(candidate => headerCriteria.All(
-                criterion => HeaderContains(candidate.RawHeaders, criterion)))
-            .ToList();
+        var parser = new SearchParser(tokens, maximumSequenceNumber, maximumUid);
+        if (!parser.TryParse(out var predicate, out var failureResponse))
+            return new SearchExecutionResult([], failureResponse);
+
+        var includeBody = predicate.Requirements.HasFlag(SearchDataRequirements.Body);
+        var includeRawHeaders = predicate.Requirements.HasFlag(SearchDataRequirements.RawHeaders);
+        var messageQuery = BuildSearchMessageQuery(query, includeBody, includeRawHeaders);
+        var matches = new List<SearchCandidate>();
+        var sequenceNumber = 0;
+        await foreach (var message in messageQuery
+                           .AsAsyncEnumerable()
+                           .WithCancellation(cancellationToken))
+        {
+            sequenceNumber++;
+            if (predicate.IsMatch(message, sequenceNumber))
+                matches.Add(new SearchCandidate(message.Id, message.Uid, sequenceNumber));
+        }
+
+        return new SearchExecutionResult(matches, null);
     }
 
-    private static bool HeaderContains(string? rawHeaders, HeaderSearchCriterion criterion)
+    private static IQueryable<SearchStoredMessage> BuildSearchMessageQuery(
+        IQueryable<EmailDB> query,
+        bool includeBody,
+        bool includeRawHeaders)
+    {
+        var ordered = query.OrderBy(message => message.Uid);
+        if (includeBody && includeRawHeaders)
+        {
+            return ordered.Select(message => new SearchStoredMessage(
+                message.Id,
+                message.Uid,
+                message.Sender,
+                message.Recipient,
+                message.Subject,
+                message.Body,
+                message.IsRead,
+                message.IsDeleted,
+                message.IsFlagged,
+                message.IsDraft,
+                message.IsAnswered,
+                message.ModSeq,
+                message.SizeBytes,
+                message.RawHeaders,
+                message.MessageId,
+                message.InReplyTo,
+                message.Cc,
+                message.ReceivedAt));
+        }
+
+        if (includeBody)
+        {
+            return ordered.Select(message => new SearchStoredMessage(
+                message.Id,
+                message.Uid,
+                message.Sender,
+                message.Recipient,
+                message.Subject,
+                message.Body,
+                message.IsRead,
+                message.IsDeleted,
+                message.IsFlagged,
+                message.IsDraft,
+                message.IsAnswered,
+                message.ModSeq,
+                message.SizeBytes,
+                null,
+                message.MessageId,
+                message.InReplyTo,
+                message.Cc,
+                message.ReceivedAt));
+        }
+
+        if (includeRawHeaders)
+        {
+            return ordered.Select(message => new SearchStoredMessage(
+                message.Id,
+                message.Uid,
+                message.Sender,
+                message.Recipient,
+                message.Subject,
+                string.Empty,
+                message.IsRead,
+                message.IsDeleted,
+                message.IsFlagged,
+                message.IsDraft,
+                message.IsAnswered,
+                message.ModSeq,
+                message.SizeBytes,
+                message.RawHeaders,
+                message.MessageId,
+                message.InReplyTo,
+                message.Cc,
+                message.ReceivedAt));
+        }
+
+        return ordered.Select(message => new SearchStoredMessage(
+            message.Id,
+            message.Uid,
+            message.Sender,
+            message.Recipient,
+            message.Subject,
+            string.Empty,
+            message.IsRead,
+            message.IsDeleted,
+            message.IsFlagged,
+            message.IsDraft,
+            message.IsAnswered,
+            message.ModSeq,
+            message.SizeBytes,
+            null,
+            message.MessageId,
+            message.InReplyTo,
+            message.Cc,
+            message.ReceivedAt));
+    }
+
+    private static bool TryTokenizeSearchCriteria(
+        string criteria,
+        out List<SearchToken> tokens)
+    {
+        tokens = [];
+        var index = 0;
+        while (index < criteria.Length)
+        {
+            while (index < criteria.Length && char.IsWhiteSpace(criteria[index]))
+                index++;
+
+            if (index >= criteria.Length)
+                break;
+
+            if (tokens.Count >= MaximumSearchTokens)
+                return false;
+
+            if (criteria[index] == '(')
+            {
+                tokens.Add(new SearchToken(SearchTokenKind.OpenParenthesis, "("));
+                index++;
+                continue;
+            }
+
+            if (criteria[index] == ')')
+            {
+                tokens.Add(new SearchToken(SearchTokenKind.CloseParenthesis, ")"));
+                index++;
+                if (index < criteria.Length
+                    && !char.IsWhiteSpace(criteria[index])
+                    && criteria[index] != ')')
+                {
+                    return false;
+                }
+                continue;
+            }
+
+            if (criteria[index] == '"')
+            {
+                index++;
+                var value = new StringBuilder();
+                var terminated = false;
+                while (index < criteria.Length)
+                {
+                    var character = criteria[index++];
+                    if (character == '"')
+                    {
+                        terminated = true;
+                        break;
+                    }
+
+                    if (character == '\\')
+                    {
+                        if (index >= criteria.Length)
+                            return false;
+                        character = criteria[index++];
+                        if (character is not '\\' and not '"')
+                            return false;
+                    }
+
+                    if (character is '\r' or '\n' or '\0')
+                        return false;
+                    value.Append(character);
+                }
+
+                if (!terminated)
+                    return false;
+                if (index < criteria.Length
+                    && !char.IsWhiteSpace(criteria[index])
+                    && criteria[index] != ')')
+                {
+                    return false;
+                }
+
+                tokens.Add(new SearchToken(SearchTokenKind.Atom, value.ToString()));
+                continue;
+            }
+
+            var start = index;
+            while (index < criteria.Length
+                   && !char.IsWhiteSpace(criteria[index])
+                   && criteria[index] is not '(' and not ')')
+            {
+                if (criteria[index] is '\r' or '\n' or '\0')
+                    return false;
+                index++;
+            }
+
+            if (index == start)
+                return false;
+            if (index < criteria.Length && criteria[index] == '(')
+                return false;
+
+            tokens.Add(new SearchToken(
+                SearchTokenKind.Atom,
+                criteria[start..index]));
+        }
+
+        return tokens.Count <= MaximumSearchTokens;
+    }
+
+    private static bool LooksLikeMessageSet(string value)
+    {
+        if (value.Length == 0 || value[0] is not ('*' or >= '0' and <= '9'))
+            return false;
+
+        foreach (var character in value)
+        {
+            if (character is not ('*' or ':' or ',' or >= '0' and <= '9'))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool ContainsSearchText(string? source, string value) =>
+        source?.Contains(value, StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool MessageTextContains(SearchStoredMessage message, string value)
+    {
+        if (ContainsSearchText(message.Body, value)
+            || HeaderBlockContains(message.RawHeaders, value))
+        {
+            return true;
+        }
+
+        if (message.RawHeaders is not null)
+            return false;
+
+        return ContainsSearchText(message.Sender, value)
+            || ContainsSearchText(message.Recipient, value)
+            || ContainsSearchText(message.Subject, value)
+            || ContainsSearchText(message.Cc, value)
+            || ContainsSearchText(message.MessageId, value)
+            || ContainsSearchText(message.InReplyTo, value);
+    }
+
+    private static bool HeaderBlockContains(string? rawHeaders, string value)
+    {
+        if (string.IsNullOrEmpty(rawHeaders))
+            return false;
+        if (ContainsSearchText(rawHeaders, value))
+            return true;
+
+        using var reader = new StringReader(rawHeaders);
+        var unfolded = new StringBuilder(rawHeaders.Length);
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (line.Length == 0)
+                break;
+
+            if (line[0] is ' ' or '\t')
+            {
+                unfolded.Append(' ').Append(line.Trim());
+            }
+            else
+            {
+                if (unfolded.Length > 0)
+                    unfolded.Append('\n');
+                unfolded.Append(line);
+            }
+        }
+
+        return ContainsSearchText(unfolded.ToString(), value);
+    }
+
+    private static bool HasKeyword(SearchStoredMessage message, string keyword) =>
+        keyword.ToUpperInvariant() switch
+        {
+            "\\SEEN" => message.IsRead,
+            "\\DELETED" => message.IsDeleted,
+            "\\FLAGGED" => message.IsFlagged,
+            "\\DRAFT" => message.IsDraft,
+            "\\ANSWERED" => message.IsAnswered,
+            "\\RECENT" => false,
+            _ => false,
+        };
+
+    private static bool HeaderContains(
+        string? rawHeaders,
+        string headerName,
+        string searchValue)
     {
         if (string.IsNullOrEmpty(rawHeaders))
             return false;
@@ -2922,15 +3697,18 @@ ILogger<ImapServerService> logger) : BackgroundService
         var currentValue = new StringBuilder();
 
         bool CurrentHeaderMatches() => currentName is not null
-            && currentName.Equals(criterion.Name, StringComparison.OrdinalIgnoreCase)
+            && currentName.Equals(headerName, StringComparison.OrdinalIgnoreCase)
             && currentValue.ToString().Contains(
-                criterion.Value,
+                searchValue,
                 StringComparison.OrdinalIgnoreCase);
 
         string? line;
         while ((line = reader.ReadLine()) is not null)
         {
-            if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t'))
+            if (line.Length == 0)
+                break;
+
+            if (line[0] is ' ' or '\t')
             {
                 if (currentName is not null)
                     currentValue.Append(' ').Append(line.Trim());
@@ -2953,253 +3731,79 @@ ILogger<ImapServerService> logger) : BackgroundService
         return CurrentHeaderMatches();
     }
 
-    private static IQueryable<EmailDB> ApplySearchCriteria(
-        IQueryable<EmailDB> query,
-        string criteria,
-        ICollection<HeaderSearchCriterion>? headerCriteria = null)
+    private static bool TryGetSentDate(string? rawHeaders, out DateOnly sentDate)
     {
-        var cleaned = criteria.Replace("(", " ").Replace(")", " ");
-        var tokens = cleaned.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-        for (var i = 0; i < tokens.Length; i++)
+        sentDate = default;
+        if (!TryGetHeaderValue(rawHeaders, "Date", out var dateValue)
+            || !MimeKit.Utils.DateUtils.TryParse(dateValue, out var parsedDate))
         {
-            var token = tokens[i];
-            switch (token)
-            {
-                case "CHARSET" when i + 1 < tokens.Length:
-                    i++;
-                    break;
-                case "ALL":
-                    break;
-                case "SEEN":
-                    query = query.Where(e => e.IsRead);
-                    break;
-                case "UNSEEN":
-                    query = query.Where(e => !e.IsRead);
-                    break;
-                case "DELETED":
-                    query = query.Where(e => e.IsDeleted);
-                    break;
-                case "UNDELETED":
-                    query = query.Where(e => !e.IsDeleted);
-                    break;
-                case "FLAGGED":
-                    query = query.Where(e => e.IsFlagged);
-                    break;
-                case "UNFLAGGED":
-                    query = query.Where(e => !e.IsFlagged);
-                    break;
-                case "DRAFT":
-                    query = query.Where(e => e.IsDraft);
-                    break;
-                case "UNDRAFT":
-                    query = query.Where(e => !e.IsDraft);
-                    break;
-                case "ANSWERED":
-                    query = query.Where(e => e.IsAnswered);
-                    break;
-                case "UNANSWERED":
-                    query = query.Where(e => !e.IsAnswered);
-                    break;
-                case "NEW":
-                    query = query.Where(e => !e.IsRead);
-                    break;
-                case "OLD":
-                    break;
-                case "RECENT":
-                    break;
-                case "SUBJECT" when i + 1 < tokens.Length:
-                    i++;
-                    var subj = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Subject.ToUpper().Contains(subj));
-                    break;
-                case "FROM" when i + 1 < tokens.Length:
-                    i++;
-                    var from = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Sender.ToUpper().Contains(from));
-                    break;
-                case "TO" when i + 1 < tokens.Length:
-                    i++;
-                    var to = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Recipient.ToUpper().Contains(to));
-                    break;
-                case "CC" when i + 1 < tokens.Length:
-                    i++;
-                    var ccVal = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Cc != null && e.Cc.ToUpper().Contains(ccVal));
-                    break;
-                case "BODY" when i + 1 < tokens.Length:
-                    i++;
-                    var bodyText = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Body.ToUpper().Contains(bodyText));
-                    break;
-                case "TEXT" when i + 1 < tokens.Length:
-                    i++;
-                    var text = UnquoteSearchArg(ref i, tokens);
-                    query = query.Where(e => e.Subject.ToUpper().Contains(text)
-                                           || e.Sender.ToUpper().Contains(text)
-                                           || e.Recipient.ToUpper().Contains(text)
-                                           || e.Body.ToUpper().Contains(text)
-                                           || (e.Cc != null && e.Cc.ToUpper().Contains(text)));
-                    break;
-                case "HEADER" when i + 2 < tokens.Length:
-                    i++;
-                    var headerName = tokens[i].ToUpperInvariant();
-                    i++;
-                    var headerVal = UnquoteSearchArg(ref i, tokens);
-                    if (headerCriteria is not null
-                        && headerName is not "FROM" and not "TO" and not "CC"
-                            and not "SUBJECT" and not "MESSAGE-ID" and not "IN-REPLY-TO")
-                    {
-                        headerCriteria.Add(new HeaderSearchCriterion(headerName, headerVal));
-                        break;
-                    }
-
-                    query = headerName switch
-                    {
-                        "FROM" => query.Where(e => e.Sender.ToUpper().Contains(headerVal)),
-                        "TO" => query.Where(e => e.Recipient.ToUpper().Contains(headerVal)),
-                        "CC" => query.Where(e => e.Cc != null && e.Cc.ToUpper().Contains(headerVal)),
-                        "SUBJECT" => query.Where(e => e.Subject.ToUpper().Contains(headerVal)),
-                        "MESSAGE-ID" => query.Where(e => e.MessageId != null && e.MessageId.ToUpper().Contains(headerVal)),
-                        "IN-REPLY-TO" => query.Where(e => e.InReplyTo != null && e.InReplyTo.ToUpper().Contains(headerVal)),
-                        _ => query.Where(e => e.RawHeaders != null
-                            && (e.RawHeaders.ToUpper().StartsWith(headerName + ":")
-                                || e.RawHeaders.ToUpper().Contains("\n" + headerName + ":"))
-                            && e.RawHeaders.ToUpper().Contains(headerVal)),
-                    };
-                    break;
-                case "SINCE" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var sinceDate))
-                        query = query.Where(e => e.ReceivedAt >= sinceDate);
-                    break;
-                case "BEFORE" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var beforeDate))
-                        query = query.Where(e => e.ReceivedAt < beforeDate);
-                    break;
-                case "ON" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var onDate))
-                    {
-                        var nextDay = onDate.AddDays(1);
-                        query = query.Where(e => e.ReceivedAt >= onDate && e.ReceivedAt < nextDay);
-                    }
-                    break;
-                case "SENTSINCE" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var sentSince))
-                        query = query.Where(e => e.ReceivedAt >= sentSince);
-                    break;
-                case "SENTBEFORE" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var sentBefore))
-                        query = query.Where(e => e.ReceivedAt < sentBefore);
-                    break;
-                case "SENTON" when i + 1 < tokens.Length:
-                    i++;
-                    if (TryParseImapDate(tokens[i], out var sentOn))
-                    {
-                        var sentNextDay = sentOn.AddDays(1);
-                        query = query.Where(e => e.ReceivedAt >= sentOn && e.ReceivedAt < sentNextDay);
-                    }
-                    break;
-                case "LARGER" when i + 1 < tokens.Length:
-                    i++;
-                    if (int.TryParse(tokens[i], out var larger))
-                        query = query.Where(e => e.SizeBytes > larger);
-                    break;
-                case "SMALLER" when i + 1 < tokens.Length:
-                    i++;
-                    if (int.TryParse(tokens[i], out var smaller))
-                        query = query.Where(e => e.SizeBytes < smaller);
-                    break;
-                case "UID" when i + 1 < tokens.Length:
-                    i++;
-                    var uidSetStr = tokens[i];
-                    var uidParts = ParseUidSetForSearch(uidSetStr);
-                    if (uidParts is not null)
-                        query = query.Where(e => uidParts.Contains(e.Uid));
-                    break;
-                case "NOT" when i + 1 < tokens.Length:
-                    i++;
-                    query = tokens[i] switch
-                    {
-                        "SEEN" => query.Where(e => !e.IsRead),
-                        "UNSEEN" => query.Where(e => e.IsRead),
-                        "DELETED" => query.Where(e => !e.IsDeleted),
-                        "FLAGGED" => query.Where(e => !e.IsFlagged),
-                        "DRAFT" => query.Where(e => !e.IsDraft),
-                        "ANSWERED" => query.Where(e => !e.IsAnswered),
-                        _ => query,
-                    };
-                    break;
-                case "OR" when i + 2 < tokens.Length:
-                    // simplified: skip OR and let both sub-criteria be applied as AND
-                    // full OR would require expression tree merging
-                    break;
-                case "KEYWORD" when i + 1 < tokens.Length:
-                    i++;
-                    break;
-                case "UNKEYWORD" when i + 1 < tokens.Length:
-                    i++;
-                    break;
-                case "MODSEQ" when i + 1 < tokens.Length:
-                    i++;
-                    if (long.TryParse(tokens[i], out var modSeqVal))
-                        query = query.Where(e => e.ModSeq >= modSeqVal);
-                    break;
-                default:
-                    // ignore unknown criteria gracefully
-                    break;
-            }
+            return false;
         }
 
-        return query;
+        sentDate = DateOnly.FromDateTime(parsedDate.Date);
+        return true;
+    }
 
-        static string UnquoteSearchArg(ref int idx, string[] tokens)
+    private static bool TryGetHeaderValue(
+        string? rawHeaders,
+        string headerName,
+        out string value)
+    {
+        value = string.Empty;
+        if (string.IsNullOrEmpty(rawHeaders))
+            return false;
+
+        using var reader = new StringReader(rawHeaders);
+        string? currentName = null;
+        string? matchedValue = null;
+        var currentValue = new StringBuilder();
+
+        bool TryUseCurrentHeader()
         {
-            var val = tokens[idx];
-            if (val.StartsWith('"'))
+            if (currentName is null
+                || !currentName.Equals(headerName, StringComparison.OrdinalIgnoreCase))
             {
-                val = val.TrimStart('"');
-                while (!val.EndsWith('"') && idx + 1 < tokens.Length)
-                {
-                    idx++;
-                    val += " " + tokens[idx];
-                }
-                val = val.TrimEnd('"');
+                return false;
             }
-            return val;
+
+            matchedValue = currentValue.ToString();
+            return true;
         }
 
-        static List<int>? ParseUidSetForSearch(string uidSet)
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
         {
-            var result = new List<int>();
-            foreach (var part in uidSet.Split(','))
+            if (line.Length == 0)
+                break;
+
+            if (line[0] is ' ' or '\t')
             {
-                if (part.Contains(':'))
-                {
-                    var range = part.Split(':', 2);
-                    if (!int.TryParse(range[0], out var start) || !int.TryParse(range[1], out var end))
-                        return null;
-                    if (start > end) (start, end) = (end, start);
-                    if (end - start > 10000) return null;
-                    for (var n = start; n <= end; n++)
-                        result.Add(n);
-                }
-                else if (part == "*")
-                {
-                    return null;
-                }
-                else if (int.TryParse(part, out var num))
-                {
-                    result.Add(num);
-                }
+                if (currentName is not null)
+                    currentValue.Append(' ').Append(line.Trim());
+                continue;
             }
-            return result;
+
+            if (TryUseCurrentHeader())
+            {
+                value = matchedValue!;
+                return true;
+            }
+
+            currentName = null;
+            currentValue.Clear();
+            var separator = line.IndexOf(':');
+            if (separator <= 0)
+                continue;
+
+            currentName = line[..separator].Trim();
+            currentValue.Append(line[(separator + 1)..].Trim());
         }
+
+        if (!TryUseCurrentHeader())
+            return false;
+
+        value = matchedValue!;
+        return true;
     }
 
     private static bool TryParseImapDate(string dateStr, out DateTime result)
@@ -3232,10 +3836,8 @@ ILogger<ImapServerService> logger) : BackgroundService
         return (null, args);
     }
 
-    private static string BuildEsearchResult(string[] returnOpts, List<int> numbers, bool useUid)
+    private static string BuildEsearchResult(string[] returnOpts, List<int> numbers)
     {
-        if (numbers.Count == 0) return "";
-
         var parts = new List<string>();
         var opts = new HashSet<string>(returnOpts.Select(o => o.ToUpperInvariant()));
 
@@ -3243,19 +3845,38 @@ ILogger<ImapServerService> logger) : BackgroundService
         if (opts.Count == 0)
             opts.Add("ALL");
 
-        if (opts.Contains("MIN"))
+        if (opts.Contains("MIN") && numbers.Count > 0)
             parts.Add($"MIN {numbers[0]}");
-        if (opts.Contains("MAX"))
+        if (opts.Contains("MAX") && numbers.Count > 0)
             parts.Add($"MAX {numbers[^1]}");
         if (opts.Contains("COUNT"))
             parts.Add($"COUNT {numbers.Count}");
-        if (opts.Contains("ALL"))
+        if (opts.Contains("ALL") && numbers.Count > 0)
             parts.Add($"ALL {FormatUidRange(numbers)}");
 
         return string.Join(' ', parts);
     }
 
     private async Task HandleSortAsync(
+        StreamWriter writer, string tag, string args, ImapSession session, bool useUid, CancellationToken ct)
+    {
+        if (!_searchCommandLimiter.Wait(0))
+        {
+            await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent search commands");
+            return;
+        }
+
+        try
+        {
+            await HandleSortCoreAsync(writer, tag, args, session, useUid, ct);
+        }
+        finally
+        {
+            _searchCommandLimiter.Release();
+        }
+    }
+
+    private async Task HandleSortCoreAsync(
         StreamWriter writer, string tag, string args, ImapSession session, bool useUid, CancellationToken ct)
     {
         var openParen = args.IndexOf('(');
@@ -3267,22 +3888,45 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
 
         var sortCriteria = args[(openParen + 1)..closeParen]
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Select(criterion => criterion.ToUpperInvariant())
+            .ToArray();
         var rest = args[(closeParen + 1)..].Trim();
 
         var charsetSpaceIdx = rest.IndexOf(' ');
-        var searchCriteria = charsetSpaceIdx > 0 ? rest[(charsetSpaceIdx + 1)..].Trim() : "ALL";
+        if (charsetSpaceIdx <= 0 || string.IsNullOrWhiteSpace(rest[(charsetSpaceIdx + 1)..]))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Syntax error");
+            return;
+        }
+
+        var searchCriteria = $"CHARSET {rest[..charsetSpaceIdx]} {rest[(charsetSpaceIdx + 1)..].Trim()}";
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
+            : null;
 
-        var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        query = ApplySearchCriteria(query, searchCriteria.ToUpperInvariant());
+        var folderQuery = db.Emails
+            .AsNoTracking()
+            .Where(email => email.FolderId == session.SelectedFolderId!.Value);
+        var searchResult = await FindSearchCandidatesAsync(folderQuery, searchCriteria, ct);
+        if (searchResult.FailureResponse is not null)
+        {
+            await writer.WriteLineAsync($"{tag} {searchResult.FailureResponse}");
+            return;
+        }
+
+        var matchedIds = searchResult.Matches.Select(candidate => candidate.Id).ToArray();
+        var query = folderQuery.Where(email => matchedIds.Contains(email.Id));
         query = ApplySortCriteria(query, sortCriteria);
 
         if (useUid)
         {
             var uids = await query.Select(e => e.Uid).ToListAsync(ct);
+            if (transaction is not null)
+                await transaction.CommitAsync(ct);
             var result = string.Join(' ', uids);
             await writer.WriteLineAsync($"* SORT {result}");
             await writer.WriteLineAsync($"{tag} OK UID SORT completed");
@@ -3290,19 +3934,12 @@ ILogger<ImapServerService> logger) : BackgroundService
         else
         {
             var sortedIds = await query.Select(e => e.Id).ToListAsync(ct);
-            var allEmails = await db.Emails
-                .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-                .OrderBy(e => e.Uid)
-                .Select(e => e.Id)
-                .ToListAsync(ct);
-
-            var seqNums = new List<int>();
-            foreach (var id in sortedIds)
-            {
-                var idx = allEmails.IndexOf(id);
-                if (idx >= 0)
-                    seqNums.Add(idx + 1);
-            }
+            if (transaction is not null)
+                await transaction.CommitAsync(ct);
+            var sequenceById = searchResult.Matches.ToDictionary(
+                candidate => candidate.Id,
+                candidate => candidate.SequenceNumber);
+            var seqNums = sortedIds.Select(id => sequenceById[id]).ToList();
 
             var result = string.Join(' ', seqNums);
             await writer.WriteLineAsync($"* SORT {result}");
@@ -3311,6 +3948,25 @@ ILogger<ImapServerService> logger) : BackgroundService
     }
 
     private async Task HandleThreadAsync(
+        StreamWriter writer, string tag, string args, ImapSession session, bool useUid, CancellationToken ct)
+    {
+        if (!_searchCommandLimiter.Wait(0))
+        {
+            await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent search commands");
+            return;
+        }
+
+        try
+        {
+            await HandleThreadCoreAsync(writer, tag, args, session, useUid, ct);
+        }
+        finally
+        {
+            _searchCommandLimiter.Release();
+        }
+    }
+
+    private async Task HandleThreadCoreAsync(
         StreamWriter writer, string tag, string args, ImapSession session, bool useUid, CancellationToken ct)
     {
         var spaceIdx = args.IndexOf(' ');
@@ -3324,7 +3980,13 @@ ILogger<ImapServerService> logger) : BackgroundService
         var rest = args[(spaceIdx + 1)..].Trim();
 
         var charsetSpaceIdx = rest.IndexOf(' ');
-        var searchCriteria = charsetSpaceIdx > 0 ? rest[(charsetSpaceIdx + 1)..].Trim() : "ALL";
+        if (charsetSpaceIdx <= 0 || string.IsNullOrWhiteSpace(rest[(charsetSpaceIdx + 1)..]))
+        {
+            await writer.WriteLineAsync($"{tag} BAD Syntax error");
+            return;
+        }
+
+        var searchCriteria = $"CHARSET {rest[..charsetSpaceIdx]} {rest[(charsetSpaceIdx + 1)..].Trim()}";
 
         if (algorithm is not "REFERENCES" and not "ORDEREDSUBJECT")
         {
@@ -3334,16 +3996,32 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead, ct)
+            : null;
 
-        var query = db.Emails.Where(e => e.FolderId == session.SelectedFolderId!.Value);
-        query = ApplySearchCriteria(query, searchCriteria.ToUpperInvariant());
+        var folderQuery = db.Emails
+            .AsNoTracking()
+            .Where(email => email.FolderId == session.SelectedFolderId!.Value);
+        var searchResult = await FindSearchCandidatesAsync(folderQuery, searchCriteria, ct);
+        if (searchResult.FailureResponse is not null)
+        {
+            await writer.WriteLineAsync($"{tag} {searchResult.FailureResponse}");
+            return;
+        }
 
-        var emails = await query
+        var matchedIds = searchResult.Matches.Select(candidate => candidate.Id).ToArray();
+        var identifierById = searchResult.Matches.ToDictionary(
+            candidate => candidate.Id,
+            candidate => useUid ? candidate.Uid : candidate.SequenceNumber);
+
+        var emails = await folderQuery
+            .Where(email => matchedIds.Contains(email.Id))
             .OrderBy(e => e.ReceivedAt)
             .Select(e => new { e.Id, e.Uid, e.MessageId, e.InReplyTo, e.Subject })
             .ToListAsync(ct);
-
-        List<Guid>? allIds = null;
+        if (transaction is not null)
+            await transaction.CommitAsync(ct);
 
         if (algorithm == "REFERENCES")
         {
@@ -3376,7 +4054,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             foreach (var root in roots)
             {
                 BuildThreadTree(sb, root, parentOf, emails.Count,
-                    i => GetSeqNum(i).ToString());
+                    i => identifierById[emails[i].Id].ToString());
             }
 
             var cmdPrefix = useUid ? "UID THREAD" : "THREAD";
@@ -3395,7 +4073,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                 var members = group.OrderBy(e => e.Uid).ToList();
                 if (members.Count == 1)
                 {
-                    var id = GetSeqNum(emails.IndexOf(members[0]));
+                    var id = identifierById[members[0].Id];
                     sb.Append($"({id})");
                 }
                 else
@@ -3403,7 +4081,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                     sb.Append('(');
                     for (var j = 0; j < members.Count; j++)
                     {
-                        var id = GetSeqNum(emails.IndexOf(members[j]));
+                        var id = identifierById[members[j].Id];
                         if (j > 0) sb.Append(' ');
                         sb.Append(id);
                     }
@@ -3414,22 +4092,6 @@ ILogger<ImapServerService> logger) : BackgroundService
             var cmdPrefix = useUid ? "UID THREAD" : "THREAD";
             await writer.WriteLineAsync($"* THREAD {sb}");
             await writer.WriteLineAsync($"{tag} OK {cmdPrefix} completed");
-        }
-
-        return;
-
-        int GetSeqNum(int idx)
-        {
-            if (useUid) return emails[idx].Uid;
-
-            allIds ??= db.Emails
-                .Where(e => e.FolderId == session.SelectedFolderId!.Value)
-                .OrderBy(e => e.Uid)
-                .Select(e => e.Id)
-                .ToList();
-
-            var seqIdx = allIds.IndexOf(emails[idx].Id);
-            return seqIdx >= 0 ? seqIdx + 1 : idx + 1;
         }
     }
 

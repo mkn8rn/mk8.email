@@ -525,6 +525,183 @@ public sealed class TransportSecurityTests
     }
 
     [TestMethod]
+    [Timeout(15_000)]
+    public async Task ImapSearchEvaluatesBooleanGroupsAndBoundedMessageSets()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedInboxMessagesForSearchAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT INBOX");
+
+        string response;
+        do
+        {
+            response = await connection.ReadLineAsync();
+        }
+        while (!response.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync(
+            "a4 UID SEARCH OR SUBJECT MixedCaseSubject SUBJECT \"Other subject\"");
+        Assert.AreEqual("* SEARCH 1 2", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync(
+            "a5 UID SEARCH NOT (OR SUBJECT MixedCaseSubject SUBJECT \"Other subject\")");
+        Assert.AreEqual("* SEARCH 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync(
+            "a6 UID SEARCH SUBJECT \"Third \\\"quoted\\\" subject\"");
+        Assert.AreEqual("* SEARCH 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync(
+            "a7 UID SEARCH SUBJECT \"Other subject\" NOT FROM third-header@example.net");
+        Assert.AreEqual("* SEARCH 2", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a7 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a8 SEARCH 2:*");
+        Assert.AreEqual("* SEARCH 2 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a8 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a9 UID SEARCH UID 1:2147483647");
+        Assert.AreEqual("* SEARCH 1 2 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a9 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync(
+            "a10 UID SEARCH RETURN (MIN MAX COUNT ALL) SUBJECT absent-marker");
+        Assert.AreEqual("* ESEARCH (TAG \"a10\") UID COUNT 0", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a10 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a11 SEARCH RETURN (MIN MAX COUNT ALL) ALL");
+        Assert.AreEqual(
+            "* ESEARCH (TAG \"a11\") MIN 1 MAX 3 COUNT 3 ALL 1:3",
+            await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a11 OK", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(15_000)]
+    public async Task ImapSearchUsesHeaderBodyInternalAndSentDateSemantics()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedInboxMessagesForSearchAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT INBOX");
+
+        string response;
+        do
+        {
+            response = await connection.ReadLineAsync();
+        }
+        while (!response.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a4 UID SEARCH HEADER X-Unrelated mixedmarker42");
+        Assert.AreEqual("* SEARCH 2", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a5 UID SEARCH TEXT \"prefix mixedmarker42\"");
+        Assert.AreEqual("* SEARCH 1", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a6 UID SEARCH BODY body-only-needle");
+        Assert.AreEqual("* SEARCH 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a7 UID SEARCH FROM third-header@example.net");
+        Assert.AreEqual("* SEARCH 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a7 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a8 UID SEARCH BCC hidden@example.net");
+        Assert.AreEqual("* SEARCH 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a8 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a9 UID SEARCH SENTON 5-Feb-2026");
+        Assert.AreEqual("* SEARCH 1", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a9 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a10 UID SEARCH ON 2-Jan-2026");
+        Assert.AreEqual("* SEARCH 2", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a10 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a11 UID SEARCH NEW");
+        Assert.AreEqual("* SEARCH", (await connection.ReadLineAsync()).TrimEnd());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a11 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a12 UID SEARCH RECENT");
+        Assert.AreEqual("* SEARCH", (await connection.ReadLineAsync()).TrimEnd());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a12 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a13 UID SEARCH OLD");
+        Assert.AreEqual("* SEARCH 1 2 3", await connection.ReadLineAsync());
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a13 OK", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(15_000)]
+    public async Task ImapSearchRejectsInvalidCriteriaAndKeepsTheConnectionUsable()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedInboxMessagesForSearchAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT INBOX");
+
+        string response;
+        do
+        {
+            response = await connection.ReadLineAsync();
+        }
+        while (!response.StartsWith("a3 ", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a4 UID SEARCH CHARSET UTF-8 ALL");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith(
+            "a4 NO [BADCHARSET (US-ASCII)]",
+            StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a5 UID SEARCH UNKNOWN-CRITERION");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a5 BAD", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a6 UID SEARCH OR SUBJECT one");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a6 BAD", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a7 UID SEARCH NOT (ALL");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a7 BAD", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a8 UID SEARCH SINCE invalid-date");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a8 BAD", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a9 NOOP");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a9 OK", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     [Timeout(10_000)]
     public async Task ImapAppendPreservesLiteralOctetsAndLeadingBodyLines()
     {
@@ -1266,8 +1443,9 @@ public sealed class TransportSecurityTests
                     Subject = "MixedCaseSubject",
                     Body = "first body\r\n",
                     RawHeaders =
-                        "From: sender@example.net\r\n" +
+                        "From: first-header@example.net\r\n" +
                         $"To: {TestUsername}\r\n" +
+                        "Date: Thu, 5 Feb 2026 23:30:00 +1400\r\n" +
                         "Subject: MixedCaseSubject\r\n" +
                         "X-Mk8-Test: prefix\r\n\tMiXeDMarker42",
                     SizeBytes = 180,
@@ -1284,8 +1462,9 @@ public sealed class TransportSecurityTests
                     Subject = "Other subject",
                     Body = "second body\r\n",
                     RawHeaders =
-                        "From: sender@example.net\r\n" +
+                        "From: second-header@example.net\r\n" +
                         $"To: {TestUsername}\r\n" +
+                        "Date: Fri, 6 Feb 2026 00:15:00 +0000\r\n" +
                         "Subject: Other subject\r\n" +
                         "X-Mk8-Test: another value\r\n" +
                         "X-Unrelated: MiXeDMarker42",
@@ -1294,8 +1473,28 @@ public sealed class TransportSecurityTests
                     ModSeq = 2,
                     FolderId = folder.Id,
                     ReceivedAt = new DateTime(2026, 1, 2, 0, 0, 0, DateTimeKind.Utc),
+                },
+                new EmailDB
+                {
+                    Id = Guid.CreateVersion7(),
+                    Sender = "envelope@example.net",
+                    Recipient = TestUsername,
+                    Subject = "Third \"quoted\" subject",
+                    Body = "body-only-needle\r\n",
+                    RawHeaders =
+                        "From: third-header@example.net\r\n" +
+                        $"To: {TestUsername}\r\n" +
+                        "Bcc: hidden@example.net\r\n" +
+                        "Date: Sat, 7 Feb 2026 12:00:00 -1000\r\n" +
+                        "Subject: Third \"quoted\" subject\r\n" +
+                        "X-Header-Only: header-only-needle",
+                    SizeBytes = 200,
+                    Uid = 3,
+                    ModSeq = 3,
+                    FolderId = folder.Id,
+                    ReceivedAt = new DateTime(2026, 1, 3, 0, 0, 0, DateTimeKind.Utc),
                 });
-            folder.NextUid = 3;
+            folder.NextUid = 4;
             await database.SaveChangesAsync();
         }
 
