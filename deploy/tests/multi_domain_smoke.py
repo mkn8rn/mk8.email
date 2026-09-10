@@ -39,6 +39,25 @@ def new_message(sender: str, recipient: str, marker: str) -> EmailMessage:
     return value
 
 
+def new_search_message(
+    sender: str,
+    recipient: str,
+    marker: str,
+    subject_token: str,
+    body_token: str,
+    sent_date: str,
+) -> EmailMessage:
+    value = EmailMessage()
+    value["From"] = sender
+    value["To"] = recipient
+    value["Date"] = sent_date
+    value["Subject"] = f"mk8.email search {subject_token}"
+    value["X-Mk8-Multi-Domain-Test"] = marker
+    value["X-Mk8-Search-Only"] = f"header-{marker}"
+    value.set_content(f"Search body {body_token}.")
+    return value
+
+
 def require_recipient_rejected(recipient: str) -> None:
     with smtplib.SMTP(INBOUND_HOST, 25, timeout=20) as client:
         client.ehlo("probe.debian.org")
@@ -280,6 +299,101 @@ def test_move_tombstone(account: str, password: str) -> None:
         delete_marker(account, password, "INBOX", marker)
 
 
+def test_search(account: str, password: str) -> None:
+    first_marker = uuid.uuid4().hex
+    second_marker = uuid.uuid4().hex
+    first_subject = f"subject{uuid.uuid4().hex}"
+    second_subject = f"subject{uuid.uuid4().hex}"
+    body_token = f"body{uuid.uuid4().hex}"
+    try:
+        send_inbound(
+            new_search_message(
+                "first-search@debian.org",
+                account,
+                first_marker,
+                first_subject,
+                body_token,
+                "Mon, 2 Feb 2037 23:30:00 +1400",
+            )
+        )
+        send_inbound(
+            new_search_message(
+                "second-search@debian.org",
+                account,
+                second_marker,
+                second_subject,
+                "otherbody",
+                "Tue, 3 Feb 2037 00:30:00 +0000",
+            )
+        )
+        wait_for_message(account, password, first_marker, delete=False)
+        wait_for_message(account, password, second_marker, delete=False)
+
+        with imaplib.IMAP4_SSL(
+            LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20
+        ) as client:
+            client.login(account, password)
+            require(client.select("INBOX")[0] == "OK", "IMAP could not select the search source.")
+            first_identifiers = find_message_identifiers(client, first_marker)
+            second_identifiers = find_message_identifiers(client, second_marker)
+            require(len(first_identifiers) == 1, "The first SEARCH source is not unique.")
+            require(len(second_identifiers) == 1, "The second SEARCH source is not unique.")
+            expected = {first_identifiers[0], second_identifiers[0]}
+
+            status, data = client.uid(
+                "SEARCH",
+                None,
+                "OR",
+                "SUBJECT",
+                first_subject,
+                "SUBJECT",
+                second_subject,
+            )
+            require(status == "OK", "The Boolean UID SEARCH failed.")
+            require(set(data[0].split()) == expected, "The Boolean UID SEARCH result is wrong.")
+
+            status, data = client.uid("SEARCH", None, "BODY", body_token)
+            require(status == "OK", "The body UID SEARCH failed.")
+            require(
+                data[0].split() == first_identifiers,
+                "BODY did not find only the selected message.",
+            )
+
+            status, data = client.uid(
+                "SEARCH", None, "TEXT", f"header-{first_marker}"
+            )
+            require(status == "OK", "The header-text UID SEARCH failed.")
+            require(
+                data[0].split() == first_identifiers,
+                "TEXT did not find only the selected message header.",
+            )
+
+            status, data = client.uid("SEARCH", None, "SENTON", "2-Feb-2037")
+            require(status == "OK", "The sent-date UID SEARCH failed.")
+            require(
+                data[0].split() == first_identifiers,
+                "SENTON did not use the Date header date.",
+            )
+
+            status, data = client.uid("SEARCH", None, "UID", "1:2147483647")
+            require(status == "OK", "The bounded UID SEARCH failed.")
+            require(expected.issubset(set(data[0].split())), "The bounded UID SEARCH lost test data.")
+
+            status, data = client.uid("SEARCH", None, "NEW")
+            require(status == "OK" and not data[0].split(), "NEW returned a non-recent message.")
+
+            status, response = client.uid("SEARCH", "CHARSET", "UTF-8", "ALL")
+            response_text = b" ".join(item for item in response if isinstance(item, bytes))
+            require(
+                status == "NO" and b"BADCHARSET" in response_text,
+                "UID SEARCH accepted an unsupported charset.",
+            )
+            require(client.noop()[0] == "OK", "SEARCH failure closed the IMAP connection.")
+    finally:
+        delete_marker(account, password, "INBOX", first_marker)
+        delete_marker(account, password, "INBOX", second_marker)
+
+
 def require_sender_mismatch_rejected(account: str, password: str) -> None:
     with smtplib.SMTP(LOCAL_HOST, 587, timeout=30) as client:
         client.ehlo("probe.debian.org")
@@ -318,6 +432,7 @@ def test_active(domain: str, account: str, password: str, selector: str) -> None
     require_sender_mismatch_rejected(account, password)
     test_copy_quota(account, password)
     test_move_tombstone(account, password)
+    test_search(account, password)
 
 
 def main() -> None:
@@ -339,7 +454,7 @@ def main() -> None:
 
     require(arguments.selector is not None, "The active test requires a DKIM selector.")
     test_active(arguments.domain, arguments.account, password, arguments.selector)
-    print("The second domain passed delivery, catch-all, login, sender, DKIM, COPY, and MOVE tests.")
+    print("The second domain passed delivery, catch-all, login, sender, DKIM, COPY, MOVE, and SEARCH tests.")
 
 
 if __name__ == "__main__":
