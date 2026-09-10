@@ -223,6 +223,7 @@ public class SmtpServerService(
 
         while (!timeout.IsCancellationRequested)
         {
+            timeout.CancelAfter(TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds));
             var maximumLineLength = session.InDataMode
                 ? Math.Min(config.MaxMessageSizeBytes, MaximumDataLineCharacters)
                 : MaximumCommandLineCharacters;

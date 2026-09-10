@@ -70,6 +70,24 @@ public sealed class TransportSecurityTests
 
     [TestMethod]
     [Timeout(10_000)]
+    public async Task SmtpRefreshesConnectionTimeoutAfterClientActivity()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(smtpPort: port, connectionTimeoutSeconds: 2);
+        await using var server = await ServerFixture.StartSmtpAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("220 ", StringComparison.Ordinal));
+        for (var index = 0; index < 5; index++)
+        {
+            await Task.Delay(550);
+            await connection.WriteLineAsync("NOOP");
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("250 ", StringComparison.Ordinal));
+        }
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
     public async Task SmtpStartTlsAdvertisesAuthenticationOnlyAfterUpgrade()
     {
         var port = ReservePort();
@@ -423,6 +441,25 @@ public sealed class TransportSecurityTests
 
         await connection.WriteLineAsync("a2 LOGIN user password");
         StringAssert.Contains(await connection.ReadLineAsync(), "[PRIVACYREQUIRED]");
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapRefreshesConnectionTimeoutAfterClientActivity()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port, connectionTimeoutSeconds: 2);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("* OK", StringComparison.Ordinal));
+        for (var index = 0; index < 5; index++)
+        {
+            await Task.Delay(550);
+            var tag = $"a{index}";
+            await connection.WriteLineAsync($"{tag} NOOP");
+            Assert.IsTrue((await connection.ReadLineAsync()).StartsWith($"{tag} OK", StringComparison.Ordinal));
+        }
     }
 
     [TestMethod]
@@ -1142,7 +1179,8 @@ public sealed class TransportSecurityTests
     private EnvironmentConfig CreateEnvironment(
         int? smtpPort = null,
         int? submissionPort = null,
-        int? imapPort = null)
+        int? imapPort = null,
+        int connectionTimeoutSeconds = 10)
     {
         return new EnvironmentConfig
         {
@@ -1174,7 +1212,7 @@ public sealed class TransportSecurityTests
             {
                 MaxMessageSizeBytes = 65_536,
                 MaxRecipientsPerMessage = 100,
-                ConnectionTimeoutSeconds = 10,
+                ConnectionTimeoutSeconds = connectionTimeoutSeconds,
                 MaxConnectionsPerIp = 10,
             },
         };

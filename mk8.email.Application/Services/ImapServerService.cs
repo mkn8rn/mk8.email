@@ -211,6 +211,7 @@ ILogger<ImapServerService> logger) : BackgroundService
 
         while (!timeout.IsCancellationRequested && session.State != ImapState.Logout)
         {
+            timeout.CancelAfter(TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds));
             var lineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
             if (lineResult.IsTooLong)
             {
