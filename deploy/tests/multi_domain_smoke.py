@@ -4,6 +4,7 @@ import imaplib
 import re
 import smtplib
 import ssl
+import subprocess
 import time
 import uuid
 from email.message import EmailMessage
@@ -70,28 +71,151 @@ def send_submission(value: EmailMessage, account: str, password: str) -> None:
         client.send_message(value)
 
 
-def wait_for_message(account: str, password: str, marker: str) -> bytes:
+def find_message_identifiers(client: imaplib.IMAP4_SSL, marker: str) -> list[bytes]:
+    status, data = client.uid(
+        "SEARCH", None, "HEADER", "X-Mk8-Multi-Domain-Test", marker
+    )
+    require(status == "OK", "The IMAP test search failed.")
+    return data[0].split()
+
+
+def wait_for_message(
+    account: str,
+    password: str,
+    marker: str,
+    delete: bool = True,
+) -> bytes:
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
             client.login(account, password)
             status, _ = client.select("INBOX")
             require(status == "OK", "IMAP could not select the test inbox.")
-            status, data = client.uid(
-                "SEARCH", None, "HEADER", "X-Mk8-Multi-Domain-Test", marker
-            )
-            require(status == "OK", "The IMAP test search failed.")
-            identifiers = data[0].split()
+            identifiers = find_message_identifiers(client, marker)
             if identifiers:
                 identifier = identifiers[-1]
                 status, content = client.uid("FETCH", identifier, "(BODY.PEEK[])")
                 require(status == "OK", "The IMAP test fetch failed.")
                 raw = next(item[1] for item in content if isinstance(item, tuple))
-                client.uid("STORE", identifier, "+FLAGS.SILENT", "(\\Deleted)")
-                client.expunge()
+                if delete:
+                    client.uid("STORE", identifier, "+FLAGS.SILENT", "(\\Deleted)")
+                    client.expunge()
                 return raw
         time.sleep(1)
     raise RuntimeError("The expected multi-domain message was not delivered.")
+
+
+def database_value(query: str) -> str:
+    result = subprocess.run(
+        [
+            "runuser",
+            "-u",
+            "postgres",
+            "--",
+            "psql",
+            "--dbname=mk8email",
+            "--no-psqlrc",
+            "--quiet",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            query,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return result.stdout.strip()
+
+
+def quota_state(account: str, marker: str) -> tuple[int, int, int]:
+    require(
+        re.fullmatch(r"[a-z0-9][a-z0-9@._-]*", account) is not None,
+        "The quota test account is not safe.",
+    )
+    require(marker.isascii() and marker.isalnum(), "The quota marker is not safe.")
+    value = database_value(
+        "SELECT u.quota_bytes || '|' || "
+        "COALESCE((SELECT SUM(e.size_bytes) FROM emails e "
+        "JOIN folders f ON f.id = e.folder_id "
+        "JOIN inboxes i ON i.id = f.inbox_id WHERE i.owner_id = u.id), 0) || '|' || "
+        "COALESCE((SELECT e.size_bytes FROM emails e "
+        "JOIN folders f ON f.id = e.folder_id "
+        "JOIN inboxes i ON i.id = f.inbox_id "
+        f"WHERE i.owner_id = u.id AND e.raw_headers LIKE '%{marker}%' "
+        "ORDER BY e.received_at DESC LIMIT 1), -1) "
+        f"FROM users u WHERE u.username = '{account}'"
+    )
+    parts = value.split("|")
+    require(
+        len(parts) == 3 and all(part.isdecimal() for part in parts),
+        "The quota state is not valid.",
+    )
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def set_user_quota(account: str, quota_bytes: int) -> None:
+    require(quota_bytes >= 0, "The test quota is not valid.")
+    result = database_value(
+        f"UPDATE users SET quota_bytes = {quota_bytes} WHERE username = '{account}'; "
+        f"SELECT quota_bytes FROM users WHERE username = '{account}'"
+    )
+    require(result == str(quota_bytes), "The test quota did not change.")
+
+
+def delete_marker(account: str, password: str, folder: str, marker: str) -> None:
+    with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
+        client.login(account, password)
+        status, _ = client.select(folder)
+        require(status == "OK", f"IMAP could not select {folder} for cleanup.")
+        for identifier in find_message_identifiers(client, marker):
+            client.uid("STORE", identifier, "+FLAGS.SILENT", "(\\Deleted)")
+        client.expunge()
+
+
+def test_copy_quota(account: str, password: str) -> None:
+    marker = uuid.uuid4().hex
+    original_quota = None
+    try:
+        send_inbound(new_message("probe@debian.org", account, marker))
+        source_content = wait_for_message(account, password, marker, delete=False)
+        original_quota, used_bytes, source_bytes = quota_state(account, marker)
+        require(source_bytes > 0 and used_bytes >= source_bytes, "The source size is not valid.")
+
+        with imaplib.IMAP4_SSL(LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20) as client:
+            client.login(account, password)
+            require(client.select("INBOX")[0] == "OK", "IMAP could not select the copy source.")
+            source_identifiers = find_message_identifiers(client, marker)
+            require(len(source_identifiers) == 1, "The copy source is not unique.")
+            source_identifier = source_identifiers[0]
+
+            set_user_quota(account, used_bytes)
+            status, response = client.uid("COPY", source_identifier, "Trash")
+            response_text = b" ".join(item for item in response if isinstance(item, bytes))
+            require(
+                status == "NO" and b"[OVERQUOTA]" in response_text,
+                "UID COPY did not reject the over-quota request.",
+            )
+
+            set_user_quota(account, used_bytes + source_bytes)
+            status, _ = client.uid("COPY", source_identifier, "Trash")
+            require(status == "OK", "UID COPY rejected the exact quota boundary.")
+
+            require(client.select("Trash")[0] == "OK", "IMAP could not select the copy target.")
+            destination_identifiers = find_message_identifiers(client, marker)
+            require(len(destination_identifiers) == 1, "The copied message is not unique.")
+            status, content = client.uid(
+                "FETCH", destination_identifiers[0], "(BODY.PEEK[])"
+            )
+            require(status == "OK", "The copied message could not be fetched.")
+            copied_content = next(item[1] for item in content if isinstance(item, tuple))
+            require(copied_content == source_content, "UID COPY changed the message content.")
+    finally:
+        if original_quota is not None:
+            set_user_quota(account, original_quota)
+        delete_marker(account, password, "Trash", marker)
+        delete_marker(account, password, "INBOX", marker)
 
 
 def require_sender_mismatch_rejected(account: str, password: str) -> None:
@@ -130,6 +254,7 @@ def test_active(domain: str, account: str, password: str, selector: str) -> None
         "Rspamd did not use the second domain selector.",
     )
     require_sender_mismatch_rejected(account, password)
+    test_copy_quota(account, password)
 
 
 def main() -> None:
@@ -151,7 +276,7 @@ def main() -> None:
 
     require(arguments.selector is not None, "The active test requires a DKIM selector.")
     test_active(arguments.domain, arguments.account, password, arguments.selector)
-    print("The second domain passed delivery, catch-all, login, sender, and DKIM tests.")
+    print("The second domain passed delivery, catch-all, login, sender, DKIM, and COPY tests.")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     private const int MaximumCommandLineCharacters = 16 * 1024;
     private const int MaximumAuthenticationLineCharacters = 4096;
     private const int MaximumConcurrentConnections = 256;
-    private const int MaximumConcurrentAppendTransactions = 2;
+    private const int MaximumConcurrentMessageWriteCommands = 2;
     private const int MaximumConcurrentFetchCommands = 4;
     private const int MaximumMultiAppendMessages = 20;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
@@ -57,9 +57,9 @@ ILogger<ImapServerService> logger) : BackgroundService
     private enum SessionUpgrade { None, StartTls, Compress }
 
     private readonly ConnectionLimiter _connectionLimiter = new(MaximumConcurrentConnections);
-    private readonly SemaphoreSlim _appendTransactionLimiter = new(
-        MaximumConcurrentAppendTransactions,
-        MaximumConcurrentAppendTransactions);
+    private readonly SemaphoreSlim _messageWriteCommandLimiter = new(
+        MaximumConcurrentMessageWriteCommands,
+        MaximumConcurrentMessageWriteCommands);
     private readonly SemaphoreSlim _fetchCommandLimiter = new(
         MaximumConcurrentFetchCommands,
         MaximumConcurrentFetchCommands);
@@ -1428,7 +1428,47 @@ ILogger<ImapServerService> logger) : BackgroundService
         await writer.WriteLineAsync($"{tag} OK EXPUNGE completed");
     }
 
-    private async Task HandleCopyAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+    private async Task HandleCopyAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        CancellationToken ct)
+    {
+        await HandleCopyWithLimitAsync(writer, tag, args, session, useUid: false, ct);
+    }
+
+    private async Task HandleCopyWithLimitAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
+    {
+        if (!_messageWriteCommandLimiter.Wait(0))
+        {
+            await writer.WriteLineAsync($"{tag} NO [UNAVAILABLE] Too many concurrent message writes");
+            return;
+        }
+
+        try
+        {
+            await HandleCopyCoreAsync(writer, tag, args, session, useUid, ct);
+        }
+        finally
+        {
+            _messageWriteCommandLimiter.Release();
+        }
+    }
+
+    private async Task HandleCopyCoreAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        bool useUid,
+        CancellationToken ct)
     {
         var spaceIdx = args.IndexOf(' ');
         if (spaceIdx <= 0)
@@ -1437,11 +1477,14 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var sequenceSet = args[..spaceIdx];
+        var messageSet = args[..spaceIdx];
         var destMailbox = UnquoteArg(args[(spaceIdx + 1)..].Trim());
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
+        await using var transaction = db.Database.IsRelational()
+            ? await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct)
+            : null;
 
         var destFolder = await ResolveFolderAsync(db, session.UserId, destMailbox, ct);
         if (destFolder is null)
@@ -1450,50 +1493,43 @@ ILogger<ImapServerService> logger) : BackgroundService
             return;
         }
 
-        var emails = await GetFullEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var selected = ResolveSequenceSet(sequenceSet, emails.Count);
-
-        var srcUids = new List<int>();
-        var dstUids = new List<int>();
-
-        foreach (var seqNum in selected)
+        var emails = await GetEmailMetadataInFolderAsync(db, session.SelectedFolderId!.Value, ct);
+        List<EmailDB> selected;
+        if (useUid)
         {
-            if (seqNum < 1 || seqNum > emails.Count) continue;
-            var source = emails[seqNum - 1];
-            var newUid = destFolder.NextUid++;
-            var newModSeq = ++destFolder.HighestModSeq;
-
-            srcUids.Add(source.Uid);
-            dstUids.Add(newUid);
-
-            db.Emails.Add(new EmailDB
-            {
-                Id = Guid.CreateVersion7(),
-                Sender = source.Sender,
-                Recipient = source.Recipient,
-                Subject = source.Subject,
-                Body = source.Body,
-                RawHeaders = source.RawHeaders,
-                SizeBytes = source.SizeBytes,
-                MessageId = source.MessageId,
-                InReplyTo = source.InReplyTo,
-                Cc = source.Cc,
-                EmailObjectId = Guid.CreateVersion7().ToString("N"),
-                ThreadObjectId = source.ThreadObjectId,
-                IsRead = source.IsRead,
-                IsDeleted = false,
-                IsFlagged = source.IsFlagged,
-                IsDraft = source.IsDraft,
-                IsAnswered = source.IsAnswered,
-                ReceivedAt = source.ReceivedAt,
-                Uid = newUid,
-                ModSeq = newModSeq,
-                FolderId = destFolder.Id,
-            });
+            var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
+            selected = emails
+                .Where(email => UidMatchesSet(email.Uid, messageSet, maxUid))
+                .ToList();
+        }
+        else
+        {
+            var sequenceNumbers = ResolveSequenceSet(messageSet, emails.Count).ToHashSet();
+            selected = emails
+                .Where((_, index) => sequenceNumbers.Contains(index + 1))
+                .ToList();
         }
 
-        await db.SaveChangesAsync(ct);
-        await writer.WriteLineAsync($"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] COPY completed");
+        if (!TryGetTotalStoredSize(selected, out var addedBytes))
+        {
+            await writer.WriteLineAsync($"{tag} NO [SERVERBUG] COPY source size is invalid");
+            return;
+        }
+
+        if (selected.Count > 0
+            && !await HasUserQuotaCapacityAsync(db, session.UserId, addedBytes, ct))
+        {
+            await writer.WriteLineAsync($"{tag} NO [OVERQUOTA] COPY exceeds the mailbox quota");
+            return;
+        }
+
+        var (srcUids, dstUids) = await CopyMessagesAsync(db, destFolder, selected, ct);
+        if (transaction is not null)
+            await transaction.CommitAsync(ct);
+
+        var commandName = useUid ? "UID COPY" : "COPY";
+        await writer.WriteLineAsync(
+            $"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] {commandName} completed");
     }
 
     private async Task HandleUidAsync(
@@ -1652,71 +1688,14 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
     }
 
-    private async Task HandleUidCopyAsync(StreamWriter writer, string tag, string args, ImapSession session, CancellationToken ct)
+    private async Task HandleUidCopyAsync(
+        StreamWriter writer,
+        string tag,
+        string args,
+        ImapSession session,
+        CancellationToken ct)
     {
-        var spaceIdx = args.IndexOf(' ');
-        if (spaceIdx <= 0)
-        {
-            await writer.WriteLineAsync($"{tag} BAD Syntax error");
-            return;
-        }
-
-        var uidSet = args[..spaceIdx];
-        var destMailbox = UnquoteArg(args[(spaceIdx + 1)..].Trim());
-
-        using var scope = scopeFactory.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
-
-        var destFolder = await ResolveFolderAsync(db, session.UserId, destMailbox, ct);
-        if (destFolder is null)
-        {
-            await writer.WriteLineAsync($"{tag} NO [TRYCREATE] Destination mailbox not found");
-            return;
-        }
-
-        var emails = await GetFullEmailsInFolderAsync(db, session.SelectedFolderId!.Value, ct);
-        var maxUid = emails.Count > 0 ? emails[^1].Uid : 0;
-
-        var srcUids = new List<int>();
-        var dstUids = new List<int>();
-
-        foreach (var email in emails)
-        {
-            if (!UidMatchesSet(email.Uid, uidSet, maxUid)) continue;
-
-            var newUid = destFolder.NextUid++;
-            var newModSeq = ++destFolder.HighestModSeq;
-            srcUids.Add(email.Uid);
-            dstUids.Add(newUid);
-
-            db.Emails.Add(new EmailDB
-            {
-                Id = Guid.CreateVersion7(),
-                Sender = email.Sender,
-                Recipient = email.Recipient,
-                Subject = email.Subject,
-                Body = email.Body,
-                RawHeaders = email.RawHeaders,
-                SizeBytes = email.SizeBytes,
-                MessageId = email.MessageId,
-                InReplyTo = email.InReplyTo,
-                Cc = email.Cc,
-                EmailObjectId = Guid.CreateVersion7().ToString("N"),
-                ThreadObjectId = email.ThreadObjectId,
-                IsRead = email.IsRead,
-                IsDeleted = false,
-                IsFlagged = email.IsFlagged,
-                IsDraft = email.IsDraft,
-                IsAnswered = email.IsAnswered,
-                ReceivedAt = email.ReceivedAt,
-                Uid = newUid,
-                ModSeq = newModSeq,
-                FolderId = destFolder.Id,
-            });
-        }
-
-        await db.SaveChangesAsync(ct);
-        await writer.WriteLineAsync($"{tag} OK [COPYUID {destFolder.UidValidity} {FormatUidSet(srcUids)} {FormatUidSet(dstUids)}] UID COPY completed");
+        await HandleCopyWithLimitAsync(writer, tag, args, session, useUid: true, ct);
     }
 
     private static async Task HandleEnableAsync(StreamWriter writer, string tag, string args, ImapSession session)
@@ -1872,16 +1851,72 @@ ILogger<ImapServerService> logger) : BackgroundService
             .ToListAsync(ct);
     }
 
-    private static async Task<List<EmailDB>> GetFullEmailsInFolderAsync(
+    private static bool TryGetTotalStoredSize(IReadOnlyList<EmailDB> emails, out long totalBytes)
+    {
+        totalBytes = 0;
+        foreach (var email in emails)
+        {
+            if (email.SizeBytes < 0 || totalBytes > long.MaxValue - email.SizeBytes)
+            {
+                totalBytes = 0;
+                return false;
+            }
+
+            totalBytes += email.SizeBytes;
+        }
+
+        return true;
+    }
+
+    private static async Task<(List<int> SourceUids, List<int> DestinationUids)> CopyMessagesAsync(
         EmailDbContext db,
-        Guid folderId,
+        FolderDB destinationFolder,
+        IReadOnlyList<EmailDB> metadata,
         CancellationToken ct)
     {
-        return await db.Emails
-            .AsNoTracking()
-            .Where(email => email.FolderId == folderId)
-            .OrderBy(email => email.Uid)
-            .ToListAsync(ct);
+        var sourceUids = new List<int>(metadata.Count);
+        var destinationUids = new List<int>(metadata.Count);
+
+        foreach (var item in metadata)
+        {
+            var source = await db.Emails
+                .AsNoTracking()
+                .SingleAsync(email => email.Id == item.Id && email.FolderId == item.FolderId, ct);
+            var newUid = destinationFolder.NextUid++;
+            var newModSeq = ++destinationFolder.HighestModSeq;
+            var copy = new EmailDB
+            {
+                Id = Guid.CreateVersion7(),
+                Sender = source.Sender,
+                Recipient = source.Recipient,
+                Subject = source.Subject,
+                Body = source.Body,
+                RawHeaders = source.RawHeaders,
+                SizeBytes = source.SizeBytes,
+                MessageId = source.MessageId,
+                InReplyTo = source.InReplyTo,
+                Cc = source.Cc,
+                EmailObjectId = Guid.CreateVersion7().ToString("N"),
+                ThreadObjectId = source.ThreadObjectId,
+                IsRead = source.IsRead,
+                IsDeleted = false,
+                IsFlagged = source.IsFlagged,
+                IsDraft = source.IsDraft,
+                IsAnswered = source.IsAnswered,
+                ReceivedAt = source.ReceivedAt,
+                Uid = newUid,
+                ModSeq = newModSeq,
+                FolderId = destinationFolder.Id,
+            };
+
+            sourceUids.Add(source.Uid);
+            destinationUids.Add(newUid);
+            db.Emails.Add(copy);
+            await db.SaveChangesAsync(ct);
+            db.Entry(copy).State = EntityState.Detached;
+        }
+
+        return (sourceUids, destinationUids);
     }
 
     private static EmailDB AttachFlagUpdate(
@@ -3564,7 +3599,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         int maximumMessageSize,
         CancellationToken ct)
     {
-        if (!_appendTransactionLimiter.Wait(0))
+        if (!_messageWriteCommandLimiter.Wait(0))
         {
             if (NonSynchronizingLiteralRegex().IsMatch(args))
             {
@@ -3592,7 +3627,7 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
         finally
         {
-            _appendTransactionLimiter.Release();
+            _messageWriteCommandLimiter.Release();
         }
     }
 
