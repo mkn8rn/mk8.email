@@ -34,6 +34,7 @@ ILogger<ImapServerService> logger) : BackgroundService
     private const int MaximumSearchTokens = 4096;
     private const int MaximumSearchNestingDepth = 64;
     private const int MaximumMultiAppendMessages = 20;
+    private const int MaximumCommandLiterals = 64;
     private static readonly Encoding ProtocolEncoding = MailWireEncoding.Instance;
 
     private enum ListenerMode { Imap, ImplicitTls }
@@ -215,13 +216,24 @@ ILogger<ImapServerService> logger) : BackgroundService
             var lineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
             if (lineResult.IsTooLong)
             {
-                await writer.WriteLineAsync("* BAD Command line is too long");
-                continue;
+                await writer.WriteLineAsync("* BYE Command line is too long");
+                session.State = ImapState.Logout;
+                break;
             }
 
-            var line = lineResult.Value;
-            if (line is null)
+            var initialLine = lineResult.Value;
+            if (initialLine is null)
                 break;
+
+            var line = await ReadCommandLiteralsAsync(
+                initialLine,
+                reader,
+                writer,
+                session,
+                timeout,
+                config.ConnectionTimeoutSeconds);
+            if (line is null)
+                continue;
 
             var spaceIdx = line.IndexOf(' ');
             if (spaceIdx <= 0)
@@ -482,7 +494,8 @@ ILogger<ImapServerService> logger) : BackgroundService
                         args,
                         session,
                         config.MaxMessageSizeBytes,
-                        ct);
+                        timeout,
+                        config.ConnectionTimeoutSeconds);
                     break;
 
                 case "IDLE":
@@ -573,6 +586,166 @@ ILogger<ImapServerService> logger) : BackgroundService
         }
 
         return SessionUpgrade.None;
+    }
+
+    private static async Task<string?> ReadCommandLiteralsAsync(
+        string initialLine,
+        BoundedLineReader reader,
+        StreamWriter writer,
+        ImapSession session,
+        CancellationTokenSource timeout,
+        int connectionTimeoutSeconds)
+    {
+        var line = initialLine;
+        var tagEnd = line.IndexOf(' ');
+        var tag = tagEnd > 0 ? line[..tagEnd] : "*";
+
+        for (var literalIndex = 0; ; literalIndex++)
+        {
+            var match = CommandLiteralRegex().Match(line);
+            if (!match.Success || IsAppendMessageLiteral(line, match.Index))
+                return line;
+
+            var isNonSynchronizing = match.Groups[2].Success;
+            if (!session.IsSecure && IsCommand(line, "LOGIN"))
+            {
+                if (isNonSynchronizing)
+                {
+                    await writer.WriteLineAsync("* BYE [PRIVACYREQUIRED] TLS is required for authentication");
+                    session.State = ImapState.Logout;
+                }
+                else
+                {
+                    await writer.WriteLineAsync($"{tag} NO [PRIVACYREQUIRED] TLS is required for authentication");
+                }
+                return null;
+            }
+
+            if (literalIndex >= MaximumCommandLiterals
+                || !int.TryParse(match.Groups[1].ValueSpan, out var literalSize)
+                || literalSize > MaximumCommandLineCharacters)
+            {
+                await RejectCommandLiteralAsync(
+                    writer,
+                    tag,
+                    session,
+                    isNonSynchronizing,
+                    "Command literal exceeds the server limit");
+                return null;
+            }
+
+            if (!isNonSynchronizing)
+                await writer.WriteLineAsync("+ Ready for literal data");
+
+            var literal = new char[literalSize];
+            var totalRead = 0;
+            while (totalRead < literal.Length)
+            {
+                timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
+                var read = await reader.ReadAsync(
+                    literal.AsMemory(totalRead, literal.Length - totalRead),
+                    timeout.Token);
+                if (read == 0)
+                {
+                    session.State = ImapState.Logout;
+                    return null;
+                }
+                totalRead += read;
+            }
+
+            if (literal.AsSpan().Contains('\0'))
+            {
+                await writer.WriteLineAsync("* BYE Binary command literals are not supported");
+                session.State = ImapState.Logout;
+                return null;
+            }
+
+            timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
+            var remainderResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, timeout.Token);
+            if (remainderResult.IsTooLong)
+            {
+                await writer.WriteLineAsync("* BYE Command continuation is too long");
+                session.State = ImapState.Logout;
+                return null;
+            }
+
+            var remainder = remainderResult.Value;
+            if (remainder is null)
+            {
+                session.State = ImapState.Logout;
+                return null;
+            }
+
+            var escapedLiteral = EscapeImapString(new string(literal));
+            var expandedLength = match.Index + escapedLiteral.Length + 2 + remainder.Length;
+            if (expandedLength > MaximumCommandLineCharacters)
+            {
+                await writer.WriteLineAsync("* BYE Expanded command exceeds the server limit");
+                session.State = ImapState.Logout;
+                return null;
+            }
+
+            line = $"{line[..match.Index]}\"{escapedLiteral}\"{remainder}";
+        }
+    }
+
+    private static bool IsAppendMessageLiteral(string line, int literalIndex)
+    {
+        if (!TryGetCommandRange(line, out _, out var commandEnd)
+            || !IsCommand(line, "APPEND"))
+        {
+            return false;
+        }
+
+        return literalIndex > commandEnd + 1
+            && !string.IsNullOrWhiteSpace(line[(commandEnd + 1)..literalIndex]);
+    }
+
+    private static bool IsCommand(string line, string expectedCommand)
+    {
+        if (!TryGetCommandRange(line, out var commandStart, out var commandEnd))
+            return false;
+
+        return line.AsSpan(commandStart, commandEnd - commandStart).Equals(
+            expectedCommand,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetCommandRange(string line, out int commandStart, out int commandEnd)
+    {
+        commandStart = 0;
+        commandEnd = 0;
+        var tagEnd = line.IndexOf(' ');
+        if (tagEnd <= 0)
+            return false;
+
+        commandStart = tagEnd + 1;
+        while (commandStart < line.Length && line[commandStart] == ' ')
+            commandStart++;
+        if (commandStart >= line.Length)
+            return false;
+
+        commandEnd = line.IndexOf(' ', commandStart);
+        if (commandEnd < 0)
+            commandEnd = line.Length;
+        return commandEnd > commandStart;
+    }
+
+    private static async Task RejectCommandLiteralAsync(
+        StreamWriter writer,
+        string tag,
+        ImapSession session,
+        bool isNonSynchronizing,
+        string response)
+    {
+        if (isNonSynchronizing)
+        {
+            await writer.WriteLineAsync($"* BYE {response}");
+            session.State = ImapState.Logout;
+            return;
+        }
+
+        await writer.WriteLineAsync($"{tag} BAD {response}");
     }
 
     private static async Task HandleCompressAsync(StreamWriter writer, string tag, string args)
@@ -2657,10 +2830,22 @@ ILogger<ImapServerService> logger) : BackgroundService
 
             if (input[i] == '"')
             {
-                var end = input.IndexOf('"', i + 1);
-                if (end < 0) end = input.Length;
-                tokens.Add(input[(i + 1)..end]);
-                i = end + 1;
+                i++;
+                var token = new StringBuilder();
+                while (i < input.Length)
+                {
+                    var character = input[i++];
+                    if (character == '"')
+                        break;
+                    if (character == '\\'
+                        && i < input.Length
+                        && input[i] is '\\' or '"')
+                    {
+                        character = input[i++];
+                    }
+                    token.Append(character);
+                }
+                tokens.Add(token.ToString());
             }
             else
             {
@@ -2676,7 +2861,21 @@ ILogger<ImapServerService> logger) : BackgroundService
     private static string UnquoteArg(string arg)
     {
         if (arg.Length >= 2 && arg[0] == '"' && arg[^1] == '"')
-            return arg[1..^1];
+        {
+            var result = new StringBuilder(arg.Length - 2);
+            for (var index = 1; index < arg.Length - 1; index++)
+            {
+                var character = arg[index];
+                if (character == '\\'
+                    && index + 1 < arg.Length - 1
+                    && arg[index + 1] is '\\' or '"')
+                {
+                    character = arg[++index];
+                }
+                result.Append(character);
+            }
+            return result.ToString();
+        }
         return arg;
     }
 
@@ -3566,7 +3765,7 @@ ILogger<ImapServerService> logger) : BackgroundService
                             return false;
                     }
 
-                    if (character is '\r' or '\n' or '\0')
+                    if (character == '\0')
                         return false;
                     value.Append(character);
                 }
@@ -4383,7 +4582,8 @@ ILogger<ImapServerService> logger) : BackgroundService
         string args,
         ImapSession session,
         int maximumMessageSize,
-        CancellationToken ct)
+        CancellationTokenSource timeout,
+        int connectionTimeoutSeconds)
     {
         if (!_messageWriteCommandLimiter.Wait(0))
         {
@@ -4409,7 +4609,8 @@ ILogger<ImapServerService> logger) : BackgroundService
                 args,
                 session,
                 maximumMessageSize,
-                ct);
+                timeout,
+                connectionTimeoutSeconds);
         }
         finally
         {
@@ -4424,8 +4625,10 @@ ILogger<ImapServerService> logger) : BackgroundService
         string args,
         ImapSession session,
         int maximumMessageSize,
-        CancellationToken ct)
+        CancellationTokenSource timeout,
+        int connectionTimeoutSeconds)
     {
+        var ct = timeout.Token;
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<EmailDbContext>();
 
@@ -4504,6 +4707,7 @@ ILogger<ImapServerService> logger) : BackgroundService
             var totalRead = 0;
             while (totalRead < literalSize.Value)
             {
+                timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
                 var read = await reader.ReadAsync(buffer.AsMemory(totalRead, literalSize.Value - totalRead), ct);
                 if (read == 0)
                     throw new EndOfStreamException("The APPEND literal ended before its declared size.");
@@ -4556,10 +4760,12 @@ ILogger<ImapServerService> logger) : BackgroundService
             pendingMessages.Add(email);
             pendingBytes = nextPendingBytes;
 
+            timeout.CancelAfter(TimeSpan.FromSeconds(connectionTimeoutSeconds));
             var nextLineResult = await reader.ReadLineAsync(MaximumCommandLineCharacters, ct);
             if (nextLineResult.IsTooLong)
             {
-                await writer.WriteLineAsync($"{tag} BAD APPEND continuation is too long");
+                await writer.WriteLineAsync("* BYE APPEND continuation is too long");
+                session.State = ImapState.Logout;
                 return;
             }
             var nextLine = nextLineResult.Value;
@@ -4649,6 +4855,9 @@ ILogger<ImapServerService> logger) : BackgroundService
 
     [GeneratedRegex(@"\{\d+\+\}\s*$")]
     private static partial Regex NonSynchronizingLiteralRegex();
+
+    [GeneratedRegex(@"\{([0-9]+)(\+)?\}$")]
+    private static partial Regex CommandLiteralRegex();
 
     private static (string? mailboxName, List<string> flags, DateTime? internalDate, int? literalSize) ParseAppendArgs(string args)
     {

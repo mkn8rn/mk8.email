@@ -441,6 +441,18 @@ public sealed class TransportSecurityTests
 
         await connection.WriteLineAsync("a2 LOGIN user password");
         StringAssert.Contains(await connection.ReadLineAsync(), "[PRIVACYREQUIRED]");
+
+        await connection.WriteLineAsync("a3 LOGIN {4}");
+        var literalLoginResponse = await connection.ReadLineAsync();
+        Assert.IsTrue(literalLoginResponse.StartsWith("a3 NO", StringComparison.Ordinal));
+        StringAssert.Contains(literalLoginResponse, "[PRIVACYREQUIRED]");
+        await connection.WriteLineAsync("a4 NOOP");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a4 OK", StringComparison.Ordinal));
+
+        await connection.WriteLineAsync("a5 LOGIN {4+}");
+        literalLoginResponse = await connection.ReadLineAsync();
+        Assert.IsTrue(literalLoginResponse.StartsWith("* BYE", StringComparison.Ordinal));
+        StringAssert.Contains(literalLoginResponse, "[PRIVACYREQUIRED]");
     }
 
     [TestMethod]
@@ -482,6 +494,109 @@ public sealed class TransportSecurityTests
         Assert.IsFalse(capability.Contains("LOGINDISABLED", StringComparison.Ordinal));
         Assert.IsFalse(capability.Contains("STARTTLS", StringComparison.Ordinal));
         Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapAcceptsBoundedCommandLiterals()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await server.SeedInboxMessagesForSearchAsync();
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+
+        await connection.WriteRawAsync(
+            $"a2 LOGIN {{{TestUsername.Length}+}}\r\n{TestUsername} {{{TestPassword.Length}+}}\r\n{TestPassword}\r\n");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        await connection.WriteLineAsync("a3 SELECT INBOX");
+        await ReadUntilTaggedResponseAsync(connection, "a3");
+
+        const string subject = "Third \"quoted\" subject";
+        await connection.WriteLineAsync($"a4 SEARCH SUBJECT {{{subject.Length}}}");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+        await connection.WriteRawAsync(subject);
+        await connection.WriteLineAsync(string.Empty);
+        var responses = await ReadUntilTaggedResponseAsync(connection, "a4");
+        Assert.IsTrue(responses.Contains("* SEARCH 3"));
+
+        const string bodyNeedle = "first body\r\n";
+        await connection.WriteRawAsync($"a5 SEARCH BODY {{{bodyNeedle.Length}+}}\r\n{bodyNeedle}\r\n");
+        responses = await ReadUntilTaggedResponseAsync(connection, "a5");
+        Assert.IsTrue(responses.Contains("* SEARCH 1"));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapAcceptsLiteralAppendMailboxName()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+        await using var connection = await ProtocolConnection.ConnectAsync(port);
+
+        await connection.ReadLineAsync();
+        await connection.WriteLineAsync("a1 STARTTLS");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a1 OK", StringComparison.Ordinal));
+        await connection.UpgradeToTlsAsync("email.mk8n.com");
+        await connection.WriteLineAsync($"a2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+
+        const string message = "From: user@mk8n.com\r\nTo: user@mk8n.com\r\nSubject: literal mailbox\r\n\r\nbody\r\n";
+        await connection.WriteRawAsync($"a3 APPEND {{4+}}\r\nSent {{{message.Length}}}\r\n");
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+        await connection.WriteRawAsync(message);
+        await connection.WriteLineAsync(string.Empty);
+        Assert.IsTrue((await connection.ReadLineAsync()).StartsWith("a3 OK [APPENDUID", StringComparison.Ordinal));
+        Assert.AreEqual("literal mailbox", (await server.GetStoredEmailAsync(DefaultFolders.Sent)).Subject);
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImapRejectsOversizedCommandLiteralsWithoutUnboundedReads()
+    {
+        var port = ReservePort();
+        var environment = CreateEnvironment(imapPort: port);
+        await using var server = await ServerFixture.StartImapAsync(environment, port);
+
+        await using (var synchronized = await ProtocolConnection.ConnectAsync(port))
+        {
+            await synchronized.ReadLineAsync();
+            await synchronized.WriteLineAsync("a1 ID {16385}");
+            Assert.IsTrue((await synchronized.ReadLineAsync()).StartsWith("a1 BAD", StringComparison.Ordinal));
+            await synchronized.WriteLineAsync("a2 NOOP");
+            Assert.IsTrue((await synchronized.ReadLineAsync()).StartsWith("a2 OK", StringComparison.Ordinal));
+        }
+
+        await using var nonSynchronizing = await ProtocolConnection.ConnectAsync(port);
+        await nonSynchronizing.ReadLineAsync();
+        await nonSynchronizing.WriteLineAsync("b1 ID {16385+}");
+        Assert.IsTrue((await nonSynchronizing.ReadLineAsync()).StartsWith("* BYE", StringComparison.Ordinal));
+
+        await using var longLine = await ProtocolConnection.ConnectAsync(port);
+        await longLine.ReadLineAsync();
+        await longLine.WriteLineAsync(new string('X', 16_385));
+        Assert.IsTrue((await longLine.ReadLineAsync()).StartsWith("* BYE", StringComparison.Ordinal));
+
+        await using var append = await ProtocolConnection.ConnectAsync(port);
+        await append.ReadLineAsync();
+        await append.WriteLineAsync("c1 STARTTLS");
+        Assert.IsTrue((await append.ReadLineAsync()).StartsWith("c1 OK", StringComparison.Ordinal));
+        await append.UpgradeToTlsAsync("email.mk8n.com");
+        await append.WriteLineAsync($"c2 LOGIN \"{TestUsername}\" \"{TestPassword}\"");
+        Assert.IsTrue((await append.ReadLineAsync()).StartsWith("c2 OK", StringComparison.Ordinal));
+        const string message = "From: user@mk8n.com\r\nTo: user@mk8n.com\r\nSubject: long continuation\r\n\r\nbody\r\n";
+        await append.WriteLineAsync($"c3 APPEND \"Sent\" {{{message.Length}}}");
+        Assert.IsTrue((await append.ReadLineAsync()).StartsWith("+ ", StringComparison.Ordinal));
+        await append.WriteRawAsync(message);
+        await append.WriteLineAsync(new string('X', 16_385));
+        Assert.IsTrue((await append.ReadLineAsync()).StartsWith("* BYE", StringComparison.Ordinal));
+        Assert.AreEqual(0, await server.CountStoredEmailsAsync());
     }
 
     [TestMethod]

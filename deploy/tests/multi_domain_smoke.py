@@ -100,6 +100,20 @@ def find_message_identifiers(client: imaplib.IMAP4_SSL, marker: str) -> list[byt
     return data[0].split()
 
 
+def read_raw_imap_response(
+    client: imaplib.IMAP4_SSL, tag: bytes
+) -> list[bytes]:
+    response: list[bytes] = []
+    for _ in range(100):
+        line = client.readline()
+        require(line.endswith(b"\r\n"), "The raw IMAP response was not complete.")
+        line = line[:-2]
+        response.append(line)
+        if line.startswith(tag + b" "):
+            return response
+    raise RuntimeError("The raw IMAP response exceeded 100 lines.")
+
+
 def wait_for_message(
     account: str,
     password: str,
@@ -400,6 +414,78 @@ def test_search(account: str, password: str) -> None:
         delete_marker(account, password, "INBOX", second_marker)
 
 
+def test_command_literals(account: str, password: str) -> None:
+    marker = uuid.uuid4().hex
+    account_bytes = account.encode("ascii")
+    password_bytes = password.encode("ascii")
+    message = (
+        f"From: {account}\r\n"
+        f"To: {account}\r\n"
+        f"Subject: literal smoke {marker}\r\n"
+        f"X-Mk8-Multi-Domain-Test: {marker}\r\n"
+        "\r\n"
+        "literal body\r\n"
+    ).encode("ascii")
+
+    try:
+        with imaplib.IMAP4_SSL(
+            LOCAL_HOST, 993, ssl_context=tls_context(), timeout=20
+        ) as client:
+            client.send(b"ML0 CAPABILITY\r\n")
+            response = read_raw_imap_response(client, b"ML0")
+            require(
+                any(b"LITERAL+" in line for line in response),
+                "The server did not advertise LITERAL+.",
+            )
+
+            client.send(
+                b"ML1 LOGIN {"
+                + str(len(account_bytes)).encode("ascii")
+                + b"+}\r\n"
+                + account_bytes
+                + b" {"
+                + str(len(password_bytes)).encode("ascii")
+                + b"+}\r\n"
+                + password_bytes
+                + b"\r\n"
+            )
+            response = read_raw_imap_response(client, b"ML1")
+            require(response[-1].startswith(b"ML1 OK"), "Literal LOGIN failed.")
+
+            client.send(
+                b"ML2 APPEND {4+}\r\nSent {"
+                + str(len(message)).encode("ascii")
+                + b"}\r\n"
+            )
+            continuation = client.readline()
+            require(continuation.startswith(b"+ "), "Literal APPEND did not continue.")
+            client.send(message + b"\r\n")
+            response = read_raw_imap_response(client, b"ML2")
+            require(response[-1].startswith(b"ML2 OK"), "Literal APPEND failed.")
+
+            client.send(b"ML3 SELECT Sent\r\n")
+            response = read_raw_imap_response(client, b"ML3")
+            require(response[-1].startswith(b"ML3 OK"), "Literal test SELECT failed.")
+
+            marker_bytes = marker.encode("ascii")
+            client.send(
+                b"ML4 UID SEARCH HEADER X-Mk8-Multi-Domain-Test {"
+                + str(len(marker_bytes)).encode("ascii")
+                + b"}\r\n"
+            )
+            continuation = client.readline()
+            require(continuation.startswith(b"+ "), "Literal SEARCH did not continue.")
+            client.send(marker_bytes + b"\r\n")
+            response = read_raw_imap_response(client, b"ML4")
+            search_lines = [line for line in response if line.startswith(b"* SEARCH")]
+            require(
+                len(search_lines) == 1 and len(search_lines[0].split()) == 3,
+                "Literal SEARCH did not find one message.",
+            )
+    finally:
+        delete_marker(account, password, "Sent", marker)
+
+
 def require_sender_mismatch_rejected(account: str, password: str) -> None:
     with smtplib.SMTP(LOCAL_HOST, 587, timeout=30) as client:
         client.ehlo("probe.debian.org")
@@ -439,6 +525,7 @@ def test_active(domain: str, account: str, password: str, selector: str) -> None
     test_copy_quota(account, password)
     test_move_tombstone(account, password)
     test_search(account, password)
+    test_command_literals(account, password)
 
 
 def main() -> None:
@@ -460,7 +547,7 @@ def main() -> None:
 
     require(arguments.selector is not None, "The active test requires a DKIM selector.")
     test_active(arguments.domain, arguments.account, password, arguments.selector)
-    print("The second domain passed delivery, catch-all, login, sender, DKIM, COPY, MOVE, and SEARCH tests.")
+    print("The second domain passed delivery, catch-all, login, sender, DKIM, COPY, MOVE, SEARCH, and literal tests.")
 
 
 if __name__ == "__main__":
