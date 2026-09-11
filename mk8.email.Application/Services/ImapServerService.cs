@@ -149,7 +149,15 @@ ILogger<ImapServerService> logger) : BackgroundService
 
                     using var cert = LoadCertificate(config);
                     sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
-                    await AuthenticateAsServerAsync(sslStream, cert, timeout.Token);
+                    if (!await TryAuthenticateAsServerAsync(
+                            sslStream,
+                            cert,
+                            timeout.Token,
+                            remoteLabel))
+                    {
+                        sslStream.Dispose();
+                        return;
+                    }
                     stream = sslStream;
                 }
 
@@ -171,7 +179,15 @@ ILogger<ImapServerService> logger) : BackgroundService
                     {
                         using var cert = LoadCertificate(config);
                         var tlsStream = new SslStream(stream, leaveInnerStreamOpen: false);
-                        await AuthenticateAsServerAsync(tlsStream, cert, timeout.Token);
+                        if (!await TryAuthenticateAsServerAsync(
+                                tlsStream,
+                                cert,
+                                timeout.Token,
+                                remoteLabel))
+                        {
+                            tlsStream.Dispose();
+                            return;
+                        }
                         stream = tlsStream;
                         session.IsSecure = true;
                     }
@@ -2277,19 +2293,35 @@ ILogger<ImapServerService> logger) : BackgroundService
         return X509CertificateLoader.LoadPkcs12FromFile(config.TlsCertificatePath!, password: null);
     }
 
-    private static Task AuthenticateAsServerAsync(
+    private async Task<bool> TryAuthenticateAsServerAsync(
         SslStream stream,
         X509Certificate2 certificate,
-        CancellationToken cancellationToken) =>
-        stream.AuthenticateAsServerAsync(
-            new SslServerAuthenticationOptions
-            {
-                ServerCertificate = certificate,
-                ClientCertificateRequired = false,
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
-                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-            },
-            cancellationToken);
+        CancellationToken cancellationToken,
+        string remoteLabel)
+    {
+        try
+        {
+            await stream.AuthenticateAsServerAsync(
+                new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = certificate,
+                    ClientCertificateRequired = false,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                },
+                cancellationToken);
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is IOException or AuthenticationException or SocketException)
+        {
+            logger.LogDebug(
+                "IMAP TLS handshake from {Endpoint} ended before authentication: {ExceptionType}",
+                remoteLabel,
+                exception.GetType().Name);
+            return false;
+        }
+    }
 
     private static bool ShouldSetSeen(string fetchItems)
     {

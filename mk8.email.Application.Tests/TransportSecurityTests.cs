@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -5,6 +6,7 @@ using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using mk8.email.Application.Interfaces;
 using mk8.email.Application.Services;
@@ -107,6 +109,76 @@ public sealed class TransportSecurityTests
         var capability = await connection.ReadSmtpResponseAsync();
         StringAssert.Contains(capability, "250-AUTH PLAIN LOGIN");
         Assert.IsFalse(capability.Contains("STARTTLS", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImplicitTlsPeerFailuresDoNotProduceWarningLogs()
+    {
+        var smtpPort = ReservePort();
+        var imapPort = ReservePort();
+        var environment = CreateEnvironment(
+            smtpImplicitTlsPort: smtpPort,
+            imapImplicitTlsPort: imapPort);
+        var smtpLogger = new CapturingLogger<SmtpServerService>();
+        var imapLogger = new CapturingLogger<ImapServerService>();
+        await using var smtpServer = await ServerFixture.StartSmtpAsync(
+            environment,
+            smtpPort,
+            smtpLogger);
+        await using var imapServer = await ServerFixture.StartImapAsync(
+            environment,
+            imapPort,
+            imapLogger);
+
+        await TriggerTlsPeerFailureAsync(smtpPort, sendMalformedPayload: false);
+        await TriggerTlsPeerFailureAsync(smtpPort, sendMalformedPayload: true);
+        await TriggerTlsPeerFailureAsync(imapPort, sendMalformedPayload: false);
+        await TriggerTlsPeerFailureAsync(imapPort, sendMalformedPayload: true);
+
+        await WaitForAsync(
+            () => CountTlsHandshakeDebugLogs(smtpLogger) >= 2,
+            "SMTP did not record both TLS peer failures at debug level.");
+        await WaitForAsync(
+            () => CountTlsHandshakeDebugLogs(imapLogger) >= 2,
+            "IMAP did not record both TLS peer failures at debug level.");
+
+        Assert.IsFalse(
+            smtpLogger.Entries.Any(entry => entry.Level >= LogLevel.Warning),
+            "SMTP recorded a warning for a TLS peer failure.");
+        Assert.IsFalse(
+            imapLogger.Entries.Any(entry => entry.Level >= LogLevel.Warning),
+            "IMAP recorded a warning for a TLS peer failure.");
+    }
+
+    [TestMethod]
+    [Timeout(10_000)]
+    public async Task ImplicitTlsCertificateLoadFailuresRemainWarnings()
+    {
+        var smtpPort = ReservePort();
+        var imapPort = ReservePort();
+        var missingCertificatePath = Path.Combine(_testDirectory, "missing.pfx");
+        var environment = CreateEnvironment(
+            smtpImplicitTlsPort: smtpPort,
+            imapImplicitTlsPort: imapPort,
+            certificatePath: missingCertificatePath);
+        var smtpLogger = new CapturingLogger<SmtpServerService>();
+        var imapLogger = new CapturingLogger<ImapServerService>();
+        await using var smtpServer = await ServerFixture.StartSmtpAsync(
+            environment,
+            smtpPort,
+            smtpLogger);
+        await using var imapServer = await ServerFixture.StartImapAsync(
+            environment,
+            imapPort,
+            imapLogger);
+
+        await WaitForAsync(
+            () => HasCertificateLoadWarning(smtpLogger),
+            "SMTP did not record the certificate load failure as a warning.");
+        await WaitForAsync(
+            () => HasCertificateLoadWarning(imapLogger),
+            "IMAP did not record the certificate load failure as a warning.");
     }
 
     [TestMethod]
@@ -1295,6 +1367,9 @@ public sealed class TransportSecurityTests
         int? smtpPort = null,
         int? submissionPort = null,
         int? imapPort = null,
+        int? smtpImplicitTlsPort = null,
+        int? imapImplicitTlsPort = null,
+        string? certificatePath = null,
         int connectionTimeoutSeconds = 10)
     {
         return new EnvironmentConfig
@@ -1304,10 +1379,10 @@ public sealed class TransportSecurityTests
                 Hostname = "email.mk8n.com",
                 Port = smtpPort ?? ReservePort(),
                 SubmissionPort = submissionPort ?? ReservePort(),
-                ImplicitTlsPort = ReservePort(),
+                ImplicitTlsPort = smtpImplicitTlsPort ?? ReservePort(),
                 EnableSmtp = smtpPort.HasValue,
                 EnableSubmission = submissionPort.HasValue,
-                EnableImplicitTls = false,
+                EnableImplicitTls = smtpImplicitTlsPort.HasValue,
                 EnableStartTls = true,
                 RequireAuth = true,
                 AllowRelay = true,
@@ -1315,13 +1390,13 @@ public sealed class TransportSecurityTests
             Imap = new ImapConfig
             {
                 Port = imapPort ?? ReservePort(),
-                ImplicitTlsPort = ReservePort(),
+                ImplicitTlsPort = imapImplicitTlsPort ?? ReservePort(),
                 EnableImap = imapPort.HasValue,
-                EnableImplicitTls = false,
+                EnableImplicitTls = imapImplicitTlsPort.HasValue,
             },
             Tls = new TlsConfig
             {
-                CertificatePath = _certificatePath,
+                CertificatePath = certificatePath ?? _certificatePath,
             },
             Limits = new LimitsConfig
             {
@@ -1340,6 +1415,37 @@ public sealed class TransportSecurityTests
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+
+    private static async Task TriggerTlsPeerFailureAsync(int port, bool sendMalformedPayload)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port, timeout.Token);
+        if (sendMalformedPayload)
+        {
+            var payload = "GET / HTTP/1.0\r\n\r\n"u8.ToArray();
+            await client.GetStream().WriteAsync(payload, timeout.Token);
+        }
+    }
+
+    private static int CountTlsHandshakeDebugLogs<T>(CapturingLogger<T> logger) =>
+        logger.Entries.Count(entry =>
+            entry.Level == LogLevel.Debug &&
+            entry.Message.Contains("TLS handshake", StringComparison.Ordinal));
+
+    private static bool HasCertificateLoadWarning<T>(CapturingLogger<T> logger) =>
+        logger.Entries.Any(entry =>
+            entry.Level == LogLevel.Warning &&
+            entry.Exception is not null &&
+            entry.Message.Contains("Error handling", StringComparison.Ordinal));
+
+    private static async Task WaitForAsync(Func<bool> condition, string failureMessage)
+    {
+        for (var attempt = 0; attempt < 100 && !condition(); attempt++)
+            await Task.Delay(20);
+
+        Assert.IsTrue(condition(), failureMessage);
     }
 
     private static async Task AuthenticateSmtpAsync(ProtocolConnection connection)
@@ -1388,25 +1494,31 @@ public sealed class TransportSecurityTests
         public StubEmailService EmailService { get; } = emailService;
         public StubMailSubmissionQueue MailQueue { get; } = mailQueue;
 
-        public static async Task<ServerFixture> StartSmtpAsync(EnvironmentConfig environment, int port)
+        public static async Task<ServerFixture> StartSmtpAsync(
+            EnvironmentConfig environment,
+            int port,
+            ILogger<SmtpServerService>? logger = null)
         {
             var (services, emailService, mailQueue) = CreateServices();
             var hostedService = new SmtpServerService(
                 services.GetRequiredService<IServiceScopeFactory>(),
                 environment,
-                NullLogger<SmtpServerService>.Instance);
+                logger ?? NullLogger<SmtpServerService>.Instance);
             var fixture = new ServerFixture(services, hostedService, emailService, mailQueue);
             await fixture.StartAsync(port);
             return fixture;
         }
 
-        public static async Task<ServerFixture> StartImapAsync(EnvironmentConfig environment, int port)
+        public static async Task<ServerFixture> StartImapAsync(
+            EnvironmentConfig environment,
+            int port,
+            ILogger<ImapServerService>? logger = null)
         {
             var (services, emailService, mailQueue) = CreateServices();
             var hostedService = new ImapServerService(
                 services.GetRequiredService<IServiceScopeFactory>(),
                 environment,
-                NullLogger<ImapServerService>.Instance);
+                logger ?? NullLogger<ImapServerService>.Instance);
             var fixture = new ServerFixture(services, hostedService, emailService, mailQueue);
             await fixture.StartAsync(port);
             return fixture;
@@ -1758,6 +1870,25 @@ public sealed class TransportSecurityTests
                 AutoFlush = true,
                 NewLine = "\r\n",
             };
+    }
+
+    private sealed record CapturedLog(LogLevel Level, string Message, Exception? Exception);
+
+    private sealed class CapturingLogger<T> : ILogger<T>
+    {
+        public ConcurrentQueue<CapturedLog> Entries { get; } = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Enqueue(new CapturedLog(logLevel, formatter(state, exception), exception));
     }
 
     private sealed class StubEmailService : IEmailService
